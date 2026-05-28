@@ -59,14 +59,18 @@ SECTION_BY_TYPE = {
     "organisation": "organisations",
     "place": "places",
     "event": "events",
-    "matter": "matters",  # ADR 0028 deprecates; kept for unmigrated matters
     "object": "objects",
     "document": "documents",
+    # ADR 0029 current taxonomy:
+    "project": "projects",  # collapses the old programme + investigation
+    "topic": "topics",  # renamed from concept
+    "pattern": "patterns",  # curator-created, not extractor-emitted
+    # Deprecated types kept for back-compat with older DB state:
+    "matter": "matters",
     "concept": "concepts",
-    # ADR 0028 additions:
     "programme": "programmes",
     "investigation": "investigations",
-    "pattern": "patterns",
+    "principle": "topics",  # transient pre-0029 name -> routes to /topics/
 }
 
 
