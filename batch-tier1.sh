@@ -51,9 +51,9 @@ for node in "${NODES[@]}"; do
 	echo "===  [$((ok + ${#failed[@]} + 1))/${#NODES[@]}]  $node  ==="
 	if docker run --rm \
 		--name "tier1-$(echo "$node" | head -c 24 | tr -c 'a-zA-Z0-9-' -)" \
-		-v /home/mark/repos/anomalica/anomalica-assembler:/work \
+		-v /home/mark/repos/anomalica/assembler:/work \
 		-v /home/mark/.local/share/digester:/db:ro \
-		-v /home/mark/repos/anomalica/anomalica-content:/content \
+		-v /home/mark/repos/anomalica/content:/content \
 		-v /home/mark/.local/bin/claude:/usr/local/bin/claude:ro \
 		-v /home/mark/.claude:/home/nonroot/.claude \
 		-v /home/mark/.claude.json:/home/nonroot/.claude.json \
@@ -79,5 +79,5 @@ fi
 # Build the site once at the end
 echo
 echo "Building site..."
-cd /home/mark/repos/anomalica/anomalica-site && hugo --gc --minify --quiet 2>&1 || true
+cd /home/mark/repos/anomalica/site && hugo --gc --minify --quiet 2>&1 || true
 ls public/en/people public/en/organisations public/en/events public/en/objects public/en/matters public/en/concepts public/en/documents 2>/dev/null | head -100 || true

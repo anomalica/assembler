@@ -9,10 +9,10 @@ the site expects.
 Run via the digester container so we get python + Claude CLI + yaml/sqlite:
 
   docker run --rm \\
-    -v /home/mark/repos/anomalica/anomalica-assembler:/work \\
+    -v /home/mark/repos/anomalica/assembler:/work \\
     -v /home/mark/.local/share/digester:/db:ro \\
-    -v /home/mark/repos/anomalica/anomalica-content:/content \\
-    -v /home/mark/repos/anomalica/anomalica-digests:/digests:ro \\
+    -v /home/mark/repos/anomalica/content:/content \\
+    -v /home/mark/repos/anomalica/digests:/digests:ro \\
     -v /home/mark/.local/bin/claude:/usr/local/bin/claude:ro \\
     -v /home/mark/.claude:/home/nonroot/.claude \\
     -v /home/mark/.claude.json:/home/nonroot/.claude.json \\
@@ -209,7 +209,7 @@ def node_slug(node: dict) -> str:
 
 
 def output_path(content_root: Path, section: str, slug: str, lang: str = "en") -> Path:
-    # Hugo mounts anomalica-content/pages/ to content/. So generated articles
+    # Hugo mounts content/pages/ to content/. So generated articles
     # for the public site live under pages/<section>/<slug>.<lang>.md - URLs
     # then come out as /<section>/<slug>/ to match the site's existing
     # /people/david-fravor pattern.
@@ -712,7 +712,7 @@ def main() -> int:
     ap.add_argument(
         "--content-root",
         default=DEFAULT_CONTENT_ROOT,
-        help=f"Path to anomalica-content repo (default: {DEFAULT_CONTENT_ROOT})",
+        help=f"Path to content repo (default: {DEFAULT_CONTENT_ROOT})",
     )
     ap.add_argument(
         "--section",
