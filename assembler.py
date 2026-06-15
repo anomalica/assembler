@@ -40,7 +40,22 @@ import yaml
 
 DEFAULT_DB = "/db/knowledge.db"
 DEFAULT_CONTENT_ROOT = "/content"
+DEFAULT_DIGESTS_ROOT = "/digests"
 DEFAULT_MODEL = "sonnet"
+
+# Entity types surfaced in a record page's `entities` breakdown, in display
+# order. Deliberately a subset of SECTION_BY_TYPE: curator-only types (pattern)
+# and deprecated aliases (concept/matter) are not listed as standalone groups.
+ENTITY_TYPES = [
+    "person",
+    "place",
+    "event",
+    "organisation",
+    "project",
+    "object",
+    "topic",
+    "document",
+]
 
 # Workbench origin used to build the per-claim deep-link URL stamped into
 # each reference. Override via env var when the workbench is deployed
@@ -71,6 +86,9 @@ SECTION_BY_TYPE = {
     "programme": "programmes",
     "investigation": "investigations",
     "principle": "topics",  # transient pre-0029 name -> routes to /topics/
+    # Per-record narrative pages (--record mode): one page per ingested
+    # source artefact, routed to /records/{friendly_name}.
+    "source": "records",
 }
 
 
@@ -177,6 +195,193 @@ def related_nodes(conn: sqlite3.Connection, node_id: str) -> list[dict]:
     ]
 
 
+def _claim_refs(claim: dict) -> list[str]:
+    """Node names a digest claim references (refs entries are {id, name})."""
+    out = []
+    for r in claim.get("refs") or []:
+        nm = r.get("name") if isinstance(r, dict) else r
+        if nm:
+            out.append(nm)
+    return out
+
+
+def load_digest(digests_root: Path, ref: str) -> tuple[dict, str] | None:
+    """Locate and parse a per-record digest (digests/records/{name}.yaml, the
+    canonical per-record output per ADR 0027). `ref` is a friendly_name (the
+    digest filename stem), a path to a digest file, or a record id / title
+    matched by scanning. Returns (digest, friendly_name) or None.
+    """
+    p = Path(ref)
+    if p.suffix in {".yaml", ".yml"} and p.is_file():
+        return yaml.safe_load(p.read_text()), p.stem
+    direct = digests_root / "records" / f"{ref}.yaml"
+    if direct.is_file():
+        return yaml.safe_load(direct.read_text()), ref
+    rec_dir = digests_root / "records"
+    if rec_dir.is_dir():
+        for f in sorted(rec_dir.glob("*.yaml")):
+            d = yaml.safe_load(f.read_text())
+            rec = d.get("record") or {}
+            if ref in (rec.get("id"), rec.get("title")):
+                return d, f.stem
+    return None
+
+
+def record_node(digest: dict, friendly_name: str) -> dict:
+    """Synthetic 'source' node so a record flows through the shared prompt /
+    section / slug machinery. friendly_name is the URL slug."""
+    rec = digest.get("record") or {}
+    return {
+        "id": rec.get("id") or friendly_name,
+        "type": "source",
+        "name": rec.get("title") or friendly_name,
+        "metadata": {"explicit_slug": friendly_name},
+        "content_hash": rec.get("content_hash"),
+        "friendly_name": friendly_name,
+    }
+
+
+def claims_from_digest(digest: dict) -> list[dict]:
+    """Map digest domain_claims to the claim-dict shape format_claim and
+    _check_date_fidelity consume. Document order is the digest's own order."""
+    rec = digest.get("record") or {}
+    out: list[dict] = []
+    for c in digest.get("domain_claims") or []:
+        sp = c.get("speaker")
+        sp = sp.get("name") if isinstance(sp, dict) else sp
+        out.append(
+            {
+                "id": c.get("id"),
+                "content": c.get("text", ""),
+                "original_excerpt": c.get("quote"),
+                "claim_type": c.get("type", "observation"),
+                "attestation": c.get("attestation") or "",
+                "location": c.get("location"),
+                "date": c.get("date"),
+                "date_end": None,
+                "record_title": rec.get("title") or "(unknown record)",
+                "record_date": rec.get("date") or "",
+                "record_content_hash": rec.get("content_hash"),
+                "speaker": sp or "",
+                "refs": _claim_refs(c),
+                "link_kind": "ref",
+            }
+        )
+    return out
+
+
+def related_from_digest(digest: dict) -> list[dict]:
+    """Digest nodes ranked by how many domain_claims reference each, for the
+    RELATED NODES link block the narrative draws on. Most-referenced first."""
+    counts: dict[str, int] = {}
+    for c in digest.get("domain_claims") or []:
+        for nm in _claim_refs(c):
+            counts[nm] = counts.get(nm, 0) + 1
+    nodes = [
+        {
+            "id": n.get("id"),
+            "type": n.get("type"),
+            "name": n.get("name"),
+            "metadata": None,
+            "shared_claims": counts.get(n.get("name"), 0),
+        }
+        for n in digest.get("nodes") or []
+        if n.get("name")
+    ]
+    nodes.sort(key=lambda x: x["shared_claims"], reverse=True)
+    return nodes[:30]
+
+
+def entity_url(node_type: str, name: str, content_root: Path) -> str | None:
+    """Encyclopaedia link for an entity: a bare, language-agnostic /<section>/<slug>
+    (the site adds the language prefix at render time). Returned only when the
+    page exists in the content repo, else null - the site renders plain text.
+
+    NB the slug is minted from the entity's per-record surface name, which can
+    diverge from the canonical entity-page slug across extractions. The existence
+    check makes that safe (mismatches yield null, never a broken link) but misses
+    real pages under a different canonical slug; resolving slugs from the graph's
+    canonical node name is the proper fix, pending cross-document naming work."""
+    section = SECTION_BY_TYPE.get(node_type, (node_type or "") + "s")
+    slug = slugify(name)
+    if output_path(content_root, section, slug).is_file():
+        return f"/{section}/{slug}"
+    return None
+
+
+def _format_duration(seconds) -> str | None:
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def record_metadata(digest: dict) -> dict:
+    """Source metadata for the page header, from the digest record block. The
+    publisher line prefers the `publisher` field (right for broadcast/web), and
+    falls back to `producer` (the ingest authors, set for authored sources).
+    Absent fields are omitted."""
+    rec = digest.get("record") or {}
+    md = {
+        "medium": rec.get("medium"),
+        "date": (str(rec.get("date") or "")[:10] or None),
+        "publisher": rec.get("publisher") or rec.get("producer"),
+        "duration": _format_duration(rec.get("duration")),
+    }
+    return {k: v for k, v in md.items() if v}
+
+
+def build_entities(digest: dict, content_root: Path) -> dict:
+    """Entities grouped by type for the collapsed breakdown. url resolves to the
+    encyclopaedia page when one exists, else null."""
+    nodes = digest.get("nodes") or []
+    out: dict[str, list] = {}
+    for t in ENTITY_TYPES:
+        items = [
+            {"name": n["name"], "url": entity_url(t, n["name"], content_root)}
+            for n in nodes
+            if n.get("type") == t and n.get("name")
+        ]
+        if items:
+            out[t] = items
+    return out
+
+
+def build_facts(digest: dict, content_root: Path) -> list[dict]:
+    """One self-contained fact card per domain claim, in document order. Each
+    carries its own quote/location/refs/workbench_url - the facts are NOT indexed
+    into the article references."""
+    rec = digest.get("record") or {}
+    ntype = {n.get("name"): n.get("type") for n in digest.get("nodes") or []}
+    public = _public_hash(rec.get("content_hash"))
+    facts: list[dict] = []
+    for c in digest.get("domain_claims") or []:
+        sp = c.get("speaker")
+        sp = sp.get("name") if isinstance(sp, dict) else sp
+        fact: dict = {"text": c.get("text", "")}
+        if sp:
+            fact["speaker"] = sp
+        if c.get("attestation"):
+            fact["attestation"] = c["attestation"]
+        fact["type"] = c.get("type", "observation")
+        refs = []
+        for nm in _claim_refs(c):
+            t = ntype.get(nm, "topic")
+            refs.append({"name": nm, "type": t, "url": entity_url(t, nm, content_root)})
+        if refs:
+            fact["refs"] = refs
+        if c.get("quote"):
+            fact["quote"] = c["quote"]
+        if c.get("location"):
+            fact["location"] = c["location"]
+        cid = c.get("id")
+        if cid and public:
+            fact["workbench_url"] = f"{WORKBENCH_ORIGIN}/{public}#claim-{cid}"
+        facts.append(fact)
+    return facts
+
+
 # ----------------------------------------------------------------------------
 # Slugs and paths
 # ----------------------------------------------------------------------------
@@ -248,7 +453,7 @@ references:
 
 <body prose, 3-6 paragraphs of British English, with inline citations as <sup>N</sup> matching the references list. Use ISO dates (2004-11-14). Don't invent any facts - every assertion must trace back to a CLAIM in the data below. Use the SAFE acronyms bare (UFO, UAP, CIA, FBI, NSA, NASA, DOD, FAA, NATO, UN, EU, US, USA, UK, USSR, GPS); expand domain acronyms on first use (Anomalous Aerial Vehicle (AAV), forward-looking infrared (FLIR), Advanced Aerospace Threat Identification Program (AATIP)).
 
-Within the body, link to related entities using markdown links of the form [Display Name](/<section>/<slug>) when the related entity appears in the RELATED NODES list above. For example: [2004 USS Nimitz encounter](/events/2004-uss-nimitz-encounter), [Strike Fighter Squadron 41 (VFA-41)](/organisations/strike-fighter-squadron-41-vfa-41). Only link nodes that appear in the related list; do not invent slugs.
+Within the body, link to related entities using markdown links of the form [Display Name](/<section>/<slug>) when the related entity appears in the RELATED NODES list above. For example: [2004 USS Nimitz encounter](/events/2004-uss-nimitz-encounter), [Strike Fighter Squadron 41 (VFA-41)](/organisations/strike-fighter-squadron-41-vfa-41). Use bare language-agnostic paths (no /en/ prefix); the site adds the language prefix at render time. Only link nodes that appear in the related list; do not invent slugs.
 
 For each <sup>N</sup> citation, ensure references[N-1] in the frontmatter is the matching source. Reference numbering must be sequential starting at 1. Each reference MUST carry a `claim_index` field with the 1-based index of the originating claim in the KNOWLEDGE GRAPH CLAIMS list below - this index lets downstream tooling link the reference back to the exact source claim in the workbench.
 
@@ -692,6 +897,31 @@ def render_article(
     )
 
 
+def render_record_page(
+    article_fm: dict, body: str, metadata: dict, entities: dict, facts: list[dict]
+) -> str:
+    """The two-part /records/ page: the model's article (title, description,
+    lean references, body) plus the deterministic metadata / entities / facts
+    breakdown the site renders below it. Frontmatter key order is the contract."""
+    frontmatter = {
+        "title": _display_name(article_fm.get("title", "")),
+        "description": article_fm.get("description", ""),
+        "noindex": True,
+        "metadata": metadata,
+        "references": article_fm.get("references", []),
+        "entities": entities,
+        "facts": facts,
+    }
+    body = _rewrite_link_display(body)
+    return (
+        "---\n"
+        + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + body.strip()
+        + "\n"
+    )
+
+
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
@@ -699,15 +929,28 @@ def render_article(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    ap.add_argument(
+    target = ap.add_mutually_exclusive_group(required=True)
+    target.add_argument(
         "--node",
-        required=True,
         help="Node name (e.g. 'Fravor, David') or uuid",
+    )
+    target.add_argument(
+        "--record",
+        help=(
+            "Assemble a per-record narrative + facts/entities page from the "
+            "per-record digest. Accepts a digest friendly_name (filename stem), "
+            "a path to a digest .yaml, or a record id / title"
+        ),
     )
     ap.add_argument(
         "--db",
         default=DEFAULT_DB,
-        help=f"Path to knowledge.db (default: {DEFAULT_DB})",
+        help=f"Path to knowledge.db, for --node mode (default: {DEFAULT_DB})",
+    )
+    ap.add_argument(
+        "--digests-root",
+        default=DEFAULT_DIGESTS_ROOT,
+        help=f"Path to digests repo, for --record mode (default: {DEFAULT_DIGESTS_ROOT})",
     )
     ap.add_argument(
         "--content-root",
@@ -734,14 +977,25 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
-    node = load_node(conn, args.node)
-    if not node:
-        print(f"node not found: {args.node!r}", file=sys.stderr)
-        return 2
+    digest: dict | None = None
+    if args.record:
+        loaded = load_digest(Path(args.digests_root), args.record)
+        if not loaded:
+            print(f"digest not found: {args.record!r}", file=sys.stderr)
+            return 2
+        digest, friendly_name = loaded
+        node = record_node(digest, friendly_name)
+        claims = claims_from_digest(digest)
+        related = related_from_digest(digest)
+    else:
+        conn = sqlite3.connect(args.db)
+        node = load_node(conn, args.node)
+        if not node:
+            print(f"node not found: {args.node!r}", file=sys.stderr)
+            return 2
+        claims = claims_for_node(conn, node["id"])
+        related = related_nodes(conn, node["id"])
 
-    claims = claims_for_node(conn, node["id"])
-    related = related_nodes(conn, node["id"])
     print(
         f"node: {node['name']} ({node['type']}, {node['id'][:8]})\n"
         f"  {len(claims)} claims, {len(related)} related nodes",
@@ -777,7 +1031,17 @@ def main() -> int:
         print(body[:1200], file=sys.stderr)
         return 4
 
-    article = render_article(fm, body, claims=claims)
+    if digest is not None:
+        content_root = Path(args.content_root)
+        article = render_record_page(
+            fm,
+            body,
+            metadata=record_metadata(digest),
+            entities=build_entities(digest, content_root),
+            facts=build_facts(digest, content_root),
+        )
+    else:
+        article = render_article(fm, body, claims=claims)
 
     if args.print_only:
         print(article)
