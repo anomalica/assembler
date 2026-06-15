@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Anomalica assembler v0 - graph-to-page generator.
 
-Queries the digester's SQLite knowledge graph for a single node, gathers all
-claims that reference or are spoken by it, formats those claims into a prompt,
-and asks Claude to produce a reference-style article in the Hugo content format
-the site expects.
+--node mode queries the digester's SQLite knowledge graph for a single node;
+--record mode reads a per-record digest (digests/records/{name}.yaml). Either
+way it formats claims into a prompt and asks Claude (the metered Anthropic API)
+to produce a reference-style article in the Hugo content format the site expects.
 
-Run via the digester container so we get python + Claude CLI + yaml/sqlite:
+Runs on the metered Anthropic API for billing isolation - no Claude Code / CLI.
+The digester container already carries python + the `anthropic` library + yaml +
+sqlite, so run there, injecting the Anomalica API key (no ~/.claude mounts):
+
+  ANTHROPIC_API_KEY=$(SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt \\
+    sops -d --extract '["ANTHROPIC_API_KEY"]' ~/repos/secrets/store/anomalica.yaml)
 
   docker run --rm \\
     -v /home/mark/repos/anomalica/assembler:/work \\
     -v /home/mark/.local/share/digester:/db:ro \\
     -v /home/mark/repos/anomalica/content:/content \\
     -v /home/mark/repos/anomalica/digests:/digests:ro \\
-    -v /home/mark/.local/bin/claude:/usr/local/bin/claude:ro \\
-    -v /home/mark/.claude:/home/nonroot/.claude \\
-    -v /home/mark/.claude.json:/home/nonroot/.claude.json \\
-    -v /tmp/digester-sandbox/empty-CLAUDE.md:/home/nonroot/.claude/CLAUDE.md:ro \\
-    -v /tmp/digester-sandbox/empty-settings.json:/home/nonroot/.claude/settings.json:ro \\
     --user $(id -u):$(id -g) --network host -e HOME=/home/nonroot \\
+    -e ANTHROPIC_API_KEY \\
     -w /work \\
     anomalica-digester:development \\
     python assembler.py --node "Fravor, David" --section people
@@ -31,7 +32,6 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -519,44 +519,48 @@ def build_prompt(node: dict, claims: list[dict], related: list[dict]) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Claude CLI - mirrors the pattern in digester/extract.py
+# Anthropic Messages API - mirrors digester/extract.py's _call_api.
+# The pipeline runs on the metered Anthropic API (ANTHROPIC_API_KEY in the
+# environment - the Anomalica key, for billing isolation), never the local
+# Claude Code / CLI transport.
 # ----------------------------------------------------------------------------
 
+API_MODEL_MAP = {
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-8",
+    "haiku": "claude-haiku-4-5",
+}
 
-def call_claude_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
-    """Send the prompt to the local Claude CLI; return the text response.
+_API_MAX_TOKENS = 16000
 
-    Pipes the prompt via stdin rather than @file so the CLI doesn't try to
-    "read" the prompt as a tool-Read input (which prompts a clarifying
-    question instead of generating when the file is large).
+
+def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    """Generate the article via the Anthropic Messages API and return its text.
+
+    Reads ANTHROPIC_API_KEY from the environment (the metered Anomalica key).
+    Streams so a large claims prompt doesn't trip the SDK's non-streaming time
+    guard; only the article narrative comes from the model - the facts/entities
+    breakdown is assembled deterministically.
     """
-    cmd = [
-        "claude",
-        "--model",
-        model,
-        "--effort",
-        "low",
-        "--output-format",
-        "json",
-        "--disable-slash-commands",
-        "--no-session-persistence",
-        "--dangerously-skip-permissions",
-        "--print",
-    ]
-    proc = subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, timeout=900
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr[:500]}")
-    try:
-        data = json.loads(proc.stdout)
-        if "result" in data:
-            return data["result"]
-        if "content" in data:
-            return data["content"]
-        return proc.stdout
-    except json.JSONDecodeError:
-        return proc.stdout
+    import anthropic
+
+    model_id = API_MODEL_MAP.get(model, model)
+    client = anthropic.Anthropic()
+    with client.messages.stream(
+        model=model_id,
+        max_tokens=_API_MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        message = stream.get_final_message()
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"API response hit max_tokens ({_API_MAX_TOKENS}); article truncated. "
+            "Raise _API_MAX_TOKENS."
+        )
+    for block in message.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    raise RuntimeError(f"API returned no text. stop_reason={message.stop_reason}")
 
 
 # ----------------------------------------------------------------------------
@@ -1008,7 +1012,7 @@ def main() -> int:
         return 0
 
     print(f"  prompt: {len(prompt):,} chars", file=sys.stderr)
-    response = call_claude_cli(prompt, model=args.model)
+    response = call_claude(prompt, model=args.model)
 
     try:
         fm, body = validate_article(response)
