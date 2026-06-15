@@ -468,6 +468,14 @@ Example of the failure mode to avoid:
 
 The test: read the cited claim's text. Could it be paraphrased to the sentence you wrote without adding new logic or temporal inference? If not, your citation is wrong - either fix the wording, drop the assertion, or pick a different claim that does support it directly.
 
+CITE AT THE LEVEL OF THE SPECIFIC, NOT THE SENTENCE:
+
+When one sentence asserts several specifics drawn from different claims (a shape AND a list of negatives; a location AND a distance AND a duration; a rank AND a unit AND a date), attach a separate <sup>N</sup> to each specific, citing the claim that actually contains THAT specific - e.g. "...no wings,<sup>14</sup> roughly 97 kilometres away,<sup>22</sup> in under a minute<sup>31</sup>". A single <sup> at the end of a multi-fact sentence is wrong unless one claim contains every one of those facts. (Failure example: writing "shaped like a Tic Tac with no wings and no exhaust"<sup>19</sup> when claim 19 describes only the Tic Tac shape - the "no wings"/"no exhaust" specifics live in other claims and must carry their own citations.)
+
+NEVER state a concrete specific - a number (distance, time, altitude, speed, count, dimension, dollar figure) or a discrete attribute ("no wings", "no exhaust") - unless that exact specific appears in the claim you cite for it. If no claim states a specific you want to write, leave it out. Do not approximate, round, unit-convert, or interpolate a figure that no claim states.
+
+The check for every <sup>N</sup>: take the clause it sits on, list each concrete specific in that clause, and confirm every one appears in references[N-1]'s claim. If any is missing from that claim, the citation is wrong - move the <sup> to the clause its claim supports, split the sentence, or drop the unsupported specific.
+
 If you cannot find a claim that directly supports an assertion you want to make, do not make the assertion. The article must be assembled from what the graph says, not from what the graph implies.
 
 KNOWLEDGE GRAPH CLAIMS (all available evidence for this {node_type}):
