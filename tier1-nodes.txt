@@ -1,0 +1,44 @@
+# Tier 1 nodes (>= 40 claims) to assemble. One per line; # comments ignored.
+# Excludes codenames that overlap existing event pages and type-duplicates.
+
+# people
+Coulthart, Ross
+Reid, Harry
+DeLonge, Tom
+Kean, Leslie
+Stratton, Jay
+Davis, Eric
+Farinaccio, Annie
+Whitaker, Bill
+Underwood, Chad
+Bigelow, Robert
+Crosson, Thomas
+Day, Kevin
+Kobitz, Nat
+
+# organisations
+Department of Defense (DoD)
+To the Stars Academy of Arts and Science
+CIA
+The New York Times
+Office of Under Secretary of Defense for Intelligence (OUSD(I))
+Advanced Aerospace Weapon System Applications Program (AAWSAP)
+US Air Force
+
+# events
+Westall UFO Sighting
+
+# matters
+Elizondo Advanced Aerospace Threat Identification Program (AATIP) Claims Investigation
+Nimitz UAP Incident, 2004
+Grusch Unidentified Anomalous Phenomena (UAP) Whistleblower Disclosure, 2023
+Advanced Aerospace Weapon System Applications Program
+Pentagon Advanced Aerospace Threat Identification Program (AATIP) UFO Program, 2007-2017
+UAP Biological Effects
+
+# documents
+Project Blue Book
+Gimbal Video
+
+# concepts
+Anomalous Aerial Vehicle (AAV)
