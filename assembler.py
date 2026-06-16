@@ -6,23 +6,20 @@
 way it formats claims into a prompt and asks Claude (the metered Anthropic API)
 to produce a reference-style article in the Hugo content format the site expects.
 
-Runs on the metered Anthropic API for billing isolation - no Claude Code / CLI.
-The digester container already carries python + the `anthropic` library + yaml +
-sqlite, so run there, injecting the Anomalica API key (no ~/.claude mounts):
+Generation defaults to the local Claude CLI on Mark's Max subscription (no
+metered spend, monitored live). Set ASSEMBLER_USE_API=1 to route through the
+metered Anthropic API instead (reads ANTHROPIC_API_KEY - the Anomalica key);
+the batch driver's spend gate covers that path. The toggle is load-bearing -
+the subscription is paused-not-cancelled - so neither transport is removed.
 
-  ANTHROPIC_API_KEY=$(SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt \\
-    sops -d --extract '["ANTHROPIC_API_KEY"]' ~/repos/secrets/store/anomalica.yaml)
+Run on the host (the `claude` CLI is on Mark's PATH), or in any environment
+carrying the CLI / the `anthropic` library:
 
-  docker run --rm \\
-    -v /home/mark/repos/anomalica/assembler:/work \\
-    -v /home/mark/.local/share/digester:/db:ro \\
-    -v /home/mark/repos/anomalica/content:/content \\
-    -v /home/mark/repos/anomalica/digests:/digests:ro \\
-    --user $(id -u):$(id -g) --network host -e HOME=/home/nonroot \\
-    -e ANTHROPIC_API_KEY \\
-    -w /work \\
-    anomalica-digester:development \\
-    python assembler.py --node "Fravor, David" --section people
+  # subscription (default)
+  python assembler.py --node "Fravor, David" --section people
+
+  # metered API
+  ASSEMBLER_USE_API=1 ANTHROPIC_API_KEY=... python assembler.py --node "..."
 """
 
 from __future__ import annotations
@@ -32,6 +29,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -527,10 +525,12 @@ def build_prompt(node: dict, claims: list[dict], related: list[dict]) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Anthropic Messages API - mirrors digester/extract.py's _call_api.
-# The pipeline runs on the metered Anthropic API (ANTHROPIC_API_KEY in the
-# environment - the Anomalica key, for billing isolation), never the local
-# Claude Code / CLI transport.
+# Claude generation. Two transports behind a runtime toggle:
+#   - default: the local Claude CLI on Mark's Max subscription (no metered spend,
+#     monitored live). _call_cli.
+#   - ASSEMBLER_USE_API=1: the metered Anthropic API (_call_api), mirroring
+#     digester/extract.py. Kept as a fallback - subscription billing is
+#     paused-not-cancelled, so the toggle is load-bearing.
 # ----------------------------------------------------------------------------
 
 API_MODEL_MAP = {
@@ -541,15 +541,68 @@ API_MODEL_MAP = {
 
 _API_MAX_TOKENS = 16000
 
+# Appended to the CLI's Claude Code system prompt to keep -p output to the bare
+# article (no preamble/commentary), since validate_article expects it to start
+# with the YAML front-matter fence.
+_CLI_SYSTEM = (
+    "You are generating a single reference article. Output ONLY the requested "
+    "YAML+markdown document, starting with --- and ending with the final body "
+    "paragraph. No preamble, no commentary, no tool use."
+)
+
+
+def _use_api() -> bool:
+    return os.environ.get("ASSEMBLER_USE_API", "").lower() in ("1", "true", "yes")
+
 
 def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
-    """Generate the article via the Anthropic Messages API and return its text.
+    """Generate the article. Defaults to the Claude subscription via the CLI;
+    set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
+    return _call_api(prompt, model) if _use_api() else _call_cli(prompt, model)
 
-    Reads ANTHROPIC_API_KEY from the environment (the metered Anomalica key).
-    Streams so a large claims prompt doesn't trip the SDK's non-streaming time
-    guard; only the article narrative comes from the model - the facts/entities
-    breakdown is assembled deterministically.
+
+def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    """Generate via the local Claude CLI on Mark's Max subscription (the default).
+
+    Pins --model explicitly (no flag defaults to Opus 1M, the most rate-limit
+    hungry) and disables tools so it is a pure generation, not the agentic stack.
+    Strips the CLAUDECODE / CLAUDE_CODE_* markers so the subprocess is not treated
+    as nested Claude Code. The full prompt is the user turn via stdin.
     """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
+    }
+    cmd = [
+        "claude",
+        "-p",
+        "--tools",
+        "",
+        "--model",
+        model,
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+        "--append-system-prompt",
+        _CLI_SYSTEM,
+    ]
+    proc = subprocess.run(
+        cmd, input=prompt, env=env, capture_output=True, text=True, timeout=900
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr[:500]}")
+    try:
+        return json.loads(proc.stdout).get("result", proc.stdout)
+    except json.JSONDecodeError:
+        return proc.stdout
+
+
+def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    """Generate via the metered Anthropic API (ASSEMBLER_USE_API=1). Reads
+    ANTHROPIC_API_KEY from the environment (the metered Anomalica key). Streams so
+    a large claims prompt doesn't trip the SDK's non-streaming time guard."""
     import anthropic
 
     model_id = API_MODEL_MAP.get(model, model)

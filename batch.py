@@ -96,26 +96,38 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     in_cost = total_in_tokens * in_price / 1_000_000
     out_cost = out_tokens * out_price / 1_000_000
     total = in_cost + out_cost
+    on_api = asm._use_api()
 
     print("=" * 60, file=sys.stderr)
-    print("BATCH SPEND ESTIMATE (metered Anthropic API)", file=sys.stderr)
+    if on_api:
+        print("BATCH SPEND ESTIMATE (metered Anthropic API)", file=sys.stderr)
+    else:
+        print(
+            "BATCH PRE-FLIGHT (Claude subscription - NO metered spend)",
+            file=sys.stderr,
+        )
     print(
         f"  {len(resolved)} {kind} x model={args.model} "
         f"(${in_price:.2f}/${out_price:.2f} per 1M in/out)",
         file=sys.stderr,
     )
     print(
-        f"  input  ~{total_in_tokens:,} tokens  -> ${in_cost:,.2f}",
+        f"  input ~{total_in_tokens:,} tokens, output ~{out_tokens:,} tokens "
+        f"(~{EST_OUTPUT_TOKENS}/item)",
         file=sys.stderr,
     )
-    print(
-        f"  output ~{out_tokens:,} tokens (~{EST_OUTPUT_TOKENS}/item)  -> ${out_cost:,.2f}",
-        file=sys.stderr,
-    )
-    print(
-        f"  ESTIMATED TOTAL: ${total:,.2f}  (conservative; actual usually lower)",
-        file=sys.stderr,
-    )
+    if on_api:
+        print(
+            f"  ESTIMATED METERED COST: ${total:,.2f}  (conservative; actual usually lower)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  Runs on Mark's Max subscription - no dollar spend, draws on plan "
+            f"rate limits. (Would cost ~${total:,.2f} on the metered API; set "
+            f"ASSEMBLER_USE_API=1 to use it.)",
+            file=sys.stderr,
+        )
     if unresolved:
         print(
             f"  {len(unresolved)} unresolved (skipped): {', '.join(unresolved[:5])}"
@@ -195,9 +207,13 @@ def main() -> int:
 
     resolved, _ = estimate(args, kind, items)
     if not args.confirm:
+        tail = (
+            "once the dollar amount above is cleared"
+            if asm._use_api()
+            else "to generate on the subscription"
+        )
         print(
-            "\nEstimate only - nothing generated, no spend. Re-run with --confirm "
-            "once the amount above is cleared.",
+            f"\nPre-flight only - nothing generated. Re-run with --confirm {tail}.",
             file=sys.stderr,
         )
         return 0
