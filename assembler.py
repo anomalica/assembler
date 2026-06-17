@@ -374,8 +374,13 @@ def build_facts(digest: dict, content_root: Path) -> list[dict]:
         if c.get("location"):
             fact["location"] = c["location"]
         cid = c.get("id")
-        if cid and public:
-            fact["workbench_url"] = f"{WORKBENCH_ORIGIN}/{public}#claim-{cid}"
+        if cid:
+            # The site sets id="claim-{claim_id}" on each fact card; a public
+            # claim link's #claim-<uuid> fragment lands here. Anchor is emitted
+            # independently of the (review-only, gated) workbench_url.
+            fact["claim_id"] = cid
+            if public:
+                fact["workbench_url"] = f"{WORKBENCH_ORIGIN}/{public}#claim-{cid}"
         facts.append(fact)
     return facts
 
@@ -886,14 +891,21 @@ def _public_hash(content_hash: str | None) -> str | None:
     return h[:PUBLIC_HASH_LENGTH] if len(h) >= PUBLIC_HASH_LENGTH else h
 
 
-def _augment_references(frontmatter: dict, claims: list[dict]) -> dict:
+def _augment_references(
+    frontmatter: dict, claims: list[dict], content_root: Path | None = None
+) -> dict:
     """For each reference the model produced, find the originating claim and
     augment the reference with deterministic provenance fields:
 
     - quote: the verbatim source text the claim was drawn from
     - claim_id: the claim's UUID, for workbench scroll-to-claim
     - record_hash: the source record's public_hash (first 56 of sha256)
-    - workbench_url: the full clickable link into the workbench
+    - workbench_url: review-only deep-link into the workbench (site gates it out
+      of public builds)
+    - inspection_url: public, language-agnostic deep-link to the source record's
+      public inspection page, /records/<slug>#claim-<uuid>. Emitted only when
+      that record page exists in content_root (so the site renders it iff
+      present); requires content_root to existence-check.
 
     Match strategy:
     1. If the reference carries claim_index (model followed the prompt), use
@@ -937,21 +949,33 @@ def _augment_references(frontmatter: dict, claims: list[dict]) -> dict:
             if ph:
                 out["record_hash"] = ph
                 out["workbench_url"] = f"{WORKBENCH_ORIGIN}/{ph}#claim-{cid}"
+            rec_slug = c.get("record_friendly_name")
+            if (
+                cid
+                and rec_slug
+                and content_root is not None
+                and output_path(content_root, "records", rec_slug).is_file()
+            ):
+                out["inspection_url"] = f"/records/{rec_slug}#claim-{cid}"
         augmented.append(out)
     return {**frontmatter, "references": augmented}
 
 
 def render_article(
-    frontmatter: dict, body: str, claims: list[dict] | None = None
+    frontmatter: dict,
+    body: str,
+    claims: list[dict] | None = None,
+    content_root: Path | None = None,
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
         frontmatter = {**frontmatter, "title": _display_name(frontmatter["title"])}
     # Augment each reference with the deterministic provenance fields drawn
     # from the originating claim's DB row (id, content_hash, original
-    # excerpt, workbench link). Only runs when the claims list is provided.
+    # excerpt, workbench link, public inspection link). Only runs when the
+    # claims list is provided.
     if claims is not None:
-        frontmatter = _augment_references(frontmatter, claims)
+        frontmatter = _augment_references(frontmatter, claims, content_root)
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1106,7 +1130,9 @@ def main() -> int:
             facts=build_facts(digest, content_root),
         )
     else:
-        article = render_article(fm, body, claims=claims)
+        article = render_article(
+            fm, body, claims=claims, content_root=Path(args.content_root)
+        )
 
     if args.print_only:
         print(article)
