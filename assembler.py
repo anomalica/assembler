@@ -443,7 +443,7 @@ Your ENTIRE response must be a single YAML+markdown document in this exact shape
 
 ---
 title: "<the node's display name>"
-description: "<one-sentence summary, what this {node_type} is>"
+description: "<one-sentence PLAIN-TEXT summary of what this {node_type} is - no markdown (no *italics*, **bold**, or backticks); this also becomes the page's search-engine description>"
 metadata:
   <type-appropriate fields - role/affiliation/rank for persons; date/location for events; founded/headquartered for organisations; status/type for objects; etc. Omit metadata block entirely if you have nothing to say>
 references:
@@ -757,6 +757,19 @@ def _check_date_fidelity(
     return bad
 
 
+def _plain_text(s: str) -> str:
+    """Strip markdown emphasis / code markers so a plain-text field doesn't render
+    literal *, _, or backticks. description is plain text and also feeds the SEO
+    <meta description>, where markdown is just wrong (the model occasionally
+    italicises a publication title, e.g. *60 Minutes*)."""
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"\*(.+?)\*", r"\1", s)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"_(.+?)_", r"\1", s)
+    s = re.sub(r"`(.+?)`", r"\1", s)
+    return s
+
+
 def validate_article(text: str) -> tuple[dict, str]:
     """Parse the model's output: YAML frontmatter + markdown body.
 
@@ -843,6 +856,11 @@ def validate_article(text: str) -> tuple[dict, str]:
                 "'references' list - model probably emitted references in body "
                 "without a clear separator, recovery missed them"
             )
+
+    # description is plain text (it also becomes the SEO meta description) -
+    # strip any markdown emphasis the model added.
+    if isinstance(fm.get("description"), str):
+        fm["description"] = _plain_text(fm["description"])
 
     return fm, body
 
@@ -1122,6 +1140,12 @@ def main() -> int:
 
     if digest is not None:
         content_root = Path(args.content_root)
+        # Give the record page's references the same per-claim provenance
+        # (quote, claim_id, record_hash, workbench_url) as entity-article
+        # references, for review-link parity. inspection_url is naturally
+        # skipped here - digest claims carry no record_friendly_name, and the
+        # references are already on this record's inspection page.
+        fm = _augment_references(fm, claims, content_root)
         article = render_record_page(
             fm,
             body,
