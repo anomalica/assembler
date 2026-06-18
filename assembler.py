@@ -546,6 +546,10 @@ API_MODEL_MAP = {
 
 _API_MAX_TOKENS = 16000
 
+# Total generation attempts before giving up - a flaky pass that trips
+# validate_article or date-fidelity is regenerated rather than hard-failed.
+_MAX_GEN_ATTEMPTS = 3
+
 # Appended to the CLI's Claude Code system prompt to keep -p output to the bare
 # article (no preamble/commentary), since validate_article expects it to start
 # with the YAML front-matter fence.
@@ -1115,28 +1119,45 @@ def main() -> int:
         return 0
 
     print(f"  prompt: {len(prompt):,} chars", file=sys.stderr)
-    response = call_claude(prompt, model=args.model)
 
-    try:
-        fm, body = validate_article(response)
-    except ValueError as exc:
-        print(f"INVALID ARTICLE: {exc}", file=sys.stderr)
-        print("--- raw response ---", file=sys.stderr)
+    # Generation is non-deterministic: an occasional pass trips validate_article
+    # or the date-fidelity guard (a fabricated year/date - site master found this
+    # when a Roswell body contained "2025-07-05" for a 1947 event). Retry a few
+    # times before giving up, rather than hard-failing one flaky pass - silent at
+    # corpus scale otherwise. Each retry is another generation (rate limits on the
+    # subscription, metered tokens on the API), but only on failure.
+    fm = body = response = None
+    fail_code, fail_msg = 3, ""
+    for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
+        response = call_claude(prompt, model=args.model)
+        try:
+            fm, body = validate_article(response)
+        except ValueError as exc:
+            fail_code, fail_msg = 3, f"invalid article: {exc}"
+            fm = body = None
+            print(
+                f"  attempt {attempt}/{_MAX_GEN_ATTEMPTS}: {fail_msg}", file=sys.stderr
+            )
+            continue
+        date_problems = _check_date_fidelity(body, claims, related)
+        if date_problems:
+            fail_code = 4
+            fail_msg = "date-fidelity: " + "; ".join(date_problems)
+            fm = body = None
+            print(
+                f"  attempt {attempt}/{_MAX_GEN_ATTEMPTS}: {fail_msg}", file=sys.stderr
+            )
+            continue
+        break  # passed both gates
+
+    if fm is None:
+        print(
+            f"GENERATION FAILED after {_MAX_GEN_ATTEMPTS} attempts ({fail_msg})",
+            file=sys.stderr,
+        )
+        print("--- last raw response ---", file=sys.stderr)
         print(response, file=sys.stderr)
-        return 3
-
-    # Date-fidelity guardrail: any year or ISO date in the assembled body
-    # must trace back to a source claim. Fails loud if the model fabricated
-    # a year/date. Site master found this when the Roswell body contained
-    # "2025-07-05" for a 1947 event.
-    date_problems = _check_date_fidelity(body, claims, related)
-    if date_problems:
-        print("DATE FIDELITY VIOLATION - article will not be written:", file=sys.stderr)
-        for p in date_problems:
-            print(f"  {p}", file=sys.stderr)
-        print("--- body (head) ---", file=sys.stderr)
-        print(body[:1200], file=sys.stderr)
-        return 4
+        return fail_code
 
     if digest is not None:
         content_root = Path(args.content_root)
