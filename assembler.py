@@ -272,8 +272,10 @@ def claims_from_digest(digest: dict) -> list[dict]:
 
 
 def related_from_digest(digest: dict) -> list[dict]:
-    """Digest nodes ranked by how many domain_claims reference each, for the
-    RELATED NODES link block the narrative draws on. Most-referenced first."""
+    """ALL entities this record references, ranked by how many domain_claims
+    mention each, as the linkable set for the narrative. Uncapped (over-linking:
+    the model links every entity it mentions; the site strips links whose page
+    doesn't exist), canonical slug per node via the shared slugifier."""
     counts: dict[str, int] = {}
     for c in digest.get("domain_claims") or []:
         for nm in _claim_refs(c):
@@ -290,7 +292,7 @@ def related_from_digest(digest: dict) -> list[dict]:
         if n.get("name")
     ]
     nodes.sort(key=lambda x: x["shared_claims"], reverse=True)
-    return nodes[:30]
+    return nodes
 
 
 def entity_url(node_type: str, name: str, content_root: Path) -> str | None:
@@ -335,6 +337,12 @@ def record_metadata(digest: dict) -> dict:
     return {k: v for k, v in md.items() if v}
 
 
+# NOTE: build_entities / build_facts are retained but NOT currently emitted - the
+# record page dropped the inline facts/entities QA breakdown (Mark's call: it lives
+# in the workbench now, reached via the page's record_hash link). Re-enabling the
+# inline breakdown is a render_record_page change plus restoring the two calls in
+# main(). Kept because the breakdown logic is tested and may return as a
+# reviewer-preview block.
 def build_entities(digest: dict, content_root: Path) -> dict:
     """Entities grouped by type for the collapsed breakdown. url resolves to the
     encyclopaedia page when one exists, else null."""
@@ -547,7 +555,7 @@ references:
 
 <body prose, 3-6 paragraphs of British English, with inline citations as <sup>N</sup> matching the references list. Use ISO dates (2004-11-14). Don't invent any facts - every assertion must trace back to a CLAIM in the data below. Use the SAFE acronyms bare (UFO, UAP, CIA, FBI, NSA, NASA, DOD, FAA, NATO, UN, EU, US, USA, UK, USSR, GPS); expand domain acronyms on first use (Anomalous Aerial Vehicle (AAV), forward-looking infrared (FLIR), Advanced Aerospace Threat Identification Program (AATIP)).
 
-Within the body, link to related entities using markdown links of the form [Display Name](/<section>/<slug>) when the related entity appears in the RELATED NODES list above. For example: [2004 USS Nimitz encounter](/events/2004-uss-nimitz-encounter), [Strike Fighter Squadron 41 (VFA-41)](/organisations/strike-fighter-squadron-41-vfa-41). Use bare language-agnostic paths (no /en/ prefix); the site adds the language prefix at render time. Only link nodes that appear in the related list; do not invent slugs.
+Within the body, link entities using markdown links of the form [Display Name](/<section>/<slug>), taking the slug verbatim from the LINKABLE ENTITIES list above. Link EVERY entity from that list the first time you mention it in the body - over-link rather than under-link. The site automatically removes any link whose target page does not yet exist, so a link that turns out dead costs nothing, but a missing link loses a real connection - so when in doubt, link it. For example: [2004 USS Nimitz encounter](/events/2004-uss-nimitz-encounter), [Strike Fighter Squadron 41 (VFA-41)](/organisations/strike-fighter-squadron-41-vfa-41). Use bare language-agnostic paths (no /en/ prefix); the site adds the language prefix at render time. Use ONLY slugs from the LINKABLE ENTITIES list - never invent or guess a slug for an entity not in the list (a guessed slug is silently dropped, losing the link). Use plain markdown links only, never raw HTML anchors.
 
 For each <sup>N</sup> citation, ensure references[N-1] in the frontmatter is the matching source. Reference numbering must be sequential starting at 1. Each reference MUST carry a `claim_index` field with the 1-based index of the originating claim in the KNOWLEDGE GRAPH CLAIMS list below - this index lets downstream tooling link the reference back to the exact source claim in the workbench.
 
@@ -583,7 +591,11 @@ OUTPUT - the article as described above, starting with --- and ending with the c
 def format_related_block(related: list[dict]) -> str:
     if not related:
         return ""
-    lines = ["", "RELATED NODES YOU MAY LINK TO (only these slugs are valid):"]
+    lines = [
+        "",
+        "LINKABLE ENTITIES - link every one you mention in the body, using its "
+        "slug verbatim (these are the only valid slugs):",
+    ]
     for r in related:
         t = r.get("type") or "topic"
         section = SECTION_BY_TYPE.get(t, t + "s")
@@ -1125,20 +1137,22 @@ def render_article(
 
 
 def render_record_page(
-    article_fm: dict, body: str, metadata: dict, entities: dict, facts: list[dict]
+    article_fm: dict, body: str, metadata: dict, record_hash: str | None
 ) -> str:
-    """The two-part /records/ page: the model's article (title, description,
-    lean references, body) plus the deterministic metadata / entities / facts
-    breakdown the site renders below it. Frontmatter key order is the contract."""
+    """The public /records/ inspection page: the model's article (title,
+    description, references, body) + source metadata + a record_hash the site
+    turns into a "view the facts breakdown in the workbench" link
+    ({workbenchUrl}/{record_hash}). The facts/entities QA breakdown is NOT emitted
+    - it is consolidated in the workbench, not the public site."""
     frontmatter = {
         "title": _display_name(article_fm.get("title", "")),
         "description": article_fm.get("description", ""),
         "noindex": True,
         "metadata": metadata,
-        "references": article_fm.get("references", []),
-        "entities": entities,
-        "facts": facts,
     }
+    if record_hash:
+        frontmatter["record_hash"] = record_hash
+    frontmatter["references"] = article_fm.get("references", [])
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1316,12 +1330,12 @@ def main() -> int:
         # skipped here - digest claims carry no record_friendly_name, and the
         # references are already on this record's inspection page.
         fm = _augment_references(fm, claims, content_root)
+        rec = digest.get("record") or {}
         article = render_record_page(
             fm,
             body,
             metadata=record_metadata(digest),
-            entities=build_entities(digest, content_root),
-            facts=build_facts(digest, content_root),
+            record_hash=_public_hash(rec.get("content_hash")),
         )
     elif brief is not None:
         article = render_article(
