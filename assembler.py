@@ -834,12 +834,17 @@ def _check_date_fidelity(
     """
     src_years, src_iso = _collect_source_dates(claims)
 
-    # Also allow years that appear in related-node names (e.g. linked event
-    # titles) since the assembler explicitly invites those as link targets.
+    # Also allow years AND full ISO dates that appear in related-node names
+    # (e.g. linked event titles like "AATIP Denial, 2019-06-14") since the
+    # assembler explicitly invites those as link targets - the model lifting a
+    # date out of a name it was told to link is sourced, not invented.
     if related:
         for r in related:
-            for m in re.findall(r"\b(19\d{2}|20\d{2})\b", r.get("name", "")):
+            name = r.get("name", "")
+            for m in re.findall(r"\b(19\d{2}|20\d{2})\b", name):
                 src_years.add(m)
+            for m in re.findall(r"\b(\d{4}-\d{2}(?:-\d{2})?)\b", name):
+                src_iso.add(m)
 
     # Strip out markdown link targets (the URL) before scanning so slug-form
     # years inside (/events/1947-roswell-uap-crash) don't count as body
@@ -856,12 +861,15 @@ def _check_date_fidelity(
     for d in body_iso:
         if d in src_iso:
             continue
-        # A YYYY-MM-DD whose year is sourced AND whose YYYY-MM prefix is
-        # sourced is borderline-acceptable (the model may have promoted a
-        # known year-month to a specific day). Treat that as failure too -
-        # if the day isn't in source, the model invented it.
-        if d not in src_iso:
-            bad.append(f"date {d!r} not in source claims")
+        # A body date that is a date-component PREFIX of a source date is
+        # sourced: the model dropped detail (wrote 2017-12 where the source has
+        # 2017-12-07) rather than inventing it. The reverse is still a failure -
+        # a body YYYY-MM-DD whose YYYY-MM is in source but whose day is not means
+        # the model invented the day - because a shorter source never startswith
+        # a longer body date.
+        if any(s == d or s.startswith(d + "-") for s in src_iso):
+            continue
+        bad.append(f"date {d!r} not in source claims")
     return bad
 
 
