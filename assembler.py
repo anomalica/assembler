@@ -41,6 +41,7 @@ from anomalica_common.slug import slugify
 DEFAULT_DB = "/db/knowledge.db"
 DEFAULT_CONTENT_ROOT = "/content"
 DEFAULT_DIGESTS_ROOT = "/digests"
+DEFAULT_BRIEFS_ROOT = os.environ.get("ANOMALICA_BRIEFS_DIR", "/briefs")
 DEFAULT_MODEL = "sonnet"
 
 # Entity types surfaced in a record page's `entities` breakdown, in display
@@ -387,6 +388,107 @@ def build_facts(digest: dict, content_root: Path) -> list[dict]:
                 fact["workbench_url"] = f"{WORKBENCH_ORIGIN}/{public}#claim-{cid}"
         facts.append(fact)
     return facts
+
+
+# ----------------------------------------------------------------------------
+# Brief queries - entity articles from synthesiser briefs (anomalica/brief/1).
+# The brief is the SOLE source: render its claims, invent nothing. page.slug and
+# related_nodes[].slug are the FINAL (canonical + disambiguated) URLs - consumed
+# verbatim, never re-slugified.
+# ----------------------------------------------------------------------------
+
+
+def load_brief(briefs_root: Path, ref: str) -> tuple[dict, str] | None:
+    """Locate and parse a synthesiser brief. `ref` is a page slug (the filename
+    stem) or a path to a brief .yaml. Returns (brief, slug) or None."""
+    p = Path(ref)
+    if p.suffix in {".yaml", ".yml"} and p.is_file():
+        return yaml.safe_load(p.read_text()), p.stem
+    direct = briefs_root / f"{ref}.yaml"
+    if direct.is_file():
+        return yaml.safe_load(direct.read_text()), ref
+    return None
+
+
+def brief_node(brief: dict) -> dict:
+    """Synthetic node from the brief's page block. page.slug is the FINAL,
+    disambiguated URL slug - carried as explicit_slug so node_slug returns it
+    verbatim (never re-slugified from the title)."""
+    pg = brief.get("page") or {}
+    return {
+        "id": pg.get("node_id"),
+        "type": pg.get("node_type"),
+        "name": pg.get("title") or "",
+        "metadata": {"explicit_slug": pg.get("slug")},
+    }
+
+
+def claims_from_brief(brief: dict) -> list[dict]:
+    """Map the brief's ordered claim selection to the claim-dict shape
+    format_claim / _augment_references / _check_date_fidelity consume, carrying
+    claim_hash for the built_from freeze."""
+    out: list[dict] = []
+    for c in brief.get("claims") or []:
+        sp = c.get("speaker")
+        sp_name = sp.get("title") if isinstance(sp, dict) else sp
+        prov = c.get("provenance") or {}
+        out.append(
+            {
+                "id": c.get("claim_id"),
+                "claim_hash": c.get("claim_hash"),
+                "content": c.get("content", ""),
+                "original_excerpt": c.get("original_excerpt"),
+                "claim_type": c.get("claim_type", "observation"),
+                "attestation": c.get("attestation") or "",
+                "location": c.get("location_in_record"),
+                "date": c.get("date"),
+                "date_end": c.get("date_end"),
+                "record_title": prov.get("record_title") or "(unknown record)",
+                "record_date": prov.get("record_date") or "",
+                "record_reference": prov.get("record_reference"),
+                "record_content_hash": prov.get("content_hash"),
+                "record_friendly_name": prov.get("friendly_name"),
+                "speaker": sp_name or "",
+                "refs": [
+                    r.get("title")
+                    for r in (c.get("node_refs") or [])
+                    if isinstance(r, dict) and r.get("title")
+                ],
+                "link_kind": "ref",
+            }
+        )
+    return out
+
+
+def related_from_brief(brief: dict) -> list[dict]:
+    """The brief's related_nodes ("you may link to" set), most-shared first as
+    the synthesiser ranked them. Each carries its FINAL slug as explicit_slug so
+    cross-links use it verbatim."""
+    return [
+        {
+            "id": rn.get("node_id"),
+            "type": rn.get("node_type"),
+            "name": rn.get("title"),
+            "metadata": {"explicit_slug": rn.get("slug")},
+            "shared_claims": rn.get("shared_claims", 0),
+        }
+        for rn in brief.get("related_nodes") or []
+        if rn.get("title")
+    ]
+
+
+def built_from_block(brief: dict) -> dict:
+    """The article-level audit field: the brief's brief_hash + the ORDERED list of
+    {id, hash} the brief contained. Copied verbatim - the assembler computes no
+    hash (single source: assimilator owns claim_hash, synthesiser owns brief_hash).
+    Lets staleness detection diff a page's built brief against a rebuilt one."""
+    return {
+        "brief_hash": brief.get("brief_hash"),
+        "claims": [
+            {"id": c.get("claim_id"), "hash": c.get("claim_hash")}
+            for c in brief.get("claims") or []
+        ],
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -972,15 +1074,35 @@ def _augment_references(
     return {**frontmatter, "references": augmented}
 
 
+def _insert_after(fm: dict, after_key: str, key: str, value) -> dict:
+    """Return fm with `key: value` inserted directly after `after_key` (or
+    appended if after_key is absent), preserving insertion order."""
+    out: dict = {}
+    placed = False
+    for k, v in fm.items():
+        out[k] = v
+        if k == after_key:
+            out[key] = value
+            placed = True
+    if not placed:
+        out[key] = value
+    return out
+
+
 def render_article(
     frontmatter: dict,
     body: str,
     claims: list[dict] | None = None,
     content_root: Path | None = None,
+    built_from: dict | None = None,
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
         frontmatter = {**frontmatter, "title": _display_name(frontmatter["title"])}
+    # built_from audit field (brief-sourced entity articles): slot it after
+    # metadata, before references, per the contract.
+    if built_from is not None:
+        frontmatter = _insert_after(frontmatter, "metadata", "built_from", built_from)
     # Augment each reference with the deterministic provenance fields drawn
     # from the originating claim's DB row (id, content_hash, original
     # excerpt, workbench link, public inspection link). Only runs when the
@@ -1042,6 +1164,14 @@ def main() -> int:
             "a path to a digest .yaml, or a record id / title"
         ),
     )
+    target.add_argument(
+        "--brief",
+        help=(
+            "Assemble an entity article from a synthesiser brief (the brief is the "
+            "sole source; freezes built_from). Accepts a page slug (filename stem) "
+            "or a path to a brief .yaml. Supersedes --node DB-direct (ADR 0036)"
+        ),
+    )
     ap.add_argument(
         "--db",
         default=DEFAULT_DB,
@@ -1051,6 +1181,11 @@ def main() -> int:
         "--digests-root",
         default=DEFAULT_DIGESTS_ROOT,
         help=f"Path to digests repo, for --record mode (default: {DEFAULT_DIGESTS_ROOT})",
+    )
+    ap.add_argument(
+        "--briefs-root",
+        default=DEFAULT_BRIEFS_ROOT,
+        help=f"Path to briefs dir, for --brief mode (default: {DEFAULT_BRIEFS_ROOT})",
     )
     ap.add_argument(
         "--content-root",
@@ -1078,7 +1213,17 @@ def main() -> int:
     args = ap.parse_args()
 
     digest: dict | None = None
-    if args.record:
+    brief: dict | None = None
+    if args.brief:
+        loaded = load_brief(Path(args.briefs_root), args.brief)
+        if not loaded:
+            print(f"brief not found: {args.brief!r}", file=sys.stderr)
+            return 2
+        brief, _slug = loaded
+        node = brief_node(brief)
+        claims = claims_from_brief(brief)
+        related = related_from_brief(brief)
+    elif args.record:
         loaded = load_digest(Path(args.digests_root), args.record)
         if not loaded:
             print(f"digest not found: {args.record!r}", file=sys.stderr)
@@ -1162,6 +1307,14 @@ def main() -> int:
             metadata=record_metadata(digest),
             entities=build_entities(digest, content_root),
             facts=build_facts(digest, content_root),
+        )
+    elif brief is not None:
+        article = render_article(
+            fm,
+            body,
+            claims=claims,
+            content_root=Path(args.content_root),
+            built_from=built_from_block(brief),
         )
     else:
         article = render_article(
