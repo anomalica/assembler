@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 
 import yaml
+from anomalica_common.slug import node_slug as _node_slug
+from anomalica_common.slug import slugify
 
 
 DEFAULT_DB = "/db/knowledge.db"
@@ -392,30 +394,15 @@ def build_facts(digest: dict, content_root: Path) -> list[dict]:
 # ----------------------------------------------------------------------------
 
 
-def slugify(name: str) -> str:
-    """Produce a kebab-case slug from a node name. Person names in 'Last,
-    First' form are reordered to 'first-last'; everything else is just
-    lowercased and hyphenated."""
-    if "," in name:
-        parts = [p.strip() for p in name.split(",", 1)]
-        if len(parts) == 2:
-            name = f"{parts[1]} {parts[0]}"
-    s = re.sub(r"[^\w\s-]", "", name.lower())
-    s = re.sub(r"[\s_]+", "-", s).strip("-")
-    return s or "untitled"
-
-
+# slugify + node_slug are imported from anomalica_common.slug - the single
+# canonical slugifier shared with the assimilator/synthesiser, so a brief's
+# page.slug and the assembler's deployed page slug cannot drift (same discipline
+# as claim_hash). This thin adapter keeps the node-dict call interface; it holds
+# no slug logic of its own.
 def node_slug(node: dict) -> str:
-    """Return the URL slug for a node, honouring metadata.explicit_slug if set
-    (ADR 0028 patterns use this to get short URLs like /patterns/shifting-
-    official-accounts/ instead of slugifying the long display name). Falls
-    back to slugify(node["name"]) when no override is present.
-    """
-    md = node.get("metadata") or {}
-    explicit = md.get("explicit_slug")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    return slugify(node["name"])
+    """URL slug for a node dict, via the canonical slugifier. Honours
+    metadata.explicit_slug (ADR 0028 pattern short URLs)."""
+    return _node_slug(node.get("name", ""), node.get("metadata"))
 
 
 def output_path(content_root: Path, section: str, slug: str, lang: str = "en") -> Path:
