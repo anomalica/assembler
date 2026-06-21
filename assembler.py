@@ -449,14 +449,14 @@ def claims_from_brief(brief: dict) -> list[dict]:
                 "record_content_hash": prov.get("content_hash"),
                 "record_friendly_name": prov.get("friendly_name"),
                 "speaker": sp_name or "",
-                "refs": [
-                    r.get("title")
-                    for r in (c.get("node_refs") or [])
-                    if isinstance(r, dict) and r.get("title")
-                ],
                 "link_kind": "ref",
             }
         )
+    # Deliberately NOT consumed in v1 (entity-article shape doesn't surface them):
+    # claim.node_refs (per-claim entity chips are a record-page feature) and
+    # claim.evidence.independent_sources (forward-provisioned, neutral until
+    # evidence-scoring pins). Both remain in the brief if a future version wants
+    # them; node_refs carries node_id so links could resolve to canonical slugs.
     return out
 
 
@@ -585,11 +585,12 @@ def format_related_block(related: list[dict]) -> str:
         return ""
     lines = ["", "RELATED NODES YOU MAY LINK TO (only these slugs are valid):"]
     for r in related:
-        section = SECTION_BY_TYPE.get(r["type"], r["type"] + "s")
+        t = r.get("type") or "topic"
+        section = SECTION_BY_TYPE.get(t, t + "s")
         slug = node_slug(r)
         lines.append(
-            f"  - [{r['name']}](/{section}/{slug}) - {r['type']}, "
-            f"co-appears in {r['shared_claims']} claims"
+            f"  - [{r['name']}](/{section}/{slug}) - {t}, "
+            f"co-appears in {r.get('shared_claims', 0)} claims"
         )
     return "\n".join(lines)
 
@@ -1099,10 +1100,14 @@ def render_article(
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
         frontmatter = {**frontmatter, "title": _display_name(frontmatter["title"])}
-    # built_from audit field (brief-sourced entity articles): slot it after
-    # metadata, before references, per the contract.
+    # built_from audit field (brief-sourced entity articles): the brief's freeze
+    # is authoritative, so drop any model-emitted built_from first, then slot it
+    # after metadata - or after description when the model omits the optional
+    # metadata block - so it always lands in the head, never after references.
     if built_from is not None:
-        frontmatter = _insert_after(frontmatter, "metadata", "built_from", built_from)
+        frontmatter = {k: v for k, v in frontmatter.items() if k != "built_from"}
+        anchor = "metadata" if "metadata" in frontmatter else "description"
+        frontmatter = _insert_after(frontmatter, anchor, "built_from", built_from)
     # Augment each reference with the deterministic provenance fields drawn
     # from the originating claim's DB row (id, content_hash, original
     # excerpt, workbench link, public inspection link). Only runs when the
@@ -1220,6 +1225,15 @@ def main() -> int:
             print(f"brief not found: {args.brief!r}", file=sys.stderr)
             return 2
         brief, _slug = loaded
+        if not brief.get("brief_hash") or any(
+            not c.get("claim_hash") for c in brief.get("claims") or []
+        ):
+            print(
+                f"brief {args.brief!r} missing brief_hash or a claim_hash - "
+                "refusing to write a page with a broken built_from audit field",
+                file=sys.stderr,
+            )
+            return 2
         node = brief_node(brief)
         claims = claims_from_brief(brief)
         related = related_from_brief(brief)
@@ -1242,7 +1256,8 @@ def main() -> int:
         related = related_nodes(conn, node["id"])
 
     print(
-        f"node: {node['name']} ({node['type']}, {node['id'][:8]})\n"
+        f"node: {node.get('name')} ({node.get('type')}, "
+        f"{(node.get('id') or '?')[:8]})\n"
         f"  {len(claims)} claims, {len(related)} related nodes",
         file=sys.stderr,
     )
