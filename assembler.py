@@ -545,6 +545,8 @@ THE NODE THIS ARTICLE IS ABOUT:
 INSTRUCTIONS:
 
 Write a single article in British English about this {node_type}. The article goes on a public reference website (Anomalica) about unidentified anomalous phenomena (UAP) research. Tone: neutral, encyclopaedic, like a Wikipedia article. Do not editorialise. Do not advocate.
+
+SPELLING - British English throughout, with ONE exception: proper nouns keep their official/original spelling. Never Briticise the words inside an official American name. US government bodies retain American spelling - "Department of Defense" (never "Defence"), "Defense Intelligence Agency" (never "Defence Intelligence Agency"), "Secretary of Defense", "Office of the Secretary of Defense"; and official US programme names keep "Program" - "Advanced Aerospace Threat Identification Program" (never "Programme"). The British forms (defence, programme, organisation, ...) are correct only as ordinary words, not when they sit inside a proper noun that is spelled the American way officially.
 {directives_block}
 Your ENTIRE response must be a single YAML+markdown document in this exact shape:
 
