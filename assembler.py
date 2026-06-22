@@ -68,6 +68,14 @@ WORKBENCH_ORIGIN = os.environ.get(
 ).rstrip("/")
 PUBLIC_HASH_LENGTH = 56
 
+# Frontmatter keys the assembler NEVER generates - they are human-authored
+# (reviewers write `directives` strings via the workbench). A (re)assembly fully
+# overwrites the article file, so these are carried across from the existing file
+# or the human's edit is lost. The model owns everything else (title, tags,
+# description, references, ...); tags stay model-owned (grounded tags supersede
+# them), so tags are deliberately NOT here.
+_PRESERVE_KEYS = ("directives",)
+
 # Section the article goes into is mapped from the node's type. The site's
 # Hugo layout expects content/english/{section}/{slug}.en.md.
 SECTION_BY_TYPE = {
@@ -1171,6 +1179,62 @@ def render_record_page(
     )
 
 
+def _split_article(text: str) -> tuple[dict, str] | None:
+    """Split a rendered article string into (frontmatter dict, body), or None if
+    it is not the expected `---`-delimited shape. Deliberately lighter than
+    validate_article: no required-key checks, so it tolerates older on-disk
+    frontmatter when reading an existing file to preserve from."""
+    text = text.strip()
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        fm = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict):
+        return None
+    return fm, parts[2].strip()
+
+
+def _preserve_authored_fields(new_article: str, existing_path: Path) -> str:
+    """Carry human-authored frontmatter keys (_PRESERVE_KEYS, e.g. reviewer
+    `directives`) from the existing article into a freshly-rendered one, which
+    otherwise fully overwrites the file and would wipe them. The model never
+    emits these keys, so the existing file's value is authoritative.
+
+    Re-dumps the new frontmatter with the same serialiser the render functions
+    use; fresh assembler output round-trips identically, so only the preserved
+    block is added - every model-owned field stays byte-for-byte unchanged."""
+    if not existing_path.is_file():
+        return new_article
+    existing = _split_article(existing_path.read_text())
+    if existing is None:
+        return new_article
+    existing_fm, _ = existing
+    preserved = {k: existing_fm[k] for k in _PRESERVE_KEYS if k in existing_fm}
+    if not preserved:
+        return new_article
+    parsed = _split_article(new_article)
+    if parsed is None:  # our own output is always well-formed; defensive
+        return new_article
+    new_fm, new_body = parsed
+    for key, value in preserved.items():
+        # Drop any model-emitted value first so the human-authored one wins,
+        # then slot the block near the top (after title) for readability.
+        new_fm = {k: v for k, v in new_fm.items() if k != key}
+        new_fm = _insert_after(new_fm, "title", key, value)
+    return (
+        "---\n"
+        + yaml.safe_dump(new_fm, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + new_body
+        + "\n"
+    )
+
+
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
@@ -1366,6 +1430,7 @@ def main() -> int:
     slug = node_slug(node)
     out = output_path(Path(args.content_root), section, slug)
     out.parent.mkdir(parents=True, exist_ok=True)
+    article = _preserve_authored_fields(article, out)
     out.write_text(article)
     print(f"  wrote: {out}", file=sys.stderr)
     return 0
