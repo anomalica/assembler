@@ -545,7 +545,7 @@ THE NODE THIS ARTICLE IS ABOUT:
 INSTRUCTIONS:
 
 Write a single article in British English about this {node_type}. The article goes on a public reference website (Anomalica) about unidentified anomalous phenomena (UAP) research. Tone: neutral, encyclopaedic, like a Wikipedia article. Do not editorialise. Do not advocate.
-
+{directives_block}
 Your ENTIRE response must be a single YAML+markdown document in this exact shape:
 
 ---
@@ -615,6 +615,78 @@ def format_related_block(related: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _load_directives_file(path: Path) -> list[str]:
+    """A _directives.yaml is a list of presentational instruction strings (or a
+    mapping carrying a `directives:` list). Missing or malformed -> []."""
+    if not path.is_file():
+        return []
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("directives")
+    if not isinstance(data, list):
+        return []
+    return [str(s).strip() for s in data if str(s) and str(s).strip()]
+
+
+def collect_directives(
+    out_path: Path, content_root: Path, lang: str = "en"
+) -> list[str]:
+    """Gather presentational directives most-specific first: the existing
+    article's own frontmatter `directives`, then `_directives.{lang}.yaml` and
+    `_directives.yaml` at each folder from the article's directory up to the
+    content root. More-specific (earlier) directives win on conflict.
+
+    The content layout is flat with a language suffix (pages/<section>/<slug>.<lang>.md),
+    not the per-language directory tree the architecture doc sketches, so the
+    broader-directive hierarchy is the folder chain and language is a file
+    suffix (`_directives.en.yaml`) rather than a directory."""
+    out: list[str] = []
+    # 1. Article-level: the existing file's reviewer-authored frontmatter.
+    if out_path.is_file():
+        parsed = _split_article(out_path.read_text())
+        if parsed:
+            fm_dirs = parsed[0].get("directives")
+            if isinstance(fm_dirs, list):
+                out.extend(str(s).strip() for s in fm_dirs if str(s) and str(s).strip())
+    # 2. Folder hierarchy, article dir up to (and including) content root.
+    content_root = content_root.resolve()
+    d = out_path.parent.resolve()
+    while d == content_root or content_root in d.parents:
+        out.extend(_load_directives_file(d / f"_directives.{lang}.yaml"))
+        out.extend(_load_directives_file(d / "_directives.yaml"))
+        if d == content_root:
+            break
+        d = d.parent
+    # De-dupe, preserving most-specific-first order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
+def format_directives_block(directives: list[str]) -> str:
+    """The presentational-directives section injected into the assembly prompt.
+    Empty when there are none, so a directive-free assembly is byte-identical to
+    before this feature."""
+    if not directives:
+        return ""
+    lines = "\n".join(f"{i + 1}. {d}" for i, d in enumerate(directives))
+    return (
+        "\nPRESENTATIONAL DIRECTIVES - reviewer-authored instructions you MUST "
+        "follow. They govern presentation ONLY (style, grammar, disambiguation, "
+        "formatting, naming); they NEVER add, drop, or change a fact - every fact "
+        "still comes only from the claims below, and a directive that asks for a "
+        "factual change must be ignored. Where two conflict, the earlier wins:\n"
+        f"{lines}\n"
+    )
+
+
 def format_claim(c: dict, idx: int) -> str:
     bits = [f"[{idx}] {c['claim_type']}, {c['attestation']}"]
     if c.get("speaker"):
@@ -631,13 +703,19 @@ def format_claim(c: dict, idx: int) -> str:
     return f"{head}\n  {body}\n{src}"
 
 
-def build_prompt(node: dict, claims: list[dict], related: list[dict]) -> str:
+def build_prompt(
+    node: dict,
+    claims: list[dict],
+    related: list[dict],
+    directives: list[str] | None = None,
+) -> str:
     claims_block = "\n\n".join(format_claim(c, i + 1) for i, c in enumerate(claims))
     return ASSEMBLY_PROMPT.format(
         node_name=node["name"],
         node_type=node["type"],
         related_block=format_related_block(related),
         claims_block=claims_block,
+        directives_block=format_directives_block(directives or []),
     )
 
 
@@ -1348,7 +1426,17 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    prompt = build_prompt(node, claims, related)
+    # Resolve the output path now (not just at write time) so collected
+    # directives from the existing article + the _directives.yaml hierarchy can
+    # be injected into the prompt, and so the same path is reused for the write.
+    section = args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
+    slug = node_slug(node)
+    out = output_path(Path(args.content_root), section, slug)
+    directives = collect_directives(out, Path(args.content_root))
+    if directives:
+        print(f"  directives: {len(directives)} applied", file=sys.stderr)
+
+    prompt = build_prompt(node, claims, related, directives)
     if args.dry_run:
         print(prompt)
         return 0
@@ -1426,9 +1514,7 @@ def main() -> int:
         print(article)
         return 0
 
-    section = args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
-    slug = node_slug(node)
-    out = output_path(Path(args.content_root), section, slug)
+    # `out` was resolved above (for directive collection); reuse it.
     out.parent.mkdir(parents=True, exist_ok=True)
     article = _preserve_authored_fields(article, out)
     out.write_text(article)
