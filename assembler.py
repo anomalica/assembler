@@ -634,23 +634,34 @@ def _load_directives_file(path: Path) -> list[str]:
 def collect_directives(
     out_path: Path, content_root: Path, lang: str = "en"
 ) -> list[str]:
-    """Gather presentational directives most-specific first: the existing
-    article's own frontmatter `directives`, then `_directives.{lang}.yaml` and
-    `_directives.yaml` at each folder from the article's directory up to the
-    content root. More-specific (earlier) directives win on conflict.
+    """Gather presentational directives most-specific first:
+    1. the existing article's own frontmatter `directives` (article + this language);
+    2. the per-article sidecar `<slug>.directives.yaml` (article, all languages);
+    3. `_directives.{lang}.yaml` then `_directives.yaml` at each folder from the
+       article's directory up to the content root (folder-level, broader).
+    More-specific (earlier) directives win on conflict; duplicates collapse to
+    their most-specific position.
 
     The content layout is flat with a language suffix (pages/<section>/<slug>.<lang>.md),
-    not the per-language directory tree the architecture doc sketches, so the
-    broader-directive hierarchy is the folder chain and language is a file
-    suffix (`_directives.en.yaml`) rather than a directory."""
+    not the per-language directory tree the architecture doc sketched, so the
+    broader-directive hierarchy is the folder chain, language is a file suffix
+    (`_directives.en.yaml`), and a single-article all-languages directive lives in
+    the per-article `<slug>.directives.yaml` sidecar rather than in 30 frontmatters."""
     out: list[str] = []
-    # 1. Article-level: the existing file's reviewer-authored frontmatter.
+    # 1. Article + THIS language: the existing file's reviewer-authored
+    #    frontmatter. Most specific - a language-specific phrasing rule.
     if out_path.is_file():
         parsed = _split_article(out_path.read_text())
         if parsed:
             fm_dirs = parsed[0].get("directives")
             if isinstance(fm_dirs, list):
                 out.extend(str(s).strip() for s in fm_dirs if str(s) and str(s).strip())
+    # 1b. Article + ALL languages: a per-article sidecar <slug>.directives.yaml
+    #     next to the article files. The canonical home for a language-agnostic
+    #     single-article directive ("use full name Luis Elizondo") - written once,
+    #     it shapes every language render without duplicating into 30 frontmatters.
+    slug_base = out_path.stem.rsplit(".", 1)[0]  # "<slug>.<lang>" -> "<slug>"
+    out.extend(_load_directives_file(out_path.parent / f"{slug_base}.directives.yaml"))
     # 2. Folder hierarchy, article dir up to (and including) content root.
     content_root = content_root.resolve()
     d = out_path.parent.resolve()
