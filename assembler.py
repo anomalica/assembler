@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from anomalica_common.llm import accumulate, usage_entry
 from anomalica_common.slug import node_slug as _node_slug
 from anomalica_common.slug import slugify
 
@@ -507,6 +508,32 @@ def built_from_block(brief: dict) -> dict:
     }
 
 
+def gather_upstream_ai_usage(claims: list[dict], digests_root: Path) -> list[dict]:
+    """The carried-forward AI-usage upstream for an entity article (brief / node
+    mode, which draws from many records): each contributing source record's
+    digest ai_usage, concatenated, deduped at the SOURCE-RECORD level (a record
+    cited by many claims contributes its digest chain once). Record-mode pages
+    don't use this - they have the single source digest in hand.
+
+    A digest is loaded by its friendly_name (the digest filename stem); a record
+    whose digest is missing or carries no ai_usage simply contributes nothing.
+    """
+    seen: set[str] = set()
+    upstream: list[dict] = []
+    for c in claims:
+        content_hash = c.get("record_content_hash")
+        friendly_name = c.get("record_friendly_name")
+        if not content_hash or content_hash in seen:
+            continue
+        seen.add(content_hash)
+        if not friendly_name:
+            continue
+        loaded = load_digest(digests_root, friendly_name)
+        if loaded:
+            upstream.extend(loaded[0].get("ai_usage") or [])
+    return upstream
+
+
 # ----------------------------------------------------------------------------
 # Slugs and paths
 # ----------------------------------------------------------------------------
@@ -767,6 +794,44 @@ def _use_api() -> bool:
     return os.environ.get("ASSEMBLER_USE_API", "").lower() in ("1", "true", "yes")
 
 
+# Token-usage accounting for the public AI-usage provenance (ADR 0037). The
+# assembler has its own (generation-shaped) transport, so it accumulates usage
+# locally in the field shape anomalica_common.llm.usage_entry consumes, rather
+# than feeding the shared accumulator (whose feed is private). Both transports
+# report usage - the subscription CLI in its JSON wrapper (usage +
+# total_cost_usd, the cache-aware figure), the API in message.usage. Scoped per
+# article: reset before the generation loop, so retries accumulate into one entry.
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+_usage: dict = {}
+
+
+def _reset_usage() -> None:
+    global _usage
+    _usage = {f: 0 for f in _USAGE_FIELDS}
+    _usage["cost_equiv_usd"] = 0.0
+
+
+def _record_usage(usage: dict | None, cost_usd: float | None) -> None:
+    if not _usage:
+        _reset_usage()
+    if usage:
+        for f in _USAGE_FIELDS:
+            _usage[f] += int(usage.get(f) or 0)
+    if cost_usd:
+        _usage["cost_equiv_usd"] += float(cost_usd)
+
+
+def _get_usage() -> dict:
+    if not _usage:
+        _reset_usage()
+    return dict(_usage)
+
+
 def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Generate the article. Defaults to the Claude subscription via the CLI;
     set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
@@ -806,9 +871,13 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr[:500]}")
     try:
-        return json.loads(proc.stdout).get("result", proc.stdout)
+        wrapper = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return proc.stdout
+    # Capture usage for the public AI-usage provenance. total_cost_usd is the
+    # CLI's cache-aware list-price figure (a naive tokens x rate is ~7x off).
+    _record_usage(wrapper.get("usage"), wrapper.get("total_cost_usd"))
+    return wrapper.get("result", proc.stdout)
 
 
 def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
@@ -829,6 +898,24 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
         raise RuntimeError(
             f"API response hit max_tokens ({_API_MAX_TOKENS}); article truncated. "
             "Raise _API_MAX_TOKENS."
+        )
+    # Capture usage. The SDK doesn't return a dollar cost, so cost is None and
+    # usage_entry falls back to a tokens x list-price notional for the metered
+    # path (the subscription path gets the cache-aware total_cost_usd instead).
+    u = getattr(message, "usage", None)
+    if u:
+        _record_usage(
+            {
+                "input_tokens": getattr(u, "input_tokens", 0) or 0,
+                "output_tokens": getattr(u, "output_tokens", 0) or 0,
+                "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0)
+                or 0,
+                "cache_creation_input_tokens": getattr(
+                    u, "cache_creation_input_tokens", 0
+                )
+                or 0,
+            },
+            None,
         )
     for block in message.content:
         if getattr(block, "type", None) == "text":
@@ -1215,6 +1302,7 @@ def render_article(
     claims: list[dict] | None = None,
     content_root: Path | None = None,
     built_from: dict | None = None,
+    ai_usage: list | None = None,
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
@@ -1233,6 +1321,11 @@ def render_article(
     # claims list is provided.
     if claims is not None:
         frontmatter = _augment_references(frontmatter, claims, content_root)
+    # Public AI-usage provenance (ADR 0037): the carried-forward upstream chain
+    # plus this assemble entry. Top-level, last (machine provenance, not content).
+    if ai_usage:
+        frontmatter = {k: v for k, v in frontmatter.items() if k != "ai_usage"}
+        frontmatter["ai_usage"] = ai_usage
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1244,7 +1337,11 @@ def render_article(
 
 
 def render_record_page(
-    article_fm: dict, body: str, metadata: dict, record_hash: str | None
+    article_fm: dict,
+    body: str,
+    metadata: dict,
+    record_hash: str | None,
+    ai_usage: list | None = None,
 ) -> str:
     """The public /records/ inspection page: the model's article (title,
     description, references, body) + source metadata + a record_hash the site
@@ -1260,6 +1357,8 @@ def render_record_page(
     if record_hash:
         frontmatter["record_hash"] = record_hash
     frontmatter["references"] = article_fm.get("references", [])
+    if ai_usage:
+        frontmatter["ai_usage"] = ai_usage
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1464,6 +1563,7 @@ def main() -> int:
     # subscription, metered tokens on the API), but only on failure.
     fm = body = response = None
     fail_code, fail_msg = 3, ""
+    _reset_usage()  # scope token usage to this article (accumulates over retries)
     for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
         response = call_claude(prompt, model=args.model)
         try:
@@ -1495,6 +1595,11 @@ def main() -> int:
         print(response, file=sys.stderr)
         return fail_code
 
+    # Public AI-usage provenance (ADR 0037): this assemble entry, appended to the
+    # carried-forward upstream chain. Record mode carries the single source
+    # digest's chain; brief/node gather every contributing record's digest chain.
+    assemble_entry = usage_entry("assemble", args.model, _get_usage())
+
     if digest is not None:
         content_root = Path(args.content_root)
         # Give the record page's references the same per-claim provenance
@@ -1509,18 +1614,26 @@ def main() -> int:
             body,
             metadata=record_metadata(digest),
             record_hash=_public_hash(rec.get("content_hash")),
+            ai_usage=accumulate(digest.get("ai_usage") or [], assemble_entry),
         )
     elif brief is not None:
+        upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
         article = render_article(
             fm,
             body,
             claims=claims,
             content_root=Path(args.content_root),
             built_from=built_from_block(brief),
+            ai_usage=accumulate(upstream, assemble_entry),
         )
     else:
+        upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
         article = render_article(
-            fm, body, claims=claims, content_root=Path(args.content_root)
+            fm,
+            body,
+            claims=claims,
+            content_root=Path(args.content_root),
+            ai_usage=accumulate(upstream, assemble_entry),
         )
 
     if args.print_only:
