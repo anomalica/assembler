@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import assembler as asm
@@ -67,6 +68,14 @@ def _prompt_chars(args, kind: str, item: str) -> int | None:
             return None
         claims = asm.claims_for_node(conn, node["id"])
         related = asm.related_nodes(conn, node["id"])
+    elif kind == "briefs":
+        loaded = asm.load_brief(Path(args.briefs_root), item)
+        if not loaded:
+            return None
+        brief, _slug = loaded
+        node = asm.brief_node(brief)
+        claims = asm.claims_from_brief(brief)
+        related = asm.related_from_brief(brief)
     else:
         loaded = asm.load_digest(Path(args.digests_root), item)
         if not loaded:
@@ -139,19 +148,33 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
 
 
 def generate(args, kind: str, items: list[str]) -> int:
-    flag = "--node" if kind == "nodes" else "--record"
+    flag = {"nodes": "--node", "records": "--record", "briefs": "--brief"}[kind]
     common = [
         "--model",
         args.model,
         "--content-root",
         args.content_root,
     ]
-    common += (
-        ["--db", args.db] if kind == "nodes" else ["--digests-root", args.digests_root]
-    )
+    if kind == "nodes":
+        common += ["--db", args.db]
+    elif kind == "briefs":
+        # Briefs are the sole source, but the digests-root lets the assembler
+        # carry forward each contributing record's ai_usage into the article.
+        common += [
+            "--briefs-root",
+            args.briefs_root,
+            "--digests-root",
+            args.digests_root,
+        ]
+    else:
+        common += ["--digests-root", args.digests_root]
     ok = 0
     failed: list[str] = []
     for i, item in enumerate(items, 1):
+        if i > 1 and args.delay:
+            # Space calls out so a paced run doesn't burst the shared
+            # subscription rate-limit (each call is already sequential).
+            time.sleep(args.delay)
         print(f"\n=== [{i}/{len(items)}] {item} ===", file=sys.stderr)
         proc = subprocess.run(
             [sys.executable, "assembler.py", flag, item, *common],
@@ -173,20 +196,34 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--nodes", nargs="*", help="Node names/uuids to assemble")
     ap.add_argument("--records", nargs="*", help="Record digest names to assemble")
+    ap.add_argument("--briefs", nargs="*", help="Brief page-slugs to assemble")
     ap.add_argument(
         "--nodes-file", help="File of node names, one per line (# comments ok)"
     )
     ap.add_argument("--records-file", help="File of record digest names, one per line")
+    ap.add_argument("--briefs-file", help="File of brief page-slugs, one per line")
     ap.add_argument(
         "--db", default=asm.DEFAULT_DB, help="knowledge.db path (node mode)"
     )
     ap.add_argument(
         "--digests-root",
         default=asm.DEFAULT_DIGESTS_ROOT,
-        help="digests repo (record mode)",
+        help="digests repo (record mode; brief mode ai_usage carry-forward)",
+    )
+    ap.add_argument(
+        "--briefs-root",
+        default=asm.DEFAULT_BRIEFS_ROOT,
+        help="briefs dir (brief mode)",
     )
     ap.add_argument("--content-root", default=asm.DEFAULT_CONTENT_ROOT)
     ap.add_argument("--model", default=asm.DEFAULT_MODEL, help="sonnet | opus | haiku")
+    ap.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="Seconds to wait between calls, to pace a run against the shared "
+        "subscription rate-limit (calls are sequential regardless).",
+    )
     ap.add_argument(
         "--confirm",
         action="store_true",
@@ -196,14 +233,19 @@ def main() -> int:
 
     nodes = _read_items(args, "nodes")
     records = _read_items(args, "records")
-    if bool(nodes) == bool(records):
+    briefs = _read_items(args, "briefs")
+    chosen = [
+        (k, v)
+        for k, v in (("nodes", nodes), ("records", records), ("briefs", briefs))
+        if v
+    ]
+    if len(chosen) != 1:
         print(
-            "provide exactly one of --nodes/--nodes-file or --records/--records-file",
+            "provide exactly one of --nodes / --records / --briefs (or their -file form)",
             file=sys.stderr,
         )
         return 2
-    kind = "nodes" if nodes else "records"
-    items = nodes or records
+    kind, items = chosen[0]
 
     resolved, _ = estimate(args, kind, items)
     if not args.confirm:
