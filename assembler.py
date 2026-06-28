@@ -80,9 +80,7 @@ _PRESERVE_KEYS = ("directives",)
 # US government proper nouns whose OFFICIAL spelling is American. The British
 # English prompt has a carve-out for these, but the model occasionally still
 # Briticises one ("Defence Intelligence Agency"), so they are corrected
-# deterministically after generation. SCOPED to unambiguous US proper nouns with
-# no British namesake (the UK equivalents are "Ministry of Defence", "Secretary
-# of State for Defence", "Defence Intelligence" without "Agency"), so ordinary
+# deterministically after generation. SCOPED to US proper nouns, so ordinary
 # British "defence"/"programme" prose is never touched. Substring replace, so
 # "Office of the Secretary of Defence" / "Under Secretary of Defence" are covered
 # by the "Secretary of Defence" entry.
@@ -94,6 +92,13 @@ _US_PROPER_NOUN_FIXES = {
         "Defense Advanced Research Projects Agency"
     ),
 }
+
+# Commonwealth defence bodies that LEGITIMATELY use British "Defence" - their
+# names collide with the US substrings above (e.g. "Australian Department of
+# Defence" is correct British, NOT the US DoD). After the blanket fix, restore
+# these so they are not wrongly Americanised. The UAP corpus has the Australian
+# Department of Defence as its own page; the others are defensive.
+_COMMONWEALTH_DEFENCE_NATIONS = ("Australian", "New Zealand")
 
 # Section the article goes into is mapped from the node's type. The site's
 # Hugo layout expects content/english/{section}/{slug}.en.md.
@@ -1224,6 +1229,10 @@ def _fix_us_proper_nouns(text: str) -> str:
     are never matched."""
     for brit, amer in _US_PROPER_NOUN_FIXES.items():
         text = text.replace(brit, amer)
+    for nation in _COMMONWEALTH_DEFENCE_NATIONS:
+        text = text.replace(
+            f"{nation} Department of Defense", f"{nation} Department of Defence"
+        )
     return text
 
 
