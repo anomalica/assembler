@@ -77,6 +77,24 @@ PUBLIC_HASH_LENGTH = 56
 # them), so tags are deliberately NOT here.
 _PRESERVE_KEYS = ("directives",)
 
+# US government proper nouns whose OFFICIAL spelling is American. The British
+# English prompt has a carve-out for these, but the model occasionally still
+# Briticises one ("Defence Intelligence Agency"), so they are corrected
+# deterministically after generation. SCOPED to unambiguous US proper nouns with
+# no British namesake (the UK equivalents are "Ministry of Defence", "Secretary
+# of State for Defence", "Defence Intelligence" without "Agency"), so ordinary
+# British "defence"/"programme" prose is never touched. Substring replace, so
+# "Office of the Secretary of Defence" / "Under Secretary of Defence" are covered
+# by the "Secretary of Defence" entry.
+_US_PROPER_NOUN_FIXES = {
+    "Department of Defence": "Department of Defense",
+    "Secretary of Defence": "Secretary of Defense",
+    "Defence Intelligence Agency": "Defense Intelligence Agency",
+    "Defence Advanced Research Projects Agency": (
+        "Defense Advanced Research Projects Agency"
+    ),
+}
+
 # Section the article goes into is mapped from the node's type. The site's
 # Hugo layout expects content/english/{section}/{slug}.en.md.
 SECTION_BY_TYPE = {
@@ -1198,6 +1216,17 @@ def _rewrite_link_display(body: str) -> str:
     return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
 
 
+def _fix_us_proper_nouns(text: str) -> str:
+    """Correct US-government proper nouns the model Briticised despite the prompt
+    carve-out (_US_PROPER_NOUN_FIXES). Runs over the whole rendered article so it
+    catches the body, the description, and reference text. URL slugs are already
+    American (defense-intelligence-agency-dia) and use a different casing, so they
+    are never matched."""
+    for brit, amer in _US_PROPER_NOUN_FIXES.items():
+        text = text.replace(brit, amer)
+    return text
+
+
 def _public_hash(content_hash: str | None) -> str | None:
     """Strip the 'sha256:' prefix and take the first PUBLIC_HASH_LENGTH chars.
     Matches the workbench's URL convention."""
@@ -1635,6 +1664,10 @@ def main() -> int:
             content_root=Path(args.content_root),
             ai_usage=accumulate(upstream, assemble_entry),
         )
+
+    # Deterministic US-proper-noun spelling correction (the prompt carve-out is a
+    # strong steer but the model occasionally slips); runs over the full article.
+    article = _fix_us_proper_nouns(article)
 
     if args.print_only:
         print(article)
