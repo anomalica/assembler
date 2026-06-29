@@ -100,6 +100,17 @@ _US_PROPER_NOUN_FIXES = {
 # Department of Defence as its own page; the others are defensive.
 _COMMONWEALTH_DEFENCE_NATIONS = ("Australian", "New Zealand")
 
+# Canonical casing of official names the model gets wrong because the SOURCE
+# CLAIM TEXT carries the wrong casing (the model faithfully reproduces it in
+# prose). Fixing it in the claim text would change claim content -> claim_hash
+# (the freezer contract), so it is corrected deterministically here instead.
+# Each entry's key must have exactly ONE correct casing (no legitimate other
+# form), so the substring replace is always safe - "All-domain" (lowercase d) is
+# the only correct casing of the AARO name.
+_CANONICAL_CASING_FIXES = {
+    "All-Domain": "All-domain",
+}
+
 # Section the article goes into is mapped from the node's type. The site's
 # Hugo layout expects content/english/{section}/{slug}.en.md.
 SECTION_BY_TYPE = {
@@ -1221,18 +1232,21 @@ def _rewrite_link_display(body: str) -> str:
     return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
 
 
-def _fix_us_proper_nouns(text: str) -> str:
-    """Correct US-government proper nouns the model Briticised despite the prompt
-    carve-out (_US_PROPER_NOUN_FIXES). Runs over the whole rendered article so it
-    catches the body, the description, and reference text. URL slugs are already
-    American (defense-intelligence-agency-dia) and use a different casing, so they
-    are never matched."""
+def _fix_canonical_text(text: str) -> str:
+    """Deterministic post-generation corrections over the whole rendered article
+    (body, description, reference text): US-government proper-noun spelling the
+    model Briticised despite the prompt carve-out (_US_PROPER_NOUN_FIXES), and
+    canonical casing of official names the model copied wrong from claim text
+    (_CANONICAL_CASING_FIXES). URL slugs are already correct (lowercase, American)
+    and a different casing, so they are never matched."""
     for brit, amer in _US_PROPER_NOUN_FIXES.items():
         text = text.replace(brit, amer)
     for nation in _COMMONWEALTH_DEFENCE_NATIONS:
         text = text.replace(
             f"{nation} Department of Defense", f"{nation} Department of Defence"
         )
+    for wrong, right in _CANONICAL_CASING_FIXES.items():
+        text = text.replace(wrong, right)
     return text
 
 
@@ -1676,7 +1690,7 @@ def main() -> int:
 
     # Deterministic US-proper-noun spelling correction (the prompt carve-out is a
     # strong steer but the model occasionally slips); runs over the full article.
-    article = _fix_us_proper_nouns(article)
+    article = _fix_canonical_text(article)
 
     if args.print_only:
         print(article)
