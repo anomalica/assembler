@@ -196,6 +196,11 @@ def claims_for_node(conn: sqlite3.Connection, node_id: str) -> list[dict]:
                 "original_excerpt": row[2],
                 "claim_type": row[3],
                 "attestation": row[4],
+                # ADR 0044. This DB-direct path is the interim --node mode (0036
+                # supersedes it with briefs) and does not select the chain, so it
+                # takes the fail-safe default: never bare-assert from here.
+                "attribution_mode": "unknown",
+                "provenance_chain": None,
                 "location": row[5],
                 "date": row[6],
                 "date_end": row[7],
@@ -300,6 +305,9 @@ def claims_from_digest(digest: dict) -> list[dict]:
                 "original_excerpt": c.get("quote"),
                 "claim_type": c.get("type", "observation"),
                 "attestation": c.get("attestation") or "",
+                # ADR 0044 - see claims_from_brief. Absent -> "unknown" (fail safe).
+                "attribution_mode": c.get("attribution_mode") or "unknown",
+                "provenance_chain": c.get("provenance_chain"),
                 "location": c.get("location"),
                 "date": c.get("date"),
                 "date_end": None,
@@ -491,6 +499,11 @@ def claims_from_brief(brief: dict) -> list[dict]:
                 "original_excerpt": c.get("original_excerpt"),
                 "claim_type": c.get("claim_type", "observation"),
                 "attestation": c.get("attestation") or "",
+                # ADR 0044. The assimilator derives this once in the brief so the
+                # three consumers cannot drift; we branch on it, never re-derive.
+                # Absent -> "unknown", which FAILS SAFE (hedge), never bare-assert.
+                "attribution_mode": c.get("attribution_mode") or "unknown",
+                "provenance_chain": c.get("provenance_chain"),
                 "location": c.get("location_in_record"),
                 "date": c.get("date"),
                 "date_end": c.get("date_end"),
@@ -630,6 +643,16 @@ Within the body, link entities using markdown links of the form [Display Name](/
 
 For each <sup>N</sup> citation, ensure references[N-1] in the frontmatter is the matching source. Reference numbering must be sequential starting at 1. Each reference MUST carry a `claim_index` field with the 1-based index of the originating claim in the KNOWLEDGE GRAPH CLAIMS list below - this index lets downstream tooling link the reference back to the exact source claim in the workbench.
 
+ATTRIBUTION RULE (ADR 0044 - this outranks style; getting it wrong publishes a falsehood):
+
+A claim is a statement about the world ONLY when its provenance says so. Each claim below is tagged, and you must obey its tag:
+
+- No ATTRIBUTION line: the claim stands on its own. Assert it plainly, in Anomalica's voice.
+- "ATTRIBUTION: ALREADY IN THE TEXT": the claim's text NAMES ITS OWN SOURCE (e.g. "An anonymous source claiming to work inside the Defense Intelligence Agency said the entity was..."). Reproduce that attribution as written. Do NOT wrap it in a second one - "According to Jon Stewart, an anonymous source claiming to work inside the DIA said..." is a double-hedge and is wrong. Equally, do NOT strip it back to a bare assertion ("The entity was...") - that changes a true statement about an assertion into a false statement about reality.
+- "ATTRIBUTION: UNVERIFIED": the text is bare, but we never captured where it came from. You MUST attribute it in the prose - to the named speaker ("Fravor said that ..."), or if no speaker is given, to the source record ("According to the Department of Defense Inspector General report, ..."). NEVER state such a claim as plain fact in Anomalica's own voice. If you cannot attribute it, leave it out.
+
+The test: for every sentence you write, ask "if this claim turned out to be false, would this article have asserted a falsehood, or reported that someone asserted it?" Only a claim with no ATTRIBUTION line may be asserted.
+
 CITATION FIDELITY RULE (this is the most important rule and the easiest to break):
 
 Every <sup>N</sup> must cite a CLAIM in the data below whose content DIRECTLY supports the assertion you just wrote - not one that supports it via inference, temporal logic, or implied negation.
@@ -762,19 +785,56 @@ def format_directives_block(directives: list[str]) -> str:
 
 
 def format_claim(c: dict, idx: int) -> str:
+    """Render one claim for the prompt, branching on ADR 0044 attribution_mode.
+
+    in_text - the claim's text already carries its attribution inline. The
+      `speaker:` line is SUPPRESSED: showing the model a speaker to attribute to,
+      beside a text that already names its source, is precisely what manufactures
+      the "According to X, an anonymous source said..." double-hedge.
+    bare_ok - conduit claim, stands on its own. Speaker shown, assert plainly.
+    unknown - text is bare but its provenance was never captured. Must be
+      attributed in the prose (to the speaker, or failing that the source record
+      - which is always known), never asserted as plain fact.
+    """
+    mode = c.get("attribution_mode") or "unknown"
+    speaker = c.get("speaker") or ""
+
     bits = [f"[{idx}] {c['claim_type']}, {c['attestation']}"]
-    if c.get("speaker"):
-        bits.append(f"speaker: {c['speaker']}")
+    if mode != "in_text" and speaker:
+        bits.append(f"speaker: {speaker}")
     if c.get("date"):
         bits.append(f"date: {c['date']}")
     head = "  ".join(bits)
+
+    if mode == "in_text":
+        note = (
+            "  ATTRIBUTION: ALREADY IN THE TEXT - the text below names its own "
+            "source. Reproduce that attribution as written. Do NOT add a second "
+            '"according to", and do NOT strip the hedge back to a bare assertion.'
+        )
+    elif mode == "bare_ok":
+        note = ""
+    else:  # unknown - fail safe
+        who = f'"{speaker}"' if speaker else "the source record below"
+        note = (
+            "  ATTRIBUTION: UNVERIFIED - this claim's provenance was never "
+            f"captured. You MUST attribute it in the prose to {who} (e.g. "
+            f"{'"' + speaker + ' said that ..."' if speaker else '"According to <the source record>, ..."'}). "
+            "NEVER state it as plain fact in Anomalica's own voice."
+        )
+
     body = c["content"]
     src = f'  source: "{c["record_title"]}"'
     if c.get("record_date"):
         src += f" ({c['record_date']})"
     if c.get("location"):
         src += f", location: {c['location']}"
-    return f"{head}\n  {body}\n{src}"
+    parts = [head]
+    if note:
+        parts.append(note)
+    parts.append(f"  {body}")
+    parts.append(src)
+    return "\n".join(parts)
 
 
 def build_prompt(
