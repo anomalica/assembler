@@ -892,9 +892,10 @@ def _use_api() -> bool:
 # assembler has its own (generation-shaped) transport, so it accumulates usage
 # locally in the field shape anomalica_common.llm.usage_entry consumes, rather
 # than feeding the shared accumulator (whose feed is private). Both transports
-# report usage - the subscription CLI in its JSON wrapper (usage +
-# total_cost_usd, the cache-aware figure), the API in message.usage. Scoped per
-# article: reset before the generation loop, so retries accumulate into one entry.
+# report usage - the subscription CLI in its JSON wrapper, the API in
+# message.usage. Tokens only: no dollar figure is accumulated, because none is
+# emitted (_strip_stored_cost). Scoped per article: reset before the generation
+# loop, so retries accumulate into one entry.
 _USAGE_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -907,17 +908,14 @@ _usage: dict = {}
 def _reset_usage() -> None:
     global _usage
     _usage = {f: 0 for f in _USAGE_FIELDS}
-    _usage["cost_equiv_usd"] = 0.0
 
 
-def _record_usage(usage: dict | None, cost_usd: float | None) -> None:
+def _record_usage(usage: dict | None) -> None:
     if not _usage:
         _reset_usage()
     if usage:
         for f in _USAGE_FIELDS:
             _usage[f] += int(usage.get(f) or 0)
-    if cost_usd:
-        _usage["cost_equiv_usd"] += float(cost_usd)
 
 
 def _get_usage() -> dict:
@@ -968,9 +966,9 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
         wrapper = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return proc.stdout
-    # Capture usage for the public AI-usage provenance. total_cost_usd is the
-    # CLI's cache-aware list-price figure (a naive tokens x rate is ~7x off).
-    _record_usage(wrapper.get("usage"), wrapper.get("total_cost_usd"))
+    # Capture token usage for the public AI-usage provenance. The wrapper's
+    # total_cost_usd is deliberately ignored: no dollar figure is stored.
+    _record_usage(wrapper.get("usage"))
     return wrapper.get("result", proc.stdout)
 
 
@@ -993,9 +991,7 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
             f"API response hit max_tokens ({_API_MAX_TOKENS}); article truncated. "
             "Raise _API_MAX_TOKENS."
         )
-    # Capture usage. The SDK doesn't return a dollar cost, so cost is None and
-    # usage_entry falls back to a tokens x list-price notional for the metered
-    # path (the subscription path gets the cache-aware total_cost_usd instead).
+    # Capture token usage for the public AI-usage provenance.
     u = getattr(message, "usage", None)
     if u:
         _record_usage(
@@ -1008,8 +1004,7 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
                     u, "cache_creation_input_tokens", 0
                 )
                 or 0,
-            },
-            None,
+            }
         )
     for block in message.content:
         if getattr(block, "type", None) == "text":
@@ -1408,6 +1403,27 @@ def _insert_after(fm: dict, after_key: str, key: str, value) -> dict:
     return out
 
 
+_STORED_COST_FIELDS = ("notional_cost_usd", "price_basis")
+
+
+def _strip_stored_cost(entries: list | None) -> list:
+    """Drop stored dollar figures from every AI-usage entry before emission.
+
+    The canonical format spec forbids cost fields in an interchange artefact: a
+    stored dollar bakes in a price that changes, and content/ is public. Model,
+    version and token counts stay; a consumer derives any figure from tokens x
+    current list price. Applied to the WHOLE chain, not just this stage's entry -
+    entries carried forward from digests written before the producer-side fix
+    still carry the fields, so re-assembly alone would not clear them.
+    """
+    return [
+        {k: v for k, v in entry.items() if k not in _STORED_COST_FIELDS}
+        if isinstance(entry, dict)
+        else entry
+        for entry in (entries or [])
+    ]
+
+
 def render_article(
     frontmatter: dict,
     body: str,
@@ -1437,7 +1453,7 @@ def render_article(
     # plus this assemble entry. Top-level, last (machine provenance, not content).
     if ai_usage:
         frontmatter = {k: v for k, v in frontmatter.items() if k != "ai_usage"}
-        frontmatter["ai_usage"] = ai_usage
+        frontmatter["ai_usage"] = _strip_stored_cost(ai_usage)
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1470,7 +1486,7 @@ def render_record_page(
         frontmatter["record_hash"] = record_hash
     frontmatter["references"] = article_fm.get("references", [])
     if ai_usage:
-        frontmatter["ai_usage"] = ai_usage
+        frontmatter["ai_usage"] = _strip_stored_cost(ai_usage)
     body = _rewrite_link_display(body)
     return (
         "---\n"
