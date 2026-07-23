@@ -25,6 +25,7 @@ carrying the CLI / the `anthropic` library:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1503,6 +1504,59 @@ def render_record_page(
     )
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def built_by_block(model: str, prompt: str, directives: list[str]) -> dict:
+    """Generator identity for the audit trail (0010): what would build this page
+    differently today. Distinct from built_from (the INPUTS - stale input means
+    reassemble) and from body_sha256 (the OUTPUT - a human edit means don't
+    clobber); a model or prompt change is invisible to both.
+
+    The prompt hash covers the ASSEMBLER-AUTHORED prompt only. The two transports
+    do not send the same thing - the CLI path appends _CLI_SYSTEM as a system
+    prompt, the API path sends none - so a transport-inclusive hash would give
+    one authored prompt two identities depending on the billing path. Transport
+    and system prompt are recorded as their own fields instead, keeping the
+    axes separable (the digest layer keys model / prompt / prep independently
+    for the same reason).
+    """
+    block = {
+        "model": API_MODEL_MAP.get(model, model),
+        "transport": "api" if _use_api() else "cli",
+        "prompt_sha256": _sha256(prompt),
+        "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
+    }
+    if not _use_api():
+        block["system_sha256"] = _sha256(_CLI_SYSTEM)
+    return block
+
+
+def stamp_built_by(article: str, block: dict) -> str:
+    """Add the generator block plus the output hash, LAST - after every body
+    transform has run, so body_sha256 covers the bytes actually written. Hashing
+    at render time would stamp a body that _fix_canonical_text then rewrites.
+
+    body_sha256 is over the whitespace-stripped body, UTF-8, frontmatter
+    excluded: a verifier reproduces it by splitting the file on the frontmatter
+    fence and stripping, with no trailing-newline convention to get wrong.
+    """
+    parsed = _split_article(article)
+    if parsed is None:  # our own output is always well-formed; defensive
+        return article
+    frontmatter, body = parsed
+    frontmatter = {k: v for k, v in frontmatter.items() if k != "built_by"}
+    frontmatter["built_by"] = {**block, "body_sha256": _sha256(body)}
+    return (
+        "---\n"
+        + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + body
+        + "\n"
+    )
+
+
 def _split_article(text: str) -> tuple[dict, str] | None:
     """Split a rendered article string into (frontmatter dict, body), or None if
     it is not the expected `---`-delimited shape. Deliberately lighter than
@@ -1781,6 +1835,9 @@ def main() -> int:
     # `out` was resolved above (for directive collection); reuse it.
     out.parent.mkdir(parents=True, exist_ok=True)
     article = _preserve_authored_fields(article, out)
+    # Last, so body_sha256 covers the final body - after the canonical-text fix
+    # and after any preserved human field is folded back in.
+    article = stamp_built_by(article, built_by_block(args.model, prompt, directives))
     out.write_text(article)
     print(f"  wrote: {out}", file=sys.stderr)
     return 0
