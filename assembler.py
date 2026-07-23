@@ -1515,11 +1515,19 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def built_by_block(model: str, prompt: str, directives: list[str]) -> dict:
+def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> dict:
     """Generator identity for the audit trail (0010): what would build this page
     differently today. Distinct from built_from (the INPUTS - stale input means
     reassemble) and from body_sha256 (the OUTPUT - a human edit means don't
     clobber); a model or prompt change is invisible to both.
+
+    Carries this stage's token counts because the article is the only artefact of
+    the assemble stage - unlike every carried-forward entry, there is no digest
+    holding a second copy, and the ledger that would (ADR 0037) is specified but
+    unwritten. Measurement only: no cost, price or currency, ever - a consumer
+    derives any figure from tokens x current list price. Model and tokens are
+    lifted from the stage's usage entry rather than recomputed, so the
+    cache-aware token summing stays single-sourced.
 
     Hashed in components, never blended into one digest: a single hash cannot
     say WHICH component differed, and folding the transport in would give one
@@ -1529,13 +1537,19 @@ def built_by_block(model: str, prompt: str, directives: list[str]) -> dict:
     divergence is detectable rather than silent. (The digest layer keys model /
     prompt / prep independently for the same reason.)
     """
-    return {
-        "model": API_MODEL_MAP.get(model, model),
-        "transport": "api" if _use_api() else "cli",
-        "prompt_sha256": _sha256(prompt),
-        "system_prompt_sha256": _sha256(_SYSTEM_PROMPT),
-        "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
+    block = {
+        k: assemble_entry[k] for k in ("model", "model_version") if k in assemble_entry
     }
+    block.update(
+        {
+            "transport": "api" if _use_api() else "cli",
+            "prompt_sha256": _sha256(prompt),
+            "system_prompt_sha256": _sha256(_SYSTEM_PROMPT),
+            "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
+            "tokens": assemble_entry.get("tokens") or {},
+        }
+    )
+    return block
 
 
 def stamp_built_by(article: str, block: dict) -> str:
@@ -1788,11 +1802,21 @@ def main() -> int:
         print(response, file=sys.stderr)
         return fail_code
 
-    # Public AI-usage provenance (ADR 0037): this assemble entry, appended to the
-    # carried-forward upstream chain. Record mode carries the single source
-    # digest's chain; brief/node gather every contributing record's digest chain.
+    # This stage's own usage. Also the single source for built_by's token counts
+    # (the cache-aware summing lives in usage_entry, not here).
     assemble_entry = usage_entry("assemble", args.model, _get_usage())
 
+    # The carried-forward ai_usage chain is emitted ONLY where the article has no
+    # binding to walk back through. Republishing upstream entries into a public
+    # artefact is the propagation path that put forbidden cost fields into 53
+    # articles; where a binding exists the same models are reachable through it -
+    # built_from's claims -> their digests (brief mode), or record_hash -> the
+    # record -> its digest (record mode, one source, so no claims walk). Node mode
+    # has neither binding and keeps the chain until it re-assembles from a brief
+    # (ADR 0036), at which point it gains built_from and drops the chain in one
+    # write. The assemble entry itself is NOT carried forward - it is first-party
+    # data with no second copy anywhere (the ledger is specified but unwritten),
+    # so it lives in built_by.tokens.
     if digest is not None:
         content_root = Path(args.content_root)
         # Give the record page's references the same per-claim provenance
@@ -1802,22 +1826,23 @@ def main() -> int:
         # references are already on this record's inspection page.
         fm = _augment_references(fm, claims, content_root)
         rec = digest.get("record") or {}
+        record_hash = _public_hash(rec.get("content_hash"))
         article = render_record_page(
             fm,
             body,
             metadata=record_metadata(digest),
-            record_hash=_public_hash(rec.get("content_hash")),
-            ai_usage=accumulate(digest.get("ai_usage") or [], assemble_entry),
+            record_hash=record_hash,
+            ai_usage=None
+            if record_hash
+            else accumulate(digest.get("ai_usage") or [], assemble_entry),
         )
     elif brief is not None:
-        upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
         article = render_article(
             fm,
             body,
             claims=claims,
             content_root=Path(args.content_root),
             built_from=built_from_block(brief),
-            ai_usage=accumulate(upstream, assemble_entry),
         )
     else:
         upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
@@ -1842,7 +1867,9 @@ def main() -> int:
     article = _preserve_authored_fields(article, out)
     # Last, so body_sha256 covers the final body - after the canonical-text fix
     # and after any preserved human field is folded back in.
-    article = stamp_built_by(article, built_by_block(args.model, prompt, directives))
+    article = stamp_built_by(
+        article, built_by_block(assemble_entry, prompt, directives)
+    )
     out.write_text(article)
     print(f"  wrote: {out}", file=sys.stderr)
     return 0
