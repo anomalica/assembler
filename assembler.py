@@ -1529,7 +1529,7 @@ def built_by_block(model: str, prompt: str, directives: list[str]) -> dict:
         "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
     }
     if not _use_api():
-        block["system_sha256"] = _sha256(_CLI_SYSTEM)
+        block["system_prompt_sha256"] = _sha256(_CLI_SYSTEM)
     return block
 
 
