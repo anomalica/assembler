@@ -875,10 +875,16 @@ _API_MAX_TOKENS = 16000
 # validate_article or date-fidelity is regenerated rather than hard-failed.
 _MAX_GEN_ATTEMPTS = 3
 
-# Appended to the CLI's Claude Code system prompt to keep -p output to the bare
-# article (no preamble/commentary), since validate_article expects it to start
-# with the YAML front-matter fence.
-_CLI_SYSTEM = (
+# Keeps the output to the bare article (no preamble/commentary), since
+# validate_article expects it to start with the YAML front-matter fence.
+# Sent VERBATIM on both transports - appended to Claude Code's system prompt on
+# the CLI path, as the system parameter on the API path. The strings must stay
+# identical: ASSEMBLER_USE_API selects a billing path, so any wording difference
+# would split the corpus into two generator identities (a differing
+# system_prompt_sha256) for a reason unrelated to how an article was written.
+# The no-tool-use clause is a no-op on the API path, which passes no tools; it
+# stays anyway, because identical beats minimal here.
+_SYSTEM_PROMPT = (
     "You are generating a single reference article. Output ONLY the requested "
     "YAML+markdown document, starting with --- and ending with the final body "
     "paragraph. No preamble, no commentary, no tool use."
@@ -956,7 +962,7 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
         "--output-format",
         "json",
         "--append-system-prompt",
-        _CLI_SYSTEM,
+        _SYSTEM_PROMPT,
     ]
     proc = subprocess.run(
         cmd, input=prompt, env=env, capture_output=True, text=True, timeout=900
@@ -984,6 +990,7 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
     with client.messages.stream(
         model=model_id,
         max_tokens=_API_MAX_TOKENS,
+        system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
         message = stream.get_final_message()
@@ -1514,23 +1521,21 @@ def built_by_block(model: str, prompt: str, directives: list[str]) -> dict:
     reassemble) and from body_sha256 (the OUTPUT - a human edit means don't
     clobber); a model or prompt change is invisible to both.
 
-    The prompt hash covers the ASSEMBLER-AUTHORED prompt only. The two transports
-    do not send the same thing - the CLI path appends _CLI_SYSTEM as a system
-    prompt, the API path sends none - so a transport-inclusive hash would give
-    one authored prompt two identities depending on the billing path. Transport
-    and system prompt are recorded as their own fields instead, keeping the
-    axes separable (the digest layer keys model / prompt / prep independently
-    for the same reason).
+    Hashed in components, never blended into one digest: a single hash cannot
+    say WHICH component differed, and folding the transport in would give one
+    authored prompt two identities depending on the billing path. Both
+    transports now send _SYSTEM_PROMPT verbatim, so system_prompt_sha256 is
+    constant across them by construction - it is emitted anyway, so a future
+    divergence is detectable rather than silent. (The digest layer keys model /
+    prompt / prep independently for the same reason.)
     """
-    block = {
+    return {
         "model": API_MODEL_MAP.get(model, model),
         "transport": "api" if _use_api() else "cli",
         "prompt_sha256": _sha256(prompt),
+        "system_prompt_sha256": _sha256(_SYSTEM_PROMPT),
         "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
     }
-    if not _use_api():
-        block["system_prompt_sha256"] = _sha256(_CLI_SYSTEM)
-    return block
 
 
 def stamp_built_by(article: str, block: dict) -> str:
