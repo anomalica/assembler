@@ -894,7 +894,7 @@ def _use_api() -> bool:
 # than feeding the shared accumulator (whose feed is private). Both transports
 # report usage - the subscription CLI in its JSON wrapper, the API in
 # message.usage. Tokens only: no dollar figure is accumulated, because none is
-# emitted (_strip_stored_cost). Scoped per article: reset before the generation
+# emitted (_clean_ai_usage). Scoped per article: reset before the generation
 # loop, so retries accumulate into one entry.
 _USAGE_FIELDS = (
     "input_tokens",
@@ -1403,21 +1403,27 @@ def _insert_after(fm: dict, after_key: str, key: str, value) -> dict:
     return out
 
 
-_STORED_COST_FIELDS = ("notional_cost_usd", "price_basis")
+# AI-usage entries are emitted against a CLOSED field list, not by subtracting
+# known-bad fields: an unspecified block accepts anything, which is how a stored
+# dollar figure crept in, and a subtraction only waits for the next field to
+# drift in from a transport or an upstream producer. `tokens` is the nested
+# {input, output} the producers actually emit (anomalica_common.llm.usage_entry);
+# `duration_s` is the local-stage shape (transcribe / diarise / embed - no
+# tokens, no cost). No cost field is emitted at any stage: a stored dollar bakes
+# in a price that changes, and content/ is public. A consumer derives any figure
+# from tokens x current list price.
+_AI_USAGE_FIELDS = ("stage", "model", "model_version", "tokens", "duration_s")
 
 
-def _strip_stored_cost(entries: list | None) -> list:
-    """Drop stored dollar figures from every AI-usage entry before emission.
+def _clean_ai_usage(entries: list | None) -> list:
+    """Reduce every AI-usage entry to the closed field list before emission.
 
-    The canonical format spec forbids cost fields in an interchange artefact: a
-    stored dollar bakes in a price that changes, and content/ is public. Model,
-    version and token counts stay; a consumer derives any figure from tokens x
-    current list price. Applied to the WHOLE chain, not just this stage's entry -
-    entries carried forward from digests written before the producer-side fix
-    still carry the fields, so re-assembly alone would not clear them.
+    Applied to the WHOLE chain, not just this stage's entry - entries carried
+    forward from digests written before the producer-side fix still carry a
+    stored cost, so re-assembly alone would not clear them.
     """
     return [
-        {k: v for k, v in entry.items() if k not in _STORED_COST_FIELDS}
+        {k: entry[k] for k in _AI_USAGE_FIELDS if k in entry}
         if isinstance(entry, dict)
         else entry
         for entry in (entries or [])
@@ -1453,7 +1459,7 @@ def render_article(
     # plus this assemble entry. Top-level, last (machine provenance, not content).
     if ai_usage:
         frontmatter = {k: v for k, v in frontmatter.items() if k != "ai_usage"}
-        frontmatter["ai_usage"] = _strip_stored_cost(ai_usage)
+        frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
     body = _rewrite_link_display(body)
     return (
         "---\n"
@@ -1486,7 +1492,7 @@ def render_record_page(
         frontmatter["record_hash"] = record_hash
     frontmatter["references"] = article_fm.get("references", [])
     if ai_usage:
-        frontmatter["ai_usage"] = _strip_stored_cost(ai_usage)
+        frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
     body = _rewrite_link_display(body)
     return (
         "---\n"
