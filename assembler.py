@@ -35,7 +35,8 @@ import sys
 from pathlib import Path
 
 import yaml
-from anomalica_common.llm import accumulate, usage_entry
+from anomalica_common.llm import PlanRateLimited, accumulate, usage_entry
+from anomalica_common.llm.transport import _raise_if_plan_limited
 from anomalica_common.slug import node_slug as _node_slug
 from anomalica_common.slug import slugify
 
@@ -875,6 +876,14 @@ _API_MAX_TOKENS = 16000
 # validate_article or date-fidelity is regenerated rather than hard-failed.
 _MAX_GEN_ATTEMPTS = 3
 
+# Plan throttling gets its own exit code (EX_TEMPFAIL) and a fixed stderr line,
+# because a batch driver has to tell "the window is full" from "this brief is
+# broken": the first is retryable in hours and must not count a strike, the
+# second is not retryable at all. Sharing an exit code between them is how a
+# throttled run marks a hundred good briefs as failures.
+_EXIT_PLAN_RATE_LIMITED = 75
+_PLAN_LIMIT_MARKER = "ASSEMBLER-PLAN-RATE-LIMITED"
+
 # Keeps the output to the bare article (no preamble/commentary), since
 # validate_article expects it to start with the YAML front-matter fence.
 # Sent VERBATIM on both transports - appended to Claude Code's system prompt on
@@ -967,6 +976,11 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     proc = subprocess.run(
         cmd, input=prompt, env=env, capture_output=True, text=True, timeout=900
     )
+    # Before the returncode check: the CLI reports plan throttling on STDOUT with
+    # a zero exit as often as it fails outright, so a returncode-first check
+    # misses the common shape. Throttling is not a broken brief - it must reach
+    # the batch driver as its own signal, never as a generation failure.
+    _raise_if_plan_limited(proc, model)
     if proc.returncode != 0:
         raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr[:500]}")
     try:
@@ -1772,7 +1786,17 @@ def main() -> int:
     fail_code, fail_msg = 3, ""
     _reset_usage()  # scope token usage to this article (accumulates over retries)
     for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
-        response = call_claude(prompt, model=args.model)
+        try:
+            response = call_claude(prompt, model=args.model)
+        except PlanRateLimited as exc:
+            # Not a failed article: the plan window is full and the brief is
+            # untouched. Exit on its own code with the reset time in a fixed
+            # machine-readable shape, so the batch driver can sleep out the
+            # window and re-queue this item rather than burning it as a strike.
+            reset = exc.reset_at
+            print(f"{_PLAN_LIMIT_MARKER} reset_at={reset or '-'}", file=sys.stderr)
+            print(f"  plan throttled: {exc}", file=sys.stderr)
+            return _EXIT_PLAN_RATE_LIMITED
         try:
             fm, body = validate_article(response)
         except ValueError as exc:
