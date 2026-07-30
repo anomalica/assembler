@@ -47,11 +47,24 @@ PRICING = {
     "opus": (5.00, 25.00),
     "haiku": (1.00, 5.00),
 }
-# Deliberately conservative: ~3.5 chars/token over-counts slightly vs the real
-# tokenizer, and a generous fixed output ceiling per article. The estimate
-# should never come in UNDER the actual spend.
-CHARS_PER_TOKEN = 3.5
-EST_OUTPUT_TOKENS = 3000
+# Measured, not assumed. The previous constants (3.5 chars/token, 3000 output
+# tokens, no per-call overhead) under-estimated a real run by ~3x on input and
+# ~9x on output, which breaks the one promise this file makes - that the figure
+# printed before a metered run is never lower than the spend that follows.
+#
+# Fitted against three assembles on claude-sonnet-5 (2026-07-31): prompts of
+# 120,941 / 132,009 / 60,500 chars reported 80,946 / 84,221 / 57,682 input
+# tokens. Two unknowns, three points: solving the extremes gives a fixed
+# per-call overhead plus a density, and the held-out middle point predicts to
+# +1.2%. The fixed term is the CLI's own system prompt, which is charged on
+# every call however small the brief - the reason a per-char-only estimate is
+# hopeless for short items.
+CHARS_PER_TOKEN = 2.6
+FIXED_INPUT_TOKENS = 34_400
+# Observed 7,829 / 25,728 / 31,023. The model re-emits every reference block
+# (quote, claim_id, record_hash) into the front matter, so output tracks the
+# reference count, not the prose length. Ceiling, not mean, by design.
+EST_OUTPUT_TOKENS = 32_000
 
 
 def _read_items(args, kind: str) -> list[str]:
@@ -112,7 +125,7 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
             unresolved.append(item)
             continue
         resolved.append(item)
-        total_in_tokens += round(chars / CHARS_PER_TOKEN)
+        total_in_tokens += FIXED_INPUT_TOKENS + round(chars / CHARS_PER_TOKEN)
 
     out_tokens = len(resolved) * EST_OUTPUT_TOKENS
     in_cost = total_in_tokens * in_price / 1_000_000
