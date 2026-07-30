@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
 from anomalica_common.llm import PlanRateLimited, accumulate, usage_entry
 from anomalica_common.llm.transport import _raise_if_plan_limited
 from anomalica_common.slug import node_slug as _node_slug
@@ -864,11 +865,12 @@ def build_prompt(
 #     paused-not-cancelled, so the toggle is load-bearing.
 # ----------------------------------------------------------------------------
 
-API_MODEL_MAP = {
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-8",
-    "haiku": "claude-haiku-4-5",
-}
+# Imported, not restated. A local copy silently went stale when the pipeline moved
+# to claude-sonnet-5 / claude-opus-5: this file still named claude-sonnet-4-6 and
+# claude-opus-4-8, ids that no longer resolve, so the metered path would have
+# failed on its first call. It stayed invisible because ASSEMBLER_USE_API defaults
+# off. Model ids belong to one owner.
+API_MODEL_MAP = _COMMON_API_MODEL_MAP
 
 _API_MAX_TOKENS = 16000
 
@@ -1309,6 +1311,114 @@ def _rewrite_link_display(body: str) -> str:
     return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
 
 
+# Body links are invented by the model from an entity's surface name, so they
+# miss the canonical page slug in three ways: the acronym suffix the naming
+# convention adds ("United States Navy (USN)" -> united-states-navy-usn, written
+# as united-states-navy), the wrong section, and entities that never earn a page
+# at all. Measured over the first 62 articles: 741 distinct links, 32 resolved.
+#
+# The index is built from the BRIEFS, not from files on disk, because assembly
+# order would otherwise decide correctness - the third page written cannot
+# existence-check the ninetieth. Disk is folded in as well, for the hand-written
+# pages (about, methodology, legal) that no brief proposes.
+#
+# An unresolvable link becomes plain text. That is not a new policy: entity_url
+# already returns null for a page that does not exist, and the site renders those
+# as plain text. This applies the same rule to prose, where the model bypassed it.
+_LINK_INDEX: dict | None = None
+
+_ACRONYM_TITLE_RE = re.compile(r"^(.*?)\s*\(([A-Z0-9][A-Z0-9&/. -]{1,})\)\s*$")
+
+
+def build_link_index(
+    briefs_root: Path | None, content_root: Path | None, min_claims: int = 0
+) -> dict:
+    """{exact, by_slug, stems, by_text} for resolving a body link to a real page.
+
+    min_claims must match the floor the batch is actually assembling at. A brief
+    below the floor is a page nobody is going to write, so linking to it is a
+    promise the run does not keep - measured at 140 link instances when indexing
+    all 225 briefs against a >=10-claim run. Zero indexes every brief.
+    """
+    exact: set[str] = set()
+    by_slug: dict[str, set[str]] = {}
+    stems: dict[str, str] = {}
+    by_text: dict[str, str] = {}
+
+    def add(section: str, slug: str, title: str | None) -> None:
+        path = f"/{section}/{slug}"
+        exact.add(path)
+        by_slug.setdefault(slug, set()).add(section)
+        by_text.setdefault(slug.replace("-", " "), path)
+        if not title:
+            return
+        by_text.setdefault(slugify(_display_name(title)).replace("-", " "), path)
+        m = _ACRONYM_TITLE_RE.match(title)
+        if m and m.group(1):
+            # "United States Navy (USN)" also answers to united-states-navy: the
+            # form the model writes, because prose drops the parenthetical.
+            stems.setdefault(slugify(m.group(1)), path)
+
+    if briefs_root:
+        for bf in sorted(Path(briefs_root).glob("*.yaml")):
+            try:
+                page = (yaml.safe_load(bf.read_text()) or {}).get("page") or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            slug, node_type = page.get("slug"), page.get("node_type")
+            if not (slug and node_type):
+                continue
+            if (page.get("claim_count") or 0) < min_claims:
+                continue
+            add(
+                SECTION_BY_TYPE.get(node_type, node_type + "s"),
+                slug,
+                page.get("title"),
+            )
+    if content_root:
+        for md in Path(content_root).glob("pages/*/*.en.md"):
+            add(md.parent.name, md.name[: -len(".en.md")], None)
+    return {"exact": exact, "by_slug": by_slug, "stems": stems, "by_text": by_text}
+
+
+def set_link_index(index: dict | None) -> None:
+    global _LINK_INDEX
+    _LINK_INDEX = index
+
+
+def _resolve_link(url: str, display: str, index: dict) -> str | None:
+    """The canonical /section/slug for a written link, or None to unlink it."""
+    parts = url.strip("/").split("/")
+    if len(parts) != 2:
+        return url  # not an entity link (anchors, external, deep paths) - leave it
+    section, slug = parts
+    if f"/{section}/{slug}" in index["exact"]:
+        return url
+    sections = index["by_slug"].get(slug) or set()
+    if len(sections) == 1:  # right page, wrong section
+        return f"/{next(iter(sections))}/{slug}"
+    if slug in index["stems"]:  # acronym suffix dropped in prose
+        return index["stems"][slug]
+    # Last resort: the link TEXT usually is the entity name, even when the slug
+    # the model minted from it is not.
+    key = slugify(_display_name(display)).replace("-", " ")
+    return index["by_text"].get(key)
+
+
+def _fix_body_links(body: str, index: dict | None = None) -> str:
+    """Point every internal entity link at a page that exists, or unlink it."""
+    index = index if index is not None else _LINK_INDEX
+    if not index:
+        return body
+
+    def _sub(m: re.Match) -> str:
+        display, url = m.group(1), m.group(2)
+        target = _resolve_link(url, display, index)
+        return f"[{display}]({target})" if target else display
+
+    return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
+
+
 def _fix_canonical_text(text: str) -> str:
     """Deterministic post-generation corrections over the whole rendered article
     (body, description, reference text): US-government proper-noun spelling the
@@ -1482,7 +1592,7 @@ def render_article(
     if ai_usage:
         frontmatter = {k: v for k, v in frontmatter.items() if k != "ai_usage"}
         frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
-    body = _rewrite_link_display(body)
+    body = _fix_body_links(_rewrite_link_display(body))
     return (
         "---\n"
         + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
@@ -1515,7 +1625,7 @@ def render_record_page(
     frontmatter["references"] = article_fm.get("references", [])
     if ai_usage:
         frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
-    body = _rewrite_link_display(body)
+    body = _fix_body_links(_rewrite_link_display(body))
     return (
         "---\n"
         + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
@@ -1712,7 +1822,26 @@ def main() -> int:
         action="store_true",
         help="Call Claude and print the article to stdout, do not write file",
     )
+    ap.add_argument(
+        "--link-min-claims",
+        type=int,
+        default=0,
+        help="Only treat a proposed page as linkable above this claim count. Set "
+        "it to the floor the batch is assembling at, so the article does not link "
+        "to pages the run will not write (default: 0, every proposal is linkable)",
+    )
     args = ap.parse_args()
+
+    # Built once, before any render: body links are resolved against the proposal
+    # set rather than files on disk, so the same brief yields the same article
+    # whether it is assembled first or ninetieth in a batch.
+    set_link_index(
+        build_link_index(
+            Path(args.briefs_root) if args.briefs_root else None,
+            Path(args.content_root),
+            min_claims=args.link_min_claims,
+        )
+    )
 
     digest: dict | None = None
     brief: dict | None = None
