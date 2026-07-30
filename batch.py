@@ -233,17 +233,18 @@ def generate(args, kind: str, items: list[str]) -> int:
         "--content-root",
         args.content_root,
     ]
+    # The briefs root goes to every mode, not just --brief: it is also the
+    # proposal set the body-link resolver indexes, and a record page links to
+    # entities as heavily as an entity page does. Without it those links fall
+    # back to whatever happens to be on disk at the time.
+    common += ["--briefs-root", args.briefs_root, "--link-min-claims"]
+    common += [str(args.link_min_claims)]
     if kind == "nodes":
         common += ["--db", args.db]
     elif kind == "briefs":
         # Briefs are the sole source, but the digests-root lets the assembler
         # carry forward each contributing record's ai_usage into the article.
-        common += [
-            "--briefs-root",
-            args.briefs_root,
-            "--digests-root",
-            args.digests_root,
-        ]
+        common += ["--digests-root", args.digests_root]
     else:
         common += ["--digests-root", args.digests_root]
     ok = 0
@@ -353,6 +354,14 @@ def main() -> int:
         default=0.0,
         help="Seconds to wait between calls, to pace a run against the shared "
         "subscription rate-limit (calls are sequential regardless).",
+    )
+    ap.add_argument(
+        "--link-min-claims",
+        type=int,
+        default=0,
+        help="Claim floor below which a proposed page is not linkable. Set it to "
+        "the floor this batch is assembling at, so articles do not link to pages "
+        "the run will not write.",
     )
     ap.add_argument(
         "--max-consecutive-failures",
