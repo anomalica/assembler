@@ -82,9 +82,36 @@ def _read_items(args, kind: str) -> list[str]:
     return items
 
 
-def _prompt_chars(args, kind: str, item: str) -> int | None:
-    """Build the assembly prompt for one item read-only (no API) and return its
-    character count, or None if the item can't be resolved."""
+def _target_path(args, kind: str, item: str) -> Path | None:
+    """Where this item would be written, resolved without generating anything."""
+    node = _resolve_node(args, kind, item)
+    if node is None:
+        return None
+    section = asm.SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
+    return asm.output_path(Path(args.content_root), section, asm.node_slug(node))
+
+
+def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[str]]:
+    """Items in this run that would write to the SAME file.
+
+    Two live nodes can compete for one URL - the graph currently has five such
+    pairs, including one at 144 claims against 5. Assembling both writes the same
+    path twice and the second silently wins, so the page is decided by list order
+    and the loss is invisible. Caught here rather than at write time because a
+    pre-flight costs nothing and a discovered overwrite costs a whole article.
+    """
+    seen: dict[str, list[str]] = {}
+    for item in items:
+        path = _target_path(args, kind, item)
+        if path is not None:
+            seen.setdefault(str(path), []).append(item)
+    return {p: its for p, its in seen.items() if len(its) > 1}
+
+
+def _load(args, kind: str, item: str):
+    """(node, claims, related) for one item, read-only, or None if unresolvable.
+    The single place a work item is turned into the assembler's inputs, so the
+    pre-flight and the estimate cannot disagree about what an item resolves to."""
     if kind == "nodes":
         import sqlite3
 
@@ -92,24 +119,44 @@ def _prompt_chars(args, kind: str, item: str) -> int | None:
         node = asm.load_node(conn, item)
         if not node:
             return None
-        claims = asm.claims_for_node(conn, node["id"])
-        related = asm.related_nodes(conn, node["id"])
-    elif kind == "briefs":
+        return (
+            node,
+            asm.claims_for_node(conn, node["id"]),
+            asm.related_nodes(conn, node["id"]),
+        )
+    if kind == "briefs":
         loaded = asm.load_brief(Path(args.briefs_root), item)
         if not loaded:
             return None
         brief, _slug = loaded
-        node = asm.brief_node(brief)
-        claims = asm.claims_from_brief(brief)
-        related = asm.related_from_brief(brief)
-    else:
-        loaded = asm.load_digest(Path(args.digests_root), item)
-        if not loaded:
-            return None
-        digest, friendly_name = loaded
-        node = asm.record_node(digest, friendly_name)
-        claims = asm.claims_from_digest(digest)
-        related = asm.related_from_digest(digest)
+        return (
+            asm.brief_node(brief),
+            asm.claims_from_brief(brief),
+            asm.related_from_brief(brief),
+        )
+    loaded = asm.load_digest(Path(args.digests_root), item)
+    if not loaded:
+        return None
+    digest, friendly_name = loaded
+    return (
+        asm.record_node(digest, friendly_name),
+        asm.claims_from_digest(digest),
+        asm.related_from_digest(digest),
+    )
+
+
+def _resolve_node(args, kind: str, item: str) -> dict | None:
+    loaded = _load(args, kind, item)
+    return loaded[0] if loaded else None
+
+
+def _prompt_chars(args, kind: str, item: str) -> int | None:
+    """Build the assembly prompt for one item read-only (no API) and return its
+    character count, or None if the item can't be resolved."""
+    loaded = _load(args, kind, item)
+    if loaded is None:
+        return None
+    node, claims, related = loaded
     return len(asm.build_prompt(node, claims, related))
 
 
@@ -369,6 +416,12 @@ def main() -> int:
         "subscription rate-limit (calls are sequential regardless).",
     )
     ap.add_argument(
+        "--allow-slug-collisions",
+        action="store_true",
+        help="Proceed even when two items in the run write to the same file "
+        "(last write wins). Off by default: the loss is otherwise invisible.",
+    )
+    ap.add_argument(
         "--link-min-claims",
         type=int,
         default=0,
@@ -424,6 +477,26 @@ def main() -> int:
     kind, items = chosen[0]
 
     resolved, _ = estimate(args, kind, items)
+
+    clashes = _check_slug_collisions(args, kind, resolved)
+    if clashes:
+        print(
+            f"\nSLUG COLLISION: {len(clashes)} output path(s) claimed by more than "
+            "one item in this run. Assembling both writes the same file twice and "
+            "the second silently wins, so list order would decide the page.",
+            file=sys.stderr,
+        )
+        for path, its in clashes.items():
+            print(f"  {path}\n      <- {', '.join(its)}", file=sys.stderr)
+        if not args.allow_slug_collisions:
+            print(
+                "\nRefusing to run. Merge the duplicate nodes, or drop all but one "
+                "of each set from the work list, or pass --allow-slug-collisions to "
+                "accept last-write-wins.",
+                file=sys.stderr,
+            )
+            return 2
+
     if not args.confirm:
         tail = (
             "once the dollar amount above is cleared"
