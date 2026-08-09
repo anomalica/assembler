@@ -38,6 +38,7 @@ import yaml
 from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
 from anomalica_common.llm import PlanRateLimited, accumulate, usage_entry
 from anomalica_common.llm.transport import _raise_if_plan_limited
+from anomalica_common.slug import SECTION_BY_TYPE as _COMMON_SECTION_BY_TYPE
 from anomalica_common.slug import node_slug as _node_slug
 from anomalica_common.slug import slugify
 
@@ -115,28 +116,12 @@ _CANONICAL_CASING_FIXES = {
 }
 
 # Section the article goes into is mapped from the node's type. The site's
-# Hugo layout expects content/english/{section}/{slug}.en.md.
-SECTION_BY_TYPE = {
-    "person": "people",
-    "organisation": "organisations",
-    "place": "places",
-    "event": "events",
-    "object": "objects",
-    "document": "documents",
-    # ADR 0029 current taxonomy:
-    "project": "projects",  # collapses the old programme + investigation
-    "topic": "topics",  # renamed from concept
-    "pattern": "patterns",  # curator-created, not extractor-emitted
-    # Deprecated types kept for back-compat with older DB state:
-    "matter": "matters",
-    "concept": "concepts",
-    "programme": "programmes",
-    "investigation": "investigations",
-    "principle": "topics",  # transient pre-0029 name -> routes to /topics/
-    # Per-record narrative pages (--record mode): one page per ingested
-    # source artefact, routed to /records/{friendly_name}.
-    "source": "records",
-}
+# Hugo layout expects content/english/{section}/{slug}.en.md. The map itself now
+# lives beside slugify in anomalica-common: section and slug are the two halves of
+# a page's URL, and the synthesiser has to reason about both to tell a real slug
+# collision from an apparent one. Imported, not copied - a second copy of this is
+# precisely what let a manufactured hex suffix nearly reach a public URL.
+SECTION_BY_TYPE = _COMMON_SECTION_BY_TYPE
 
 
 # ----------------------------------------------------------------------------
@@ -886,6 +871,13 @@ _MAX_GEN_ATTEMPTS = 3
 _EXIT_PLAN_RATE_LIMITED = 75
 _PLAN_LIMIT_MARKER = "ASSEMBLER-PLAN-RATE-LIMITED"
 
+# How long one generation may take before it is abandoned. Was a hardcoded 900,
+# which a 124,913-char brief exceeded while an 884,522-char record prompt had
+# finished comfortably inside it - so this bounds wall-clock, not prompt size,
+# and the two are not the same thing. Env-tunable so an unattended run can buy
+# more patience without an edit.
+_CLI_TIMEOUT_SECONDS = int(os.environ.get("ASSEMBLER_CLI_TIMEOUT", "900"))
+
 # Keeps the output to the bare article (no preamble/commentary), since
 # validate_article expects it to start with the YAML front-matter fence.
 # Sent VERBATIM on both transports - appended to Claude Code's system prompt on
@@ -975,9 +967,27 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
         "--append-system-prompt",
         _SYSTEM_PROMPT,
     ]
-    proc = subprocess.run(
-        cmd, input=prompt, env=env, capture_output=True, text=True, timeout=900
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_CLI_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A timeout is a THIRD class, distinct from both throttling and a broken
+        # brief: nothing came back, so there is nothing to diagnose, and the same
+        # brief may well succeed on the next attempt. Raised as a plain error with
+        # the numbers that matter, rather than escaping as a traceback - and left
+        # inside the retry loop, because the one thing it is not is permanent.
+        raise RuntimeError(
+            f"claude CLI produced nothing in {_CLI_TIMEOUT_SECONDS}s "
+            f"({len(prompt):,}-char prompt, model={model}). Prompt size alone does "
+            "not predict this - an 884k-char record prompt has completed well "
+            "inside it. Raise ASSEMBLER_CLI_TIMEOUT if it recurs."
+        ) from exc
     # Before the returncode check: the CLI reports plan throttling on STDOUT with
     # a zero exit as often as it fails outright, so a returncode-first check
     # misses the common shape. Throttling is not a broken brief - it must reach
