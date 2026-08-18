@@ -59,12 +59,13 @@ PRICING = {
 # +1.2%. The fixed term is the CLI's own system prompt, which is charged on
 # every call however small the brief - the reason a per-char-only estimate is
 # hopeless for short items.
-CHARS_PER_TOKEN = 2.6
-FIXED_INPUT_TOKENS = 34_400
-# Observed 7,829 / 25,728 / 31,023. The model re-emits every reference block
-# (quote, claim_id, record_hash) into the front matter, so output tracks the
-# reference count, not the prose length. Ceiling, not mean, by design.
-EST_OUTPUT_TOKENS = 32_000
+# Single-sourced in assembler.py so the batch pre-flight and the single-run gate
+# cannot quote different numbers for the same work. (Observed output: 7,829 /
+# 25,728 / 31,023 - the model re-emits every reference block into the front
+# matter, so output tracks reference count, not prose length. Ceiling by design.)
+CHARS_PER_TOKEN = asm.CHARS_PER_TOKEN
+FIXED_INPUT_TOKENS = asm.FIXED_INPUT_TOKENS
+EST_OUTPUT_TOKENS = asm.EST_OUTPUT_TOKENS
 
 
 def _read_items(args, kind: str) -> list[str]:
@@ -293,6 +294,13 @@ def generate(args, kind: str, items: list[str]) -> int:
         "--content-root",
         args.content_root,
     ]
+    # Carry this batch's --confirm through to each child's own spend gate. The
+    # children are separate processes, so the authorisation this driver took
+    # from the operator does not otherwise reach them, and the metered backstop
+    # in _call_api would refuse every item. No-op on the subscription path,
+    # which is not metered and never consults it.
+    if asm._use_api() and getattr(args, "confirm", False):
+        common.append("--confirm-spend")
     # The briefs root goes to every mode, not just --brief: it is also the
     # proposal set the body-link resolver indexes, and a record page links to
     # entities as heavily as an entity page does. Without it those links fall

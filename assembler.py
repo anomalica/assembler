@@ -2,7 +2,7 @@
 """Anomalica assembler v0 - graph-to-page generator.
 
 --node mode queries the digester's SQLite knowledge graph for a single node;
---record mode reads a per-record digest (digests/records/{name}.yaml). Either
+--record mode reads a per-record digest (digests/{name}.yaml). Either
 way it formats claims into a prompt and asks Claude (the metered Anthropic API)
 to produce a reference-style article in the Hugo content format the site expects.
 
@@ -243,7 +243,7 @@ def _claim_refs(claim: dict) -> list[str]:
 
 
 def load_digest(digests_root: Path, ref: str) -> tuple[dict, str] | None:
-    """Locate and parse a per-record digest (digests/records/{name}.yaml, the
+    """Locate and parse a per-record digest (digests/{name}.yaml, the
     canonical per-record output per ADR 0027). `ref` is a friendly_name (the
     digest filename stem), a path to a digest file, or a record id / title
     matched by scanning. Returns (digest, friendly_name) or None.
@@ -251,10 +251,10 @@ def load_digest(digests_root: Path, ref: str) -> tuple[dict, str] | None:
     p = Path(ref)
     if p.suffix in {".yaml", ".yml"} and p.is_file():
         return yaml.safe_load(p.read_text()), p.stem
-    direct = digests_root / "records" / f"{ref}.yaml"
+    direct = digests_root / f"{ref}.yaml"
     if direct.is_file():
         return yaml.safe_load(direct.read_text()), ref
-    rec_dir = digests_root / "records"
+    rec_dir = digests_root
     if rec_dir.is_dir():
         for f in sorted(rec_dir.glob("*.yaml")):
             d = yaml.safe_load(f.read_text())
@@ -1005,11 +1005,45 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     return wrapper.get("result", proc.stdout)
 
 
+# Per-article token estimates, single-sourced here because both the single-run
+# gate in main() and batch.py's pre-flight quote from them; they lived only in
+# batch.py, so the single path had no figures to quote at all. Measured, and
+# ceilings rather than means by design (see batch.py's own notes).
+FIXED_INPUT_TOKENS = 34_400
+EST_OUTPUT_TOKENS = 32_000
+CHARS_PER_TOKEN = 2.6
+
+
+def _estimate_article_cost(model: str) -> dict:
+    """A one-article estimate dict for the shared spend gate. Same per-item
+    figures batch.py uses for its own pre-flight, so a single run and a batch of
+    one quote the same number."""
+    from anomalica_common.llm.cost import price_for
+
+    in_price, out_price = price_for(API_MODEL_MAP.get(model, model))
+    in_tok, out_tok = FIXED_INPUT_TOKENS, EST_OUTPUT_TOKENS
+    usd = in_tok / 1e6 * in_price + out_tok / 1e6 * out_price
+    return {
+        "items": 1,
+        "est_input_tokens": in_tok,
+        "est_output_tokens": out_tok,
+        "usd": usd,
+        "usd_low": usd * 0.6,
+        "usd_high": usd * 1.4,
+    }
+
+
 def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Generate via the metered Anthropic API (ASSEMBLER_USE_API=1). Reads
     ANTHROPIC_API_KEY from the environment (the metered Anomalica key). Streams so
     a large claims prompt doesn't trip the SDK's non-streaming time guard."""
     import anthropic
+    from anomalica_common.llm.transport import _require_metered
+
+    # Backstop, not the gate. The gate is in main(); this refuses if a future
+    # call site ever reaches the metered client without passing it, the same
+    # guarantee the shared transport gives the digester and assimilator.
+    _require_metered("Anthropic API (assembler)")
 
     model_id = API_MODEL_MAP.get(model, model)
     client = anthropic.Anthropic()
@@ -1840,7 +1874,33 @@ def main() -> int:
         "it to the floor the batch is assembling at, so the article does not link "
         "to pages the run will not write (default: 0, every proposal is linkable)",
     )
+    ap.add_argument(
+        "--confirm-spend",
+        action="store_true",
+        help="Authorise this metered run after reading the printed estimate. Only "
+        "consulted when ASSEMBLER_USE_API=1; the subscription path is not metered. "
+        "batch.py passes it through from its own --confirm.",
+    )
     args = ap.parse_args()
+
+    # Pre-flight spend gate for the SINGLE-article path. batch.py has always
+    # printed an estimate and refused without --confirm, but `assembler.py
+    # --node ...` - the invocation this module's own docstring documents - went
+    # straight to _call_api with no figure and no confirmation. Same shared gate
+    # the digester and ingester use, so the wording and the authorisation are
+    # identical. use_api is passed in: spend_confirmed's fallback reads the
+    # global ANOMALICA_USE_API, and this component resolves ASSEMBLER_USE_API.
+    if _use_api():
+        from anomalica_common.llm import spend_confirmed
+
+        if not spend_confirmed(
+            _estimate_article_cost(args.model),
+            API_MODEL_MAP.get(args.model, args.model),
+            confirm=args.confirm_spend,
+            echo=lambda m: print(m, file=sys.stderr),
+            use_api=True,
+        ):
+            return 2
 
     # Built once, before any render: body links are resolved against the proposal
     # set rather than files on disk, so the same brief yields the same article
