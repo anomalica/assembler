@@ -1,0 +1,10 @@
+# Anomalica repos commit under the mark@anomalica.is identity, not Mark's personal
+# account, so the work-hours commit-time protection (a personal-boundary policy)
+# does not apply. Authorised by Mark 2026-06-23. Per-repo override read by
+# ~/repos/git-hooks - NOT a change to the guarded global config.
+#
+# Without it the post-commit hook runs `git filter-branch` over recent history to
+# move commit times, which rewrites those commits and PERMANENTLY STRIPS their SSH
+# signatures - so an Anomalica repo silently accumulates unsigned commits under a
+# signing identity. Observed live 2026-08-19: one commit here rewrote 15.
+SKIP_WORK_PROTECTION=1
