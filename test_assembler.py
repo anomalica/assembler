@@ -76,3 +76,40 @@ def test_unparseable_frontmatter_is_a_failed_attempt_not_a_crash():
     )
     with pytest.raises(ValueError, match="not valid YAML"):
         a.validate_article(bad)
+
+
+def test_a_source_title_that_starts_with_a_quote_is_repaired():
+    """A title whose own text opens with a double quote produced
+
+        source: ""Skinny Bob is Real" - Lifelong Abductee...
+
+    which YAML reads as an empty scalar followed by junk. Re-quoted with single
+    quotes, the one form that carries embedded double quotes without escaping,
+    the value survives intact rather than costing a regeneration.
+    """
+    import yaml
+
+    bad = (
+        "title: T\n"
+        "description: D\n"
+        "references:\n"
+        '  - text: "x"\n'
+        '    source: ""Skinny Bob is Real" - Lifelong Abductee\n'
+    )
+    fixed = a._sanitise_frontmatter_yaml(bad)
+    parsed = yaml.safe_load(fixed)
+    assert (
+        parsed["references"][0]["source"] == '"Skinny Bob is Real" - Lifelong Abductee'
+    )
+
+
+def test_ordinary_frontmatter_is_left_alone():
+    """The repair must not touch values that were already valid."""
+    ok = (
+        "title: T\n"
+        'description: "plain value"\n'
+        "references:\n"
+        '  - text: "y"\n'
+        '    source: "Normal Title"\n'
+    )
+    assert a._sanitise_frontmatter_yaml(ok) == ok

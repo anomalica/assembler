@@ -1101,9 +1101,31 @@ def _sanitise_frontmatter_yaml(fm_text: str) -> str:
        throws data away (broke Roswell title, Whitaker references on
        2026-05-23).
 
+    3. `key: ""Quoted Title" rest of title"` where the VALUE ITSELF starts with a
+       double quote, because the source's own title does. YAML reads the leading
+       `""` as an empty scalar and then chokes on the words after it. Re-quote the
+       whole value with single quotes, which is the one form that carries embedded
+       double quotes without escaping. Found on the Chris Ramsay page:
+       `source: ""Skinny Bob is Real" - Lifelong Abductee...`, which crashed the
+       run outright. Titles carrying quotes are ordinary in this corpus.
+
     Apply 2 first - splitting cannot break shape 1, but merging would
-    permanently destroy shape 2.
+    permanently destroy shape 2. Apply 3 before both: it is the only shape whose
+    value begins with a quote, so leaving it until later lets 1 and 2 misread the
+    empty scalar as a complete value.
     """
+
+    # Shape 3: a value whose own text opens with a double quote.
+    def _requote(m: re.Match) -> str:
+        indent, prefix, value = m.groups()
+        return f"{indent}{prefix}'{value.rstrip().replace(chr(39), chr(39) * 2)}'"
+
+    fm_text = re.sub(
+        r'^([ \t]*)([\w-]+:[ \t]+)"("[^\n]*)$',
+        _requote,
+        fm_text,
+        flags=re.MULTILINE,
+    )
     # NOTE: use [ \t]+ for "whitespace between two pieces on the same line"
     # rather than \s+, because \s also matches \n - and a newline-spanning
     # match would either merge data across lines (the bug we just fixed) or
