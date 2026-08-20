@@ -104,3 +104,39 @@ def test_ordinary_frontmatter_is_left_alone():
         '    source: "Normal Title"\n'
     )
     assert a._sanitise_frontmatter_yaml(ok) == ok
+
+
+ACRONYM_RELATED = [
+    {"name": "Unidentified Flying Object (UFO)", "type": "topic"},
+    {
+        "name": "Office of the Under Secretary of Defense for Intelligence (OUSDI)",
+        "type": "organisation",
+    },
+    {"name": "United States Department of Defense (DoD)", "type": "organisation"},
+]
+
+
+def test_an_acronym_in_the_prose_matches_its_parenthesised_name():
+    """The corpus names an entity "... for Intelligence (OUSDI)" and the prose
+    calls it "OUSDI", so the acronym must be a comparable word on both sides.
+
+    Getting this wrong was expensive: the AATIP and Tom DeLonge pages each failed
+    all three attempts on CORRECT links to UFO, OUSDI, AAWSAP, NASA and CE5, and
+    neither page was written.
+    """
+    assert not a._check_link_targets(
+        "[OUSDI](/organisations/office-of-the-under-secretary-of-defense-for-intelligence-ousdi)",
+        ACRONYM_RELATED,
+    )
+    # Plural of an acronym, as the prose naturally writes it.
+    assert not a._check_link_targets(
+        "[UFOs](/topics/unidentified-flying-object-ufo)", ACRONYM_RELATED
+    )
+
+
+def test_a_wrong_acronym_is_still_caught():
+    """Loosening for acronyms must not blind the check: CIA is not the DoD."""
+    problems = a._check_link_targets(
+        "[CIA](/organisations/united-states-department-of-defense-dod)", ACRONYM_RELATED
+    )
+    assert len(problems) == 1 and "CIA" in problems[0]

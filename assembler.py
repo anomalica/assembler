@@ -1210,6 +1210,30 @@ def _retry_note(fail_msg: str) -> str:
 _BODY_LINK = re.compile(r"\[([^\]\n]+?)\]\(/([a-z-]+)/([a-z0-9-]+)\)")
 
 
+def _link_words(text: str) -> set[str]:
+    """The comparable words in a name or a link's display text.
+
+    Parentheses are stripped, not kept: the corpus writes an entity as "Office of
+    the Under Secretary of Defense for Intelligence (OUSDI)" and the prose refers
+    to it as "OUSDI", so the acronym has to be a word on both sides or every such
+    link reads as a mismatch. That mistake cost six generations - the AATIP and Tom
+    DeLonge pages each failed all three attempts on correct links to UFO, OUSDI,
+    AAWSAP, NASA and CE5.
+
+    A trailing plural "s" is dropped for the same reason ("UFOs" against "UFO").
+    Two characters or fewer carry no evidence and are ignored.
+    """
+    out: set[str] = set()
+    for raw in text.split():
+        w = raw.strip(",.;:'\"()[[]").lower()
+        if len(w) <= 2:
+            continue
+        out.add(w)
+        if w.endswith("s") and len(w) > 3:
+            out.add(w[:-1])
+    return out
+
+
 def _check_link_targets(body: str, related: list[dict] | None) -> list[str]:
     """Violations where a link's display text is not the entity it points at.
 
@@ -1246,8 +1270,8 @@ def _check_link_targets(body: str, related: list[dict] | None) -> list[str]:
         target_name = by_slug.get(f"{section}/{slug}")
         if not target_name:
             continue
-        words = {w.strip(",.;:'\"").lower() for w in target_name.split() if len(w) > 2}
-        shown = {w.strip(",.;:'\"").lower() for w in display.split() if len(w) > 2}
+        words = _link_words(target_name)
+        shown = _link_words(display)
         if shown and not (shown & words):
             problems.append(f'"{display}" links to /{section}/{slug} ("{target_name}")')
     return problems
