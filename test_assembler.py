@@ -55,25 +55,16 @@ def test_a_target_outside_the_linkable_list_is_not_judged():
 
 def test_unparseable_frontmatter_is_a_failed_attempt_not_a_crash():
     """Every other malformation in validate_article raises ValueError, which the
-    retry loop catches. A YAML parse error did not, so it escaped as a traceback
-    and killed the run on exit 1 with nothing written.
+    retry loop catches and regenerates from. A YAML parse error did not, so it
+    escaped as a traceback and killed the run on exit 1 with nothing written.
 
-    The case that found it: a source whose own title starts with a quote -
-    source: ""Skinny Bob is Real" - Lifelong A... - which YAML reads as an empty
-    scalar followed by junk. Titles carrying quotes are ordinary in this corpus.
+    Uses a malformation the sanitiser cannot repair - an unclosed flow sequence -
+    because the shape that originally exposed this (a source title opening with a
+    quote) is now repaired before the parse and no longer reaches it.
     """
     import pytest
 
-    bad = (
-        "---\n"
-        "title: T\n"
-        "description: D\n"
-        "references:\n"
-        '  - text: "x"\n'
-        '    source: ""Skinny Bob is Real" - Lifelong Abductee\n'
-        "---\n"
-        "\nbody text\n"
-    )
+    bad = "---\ntitle: T\ndescription: D\nmetadata: [unclosed, flow\n---\n\nbody text\n"
     with pytest.raises(ValueError, match="not valid YAML"):
         a.validate_article(bad)
 
