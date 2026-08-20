@@ -1185,6 +1185,52 @@ def _retry_note(fail_msg: str) -> str:
     )
 
 
+_BODY_LINK = re.compile(r"\[([^\]\n]+?)\]\(/([a-z-]+)/([a-z0-9-]+)\)")
+
+
+def _check_link_targets(body: str, related: list[dict] | None) -> list[str]:
+    """Violations where a link's display text is not the entity it points at.
+
+    The assembler hands the model a slug list and the model writes the links
+    itself. Nothing checked that the words and the destination were the same
+    entity, so the model could put one person's name on another person's page and
+    the article passed every other gate.
+
+    This class is invisible to a human reader, which is why it has to be
+    mechanical: the prose reads correctly and only the href is wrong. One reached
+    the live site - "Garry Reid" linked to /people/luis-elizondo on the OUSDI
+    page - and four more sat in content/ waiting for their target page to exist,
+    including "Lex Fridman" pointing at /people/george-knapp.
+
+    Surname-only shorthand is legitimate and common ("[Fravor](/people/david-
+    fravor)"), so a display text that is a WORD of the target's name passes. The
+    test is deliberately loose in that direction: it exists to catch a link
+    naming somebody else entirely, not to police phrasing.
+
+    Only links whose target is in the linkable list are judged. A link to a page
+    outside it cannot be checked here and is left to the existing link-resolution
+    pass.
+    """
+    if not related:
+        return []
+    by_slug: dict[str, str] = {}
+    for r in related:
+        t = r.get("type") or "topic"
+        section = SECTION_BY_TYPE.get(t, t + "s")
+        by_slug[f"{section}/{node_slug(r)}"] = r.get("name") or ""
+
+    problems: list[str] = []
+    for display, section, slug in _BODY_LINK.findall(body):
+        target_name = by_slug.get(f"{section}/{slug}")
+        if not target_name:
+            continue
+        words = {w.strip(",.;:'\"").lower() for w in target_name.split() if len(w) > 2}
+        shown = {w.strip(",.;:'\"").lower() for w in display.split() if len(w) > 2}
+        if shown and not (shown & words):
+            problems.append(f'"{display}" links to /{section}/{slug} ("{target_name}")')
+    return problems
+
+
 def _check_date_fidelity(
     body: str, claims: list[dict], related: list[dict] | None = None
 ) -> list[str]:
@@ -2028,6 +2074,15 @@ def main() -> int:
             fm, body = validate_article(response)
         except ValueError as exc:
             fail_code, fail_msg = 3, f"invalid article: {exc}"
+            fm = body = None
+            print(
+                f"  attempt {attempt}/{_MAX_GEN_ATTEMPTS}: {fail_msg}", file=sys.stderr
+            )
+            continue
+        link_problems = _check_link_targets(body, related)
+        if link_problems:
+            fail_code = 4
+            fail_msg = "link-target: " + "; ".join(link_problems)
             fm = body = None
             print(
                 f"  attempt {attempt}/{_MAX_GEN_ATTEMPTS}: {fail_msg}", file=sys.stderr
