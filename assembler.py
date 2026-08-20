@@ -1256,6 +1256,15 @@ def _check_link_targets(body: str, related: list[dict] | None) -> list[str]:
     Only links whose target is in the linkable list are judged. A link to a page
     outside it cannot be checked here and is left to the existing link-resolution
     pass.
+
+    KNOWN FALSE POSITIVES, measured rather than assumed: a corpus-wide audit on
+    2026-08-21 found exactly two links this rejects that are correct - a synonym
+    ("preknowledge" for Precognition) and a callsign ("FastEagle" for Strike
+    Fighter Squadron 41). Both would be accepted if the check could see the
+    target's ALIASES, but a brief carries only node_id, node_type, slug, title and
+    shared_claims, so that needs a schema change in synthesise as well as here.
+    Two wasted regenerations across the whole corpus did not justify it; revisit if
+    the count grows.
     """
     if not related:
         return []
