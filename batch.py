@@ -186,7 +186,8 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         print("BATCH SPEND ESTIMATE (metered Anthropic API)", file=sys.stderr)
     else:
         print(
-            "BATCH PRE-FLIGHT (Claude subscription - NO metered spend)",
+            "BATCH PRE-FLIGHT (Claude subscription - no metered spend, "
+            "but spends plan allowance)",
             file=sys.stderr,
         )
     print(
@@ -206,9 +207,11 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         )
     else:
         print(
-            f"  Runs on Mark's Max subscription - no dollar spend, draws on plan "
-            f"rate limits. (Would cost ~${total:,.2f} on the metered API; set "
-            f"ASSEMBLER_USE_API=1 to use it.)",
+            f"  Draws on the Max plan's finite weekly allowance - DISCOUNTED, "
+            f"NOT FREE. Equivalent metered value ~${total:,.2f}. The allowance is "
+            f"shared across every project and heavier models burn it fastest, so "
+            f"this still needs clearing before it runs. (ASSEMBLER_USE_API=1 to "
+            f"bill the metered API instead.)",
             file=sys.stderr,
         )
     if unresolved:

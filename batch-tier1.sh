@@ -17,7 +17,7 @@ export ANTHROPIC_API_KEY
 
 docker run --rm \
 	-v /home/mark/repos/anomalica/assembler:/work \
-	-v /home/mark/.local/share/digester:/db:ro \
+	-v /home/mark/.local/share/assimilator:/db:ro \
 	-v /home/mark/repos/anomalica/content:/content \
 	-v /home/mark/repos/anomalica/digests:/digests:ro \
 	--user "$(id -u):$(id -g)" --network host -e HOME=/home/nonroot \
