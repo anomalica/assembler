@@ -1319,7 +1319,20 @@ def validate_article(text: str) -> tuple[dict, str]:
     if len(parts) < 3:
         raise ValueError("article frontmatter not closed by second '---'")
     fm_text = _sanitise_frontmatter_yaml(parts[1])
-    fm = yaml.safe_load(fm_text)
+    try:
+        fm = yaml.safe_load(fm_text)
+    except yaml.YAMLError as exc:
+        # A generation that emits unparseable frontmatter is a FAILED ATTEMPT, not
+        # a crash. It escaped as a traceback because every other malformation here
+        # raises ValueError and this one did not, so the retry loop never saw it
+        # and the run died on exit 1 with nothing written.
+        #
+        # The case that found it: a source whose own title starts with a quote -
+        # source: ""Skinny Bob is Real" - Lifelong A... - which YAML reads as an
+        # empty scalar followed by junk. Titles carrying quotes are ordinary in
+        # this corpus, so this will recur; as a ValueError it now costs one retry
+        # instead of the whole article.
+        raise ValueError(f"frontmatter is not valid YAML: {exc}") from exc
     body = parts[2].strip()
     if not isinstance(fm, dict):
         raise ValueError("frontmatter is not a mapping")

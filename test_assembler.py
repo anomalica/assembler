@@ -51,3 +51,28 @@ def test_a_target_outside_the_linkable_list_is_not_judged():
     )
     assert not a._check_link_targets("text with no links at all", RELATED)
     assert not a._check_link_targets("[Anyone](/people/anyone)", None)
+
+
+def test_unparseable_frontmatter_is_a_failed_attempt_not_a_crash():
+    """Every other malformation in validate_article raises ValueError, which the
+    retry loop catches. A YAML parse error did not, so it escaped as a traceback
+    and killed the run on exit 1 with nothing written.
+
+    The case that found it: a source whose own title starts with a quote -
+    source: ""Skinny Bob is Real" - Lifelong A... - which YAML reads as an empty
+    scalar followed by junk. Titles carrying quotes are ordinary in this corpus.
+    """
+    import pytest
+
+    bad = (
+        "---\n"
+        "title: T\n"
+        "description: D\n"
+        "references:\n"
+        '  - text: "x"\n'
+        '    source: ""Skinny Bob is Real" - Lifelong Abductee\n'
+        "---\n"
+        "\nbody text\n"
+    )
+    with pytest.raises(ValueError, match="not valid YAML"):
+        a.validate_article(bad)
