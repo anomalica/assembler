@@ -1165,6 +1165,26 @@ def _collect_source_dates(claims: list[dict]) -> tuple[set[str], set[str]]:
     return years, iso
 
 
+def _retry_note(fail_msg: str) -> str:
+    """The corrective suffix appended to a regeneration prompt after a failure.
+
+    Names the specific gate that rejected the last attempt rather than asking for
+    "a better article", because the two gates fail for unrelated reasons:
+    validate_article is a shape problem (missing frontmatter, unparseable YAML)
+    and date-fidelity is a truthfulness problem (a year that is in no claim).
+    """
+    return (
+        "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED AND DISCARDED.\n"
+        f"Reason: {fail_msg}\n\n"
+        "Correct that specific fault. In particular:\n"
+        "- The response must BEGIN with '---' on its own line - no preamble, no "
+        "explanation, no code fence before it. The first three characters of your "
+        "output are '-', '-', '-'.\n"
+        "- Every date must come from a claim you were given. Do not infer, round "
+        "or complete a date that is not in the source material.\n"
+    )
+
+
 def _check_date_fidelity(
     body: str, claims: list[dict], related: list[dict] | None = None
 ) -> list[str]:
@@ -1985,8 +2005,16 @@ def main() -> int:
     fail_code, fail_msg = 3, ""
     _reset_usage()  # scope token usage to this article (accumulates over retries)
     for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
+        # Tell the model what went wrong last time. Retrying the IDENTICAL prompt
+        # only helps if the failure was a coin-flip; when it is systematic the
+        # generation fails the same way every attempt and the whole budget is
+        # spent for nothing - three passes of a 98,000-character prompt in the
+        # case that prompted this (the Luis Elizondo page, "does not start with
+        # '---' frontmatter" twice in a row). Feeding the error back costs a few
+        # hundred characters and turns a blind retry into a corrective one.
+        attempt_prompt = prompt if attempt == 1 else prompt + _retry_note(fail_msg)
         try:
-            response = call_claude(prompt, model=args.model)
+            response = call_claude(attempt_prompt, model=args.model)
         except PlanRateLimited as exc:
             # Not a failed article: the plan window is full and the brief is
             # untouched. Exit on its own code with the reset time in a fixed
