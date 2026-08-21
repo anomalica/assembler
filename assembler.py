@@ -1224,13 +1224,21 @@ def _link_words(text: str) -> set[str]:
     Two characters or fewer carry no evidence and are ignored.
     """
     out: set[str] = set()
-    for raw in text.split():
-        w = raw.strip(",.;:'\"()[[]").lower()
-        if len(w) <= 2:
+    for raw in re.split(r"[\s/]+", text):
+        w = raw.strip(",.;:'\"()[]").lower()
+        if not w:
             continue
-        out.add(w)
-        if w.endswith("s") and len(w) > 3:
-            out.add(w[:-1])
+        # Keep the compound AND its parts: "1952-1957" has to match prose that
+        # says "1952 and 1957", and "F-117A" the bare "F-117A". Splitting only on
+        # whitespace left the hyphenated form matching nothing, which rejected a
+        # correct Project Blue Book link and cost that page its whole attempt
+        # budget.
+        for part in [w, *w.split("-")]:
+            if len(part) <= 2:
+                continue
+            out.add(part)
+            if part.endswith("s") and len(part) > 3:
+                out.add(part[:-1])
     return out
 
 

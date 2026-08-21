@@ -140,3 +140,31 @@ def test_a_wrong_acronym_is_still_caught():
         "[CIA](/organisations/united-states-department-of-defense-dod)", ACRONYM_RELATED
     )
     assert len(problems) == 1 and "CIA" in problems[0]
+
+
+def test_a_hyphenated_compound_matches_its_parts():
+    """ "1952-1957" has to match prose that writes "1952 and 1957". Splitting only
+    on whitespace left the hyphenated form matching nothing, which rejected a
+    correct Project Blue Book link and cost that page its entire attempt budget.
+
+    Third false-positive class found in this gate after acronyms and plurals, all
+    from the same mistake: assuming the display text is spelled like the node name.
+    """
+    related = [
+        {
+            "name": "1952-1957 Unidentified Anomalous Phenomena / Unidentified Aerial Phenomena (UAP) sighting spike",
+            "type": "event",
+        }
+    ]
+    assert not a._check_link_targets(
+        "[1952 and 1957](/events/1952-1957-unidentified-anomalous-phenomena-unidentified-aerial-phenomena-uap-sighting-spike)",
+        related,
+    )
+
+
+def test_the_hyphen_split_does_not_blind_the_check():
+    """Splitting compounds must not make everything match everything."""
+    related = [{"name": "USS Nimitz (CVN-68)", "type": "object"}]
+    assert a._check_link_targets(
+        "[Ticonderoga-class](/objects/uss-nimitz-cvn-68)", related
+    )
