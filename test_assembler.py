@@ -168,3 +168,82 @@ def test_the_hyphen_split_does_not_blind_the_check():
     assert a._check_link_targets(
         "[Ticonderoga-class](/objects/uss-nimitz-cvn-68)", related
     )
+
+
+CLAIM = {
+    "content": "The object accelerated away.",
+    "record_title": "Some Recording",
+    "attribution_mode": "unverified",
+    "claim_type": "observation",
+    "attestation": "firsthand",
+}
+
+
+def test_bracketed_speaker_is_a_description_not_a_name():
+    """Square brackets are the notation for "we do not know who this is". Real
+    names, and titles that merely start with the word, must not be caught."""
+    for described in (
+        "[interviewer 2]",
+        "[audience member]",
+        "Speaker 1",
+        "speaker_3",
+        "speaker-1",
+        "unnamed 1976 Bolton abductee",
+        "unnamed-1976-bolton-abductee",
+    ):
+        assert a.is_described_speaker(described), described
+    for named in (
+        "David Fravor",
+        "david-fravor",
+        "Speaker of the House",
+        "speaker-of-the-house",
+        "USS Nimitz",
+    ):
+        assert not a.is_described_speaker(named), named
+
+
+def test_a_described_speaker_is_never_offered_as_a_link_target():
+    """A page for "[audience member]" would be a page about nobody, assembled from
+    unrelated people in unrelated recordings."""
+    block = a.format_related_block(
+        [
+            {"name": "David Fravor", "type": "person", "shared_claims": 5},
+            {"name": "[interviewer 2]", "type": "person", "shared_claims": 3},
+            {"name": "Speaker 1", "type": "person", "shared_claims": 2},
+        ]
+    )
+    assert "david-fravor" in block
+    assert "interviewer" not in block
+    assert "speaker-1" not in block
+
+
+def test_described_speaker_gets_its_own_attribution_branch():
+    """Reproduced verbatim, brackets included, and never spoken of as a named
+    person - the brackets ARE the signal that this is a description."""
+    out = a.format_claim({**CLAIM, "speaker": "[interviewer 2]"}, 1)
+    assert "SPEAKER DESCRIBED NOT NAMED" in out
+    assert "[interviewer 2]" in out
+    assert "Do NOT link it" in out
+
+
+def test_named_speaker_attribution_is_unchanged():
+    out = a.format_claim({**CLAIM, "speaker": "David Fravor"}, 1)
+    assert "SPEAKER DESCRIBED NOT NAMED" not in out
+    assert "David Fravor said that" in out
+
+
+def test_missing_speaker_still_falls_through_to_the_source_record():
+    out = a.format_claim({**CLAIM, "speaker": ""}, 1)
+    assert "the source record below" in out
+
+
+def test_link_index_refuses_a_described_speaker_even_with_a_page_on_disk(tmp_path):
+    """Belt and braces: a page may exist from before this rule, and must still not
+    be linkable."""
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    (pages / "speaker-1.en.md").write_text("---\ntitle: Speaker 1\n---\n\nbody\n")
+    (pages / "david-fravor.en.md").write_text("---\ntitle: David Fravor\n---\n\nbody\n")
+    idx = a.build_link_index(None, tmp_path)
+    assert "/people/david-fravor" in idx["exact"]
+    assert "/people/speaker-1" not in idx["exact"]

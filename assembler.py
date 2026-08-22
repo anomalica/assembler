@@ -579,6 +579,33 @@ def gather_upstream_ai_usage(claims: list[dict], digests_root: Path) -> list[dic
 # page.slug and the assembler's deployed page slug cannot drift (same discipline
 # as claim_hash). This thin adapter keeps the node-dict call interface; it holds
 # no slug logic of its own.
+# A speaker value in square brackets is a DESCRIPTION, not a name: the person is
+# unknown and the text describes their role in that one recording ("[interviewer 2]",
+# "[audience member]"). It is RECORD-SCOPED - the "[interviewer 2]" in one recording
+# is not the one in another - so nothing may merge them, build a person page from
+# them, or link them. Generalises what "[narrator]" and "[irrelevant]" already did.
+# See architecture/ingest-format.md and node-types.md.
+#
+# Two older unbracketed forms mean the same thing and are handled alongside it:
+# "unnamed X" ("unnamed 1976 Bolton, Lancashire abductee"), and a bare diarisation
+# id "Speaker 1" - the ingester is switching its default output to "[speaker 1]",
+# so both spellings are in the corpus at once. Requiring a DIGIT after "speaker"
+# keeps real titles like "Speaker of the House" out of this.
+_DESCRIBED_SPEAKER_RE = re.compile(
+    r"^\s*(\[|unnamed[\s_-]|speaker[\s_-]*\d)", re.IGNORECASE
+)
+
+
+def is_described_speaker(name: str | None) -> bool:
+    """True when this value describes an unidentified person rather than naming one.
+
+    Such a value may appear in an attribution and MUST render as written - the
+    brackets are the signal that it is a description - but it must never become a
+    linked entity, earn a page, or be spoken of as a named person.
+    """
+    return bool(name and _DESCRIBED_SPEAKER_RE.match(name))
+
+
 def node_slug(node: dict) -> str:
     """URL slug for a node dict, via the canonical slugifier. Honours
     metadata.explicit_slug (ADR 0028 pattern short URLs)."""
@@ -671,6 +698,11 @@ OUTPUT - the article as described above, starting with --- and ending with the c
 
 
 def format_related_block(related: list[dict]) -> str:
+    # A described speaker ("[interviewer 2]", "Speaker 1") is not an entity: it is
+    # record-scoped shorthand for someone unidentified, so offering it as a link
+    # target would point at a page about nobody, assembled from unrelated people in
+    # unrelated recordings.
+    related = [r for r in related if not is_described_speaker(r.get("name"))]
     if not related:
         return ""
     lines = [
@@ -802,6 +834,19 @@ def format_claim(c: dict, idx: int) -> str:
         )
     elif mode == "bare_ok":
         note = ""
+    elif is_described_speaker(speaker):
+        # The value describes an unidentified person rather than naming one. It is
+        # reproduced verbatim, brackets and all - they are the notation that says
+        # "description, not name" - and never treated as a person or linked.
+        note = (
+            "  ATTRIBUTION: UNVERIFIED, SPEAKER DESCRIBED NOT NAMED - "
+            f"{speaker!r} describes who this person was in this one recording; "
+            "their name is unknown. Attribute in the prose using that description "
+            f'EXACTLY as written, brackets included (e.g. "{speaker} said that '
+            '..."). Do NOT link it, do NOT invent or infer a name for them, and do '
+            "NOT treat them as the same person as a similar description in any "
+            "other record. NEVER state it as plain fact in Anomalica's own voice."
+        )
     else:  # unknown - fail safe
         who = f'"{speaker}"' if speaker else "the source record below"
         note = (
@@ -1532,6 +1577,10 @@ def build_link_index(
     by_text: dict[str, str] = {}
 
     def add(section: str, slug: str, title: str | None) -> None:
+        # Belt and braces with format_related_block: a described speaker must not be
+        # linkable even if one already has a page on disk from before this rule.
+        if is_described_speaker(title) or is_described_speaker(slug):
+            return
         path = f"/{section}/{slug}"
         exact.add(path)
         by_slug.setdefault(slug, set()).add(section)
