@@ -247,3 +247,32 @@ def test_link_index_refuses_a_described_speaker_even_with_a_page_on_disk(tmp_pat
     idx = a.build_link_index(None, tmp_path)
     assert "/people/david-fravor" in idx["exact"]
     assert "/people/speaker-1" not in idx["exact"]
+
+
+def test_a_de_bracketed_slug_is_caught_by_the_page_title(tmp_path):
+    """slugify strips brackets, so "[interviewer 2]" lands on disk as
+    interviewer-2 - indistinguishable from a real slug. The title still carries
+    them, so the gate tests that instead of the lossy derivative."""
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    (pages / "interviewer-2.en.md").write_text(
+        '---\ntitle: "[interviewer 2]"\n---\n\nbody\n'
+    )
+    (pages / "david-fravor.en.md").write_text("---\ntitle: David Fravor\n---\n\nbody\n")
+    idx = a.build_link_index(None, tmp_path)
+    assert "/people/david-fravor" in idx["exact"]
+    assert "/people/interviewer-2" not in idx["exact"]
+
+
+def test_real_pages_still_index_by_their_title(tmp_path):
+    pages = tmp_path / "pages" / "organisations"
+    pages.mkdir(parents=True)
+    (pages / "united-states-navy-usn.en.md").write_text(
+        '---\ntitle: "United States Navy (USN)"\ndescription: x\n---\n\nbody\n'
+    )
+    idx = a.build_link_index(None, tmp_path)
+    # The acronym stem still resolves, so prose dropping "(USN)" still links.
+    assert (
+        idx["stems"].get("united-states-navy")
+        == "/organisations/united-states-navy-usn"
+    )

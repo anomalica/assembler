@@ -1561,6 +1561,29 @@ _LINK_INDEX: dict | None = None
 _ACRONYM_TITLE_RE = re.compile(r"^(.*?)\s*\(([A-Z0-9][A-Z0-9&/. -]{1,})\)\s*$")
 
 
+def _page_title(md: Path) -> str | None:
+    """The `title:` from a page's front matter, without parsing the whole file.
+
+    Worth the read because the filename is a LOSSY derivative of the name: slugify
+    strips the brackets that mark a described speaker, so "[interviewer 2]" lands on
+    disk as interviewer-2 and is indistinguishable from a real slug. The title still
+    carries the brackets, so reading it lets every gate test the thing that actually
+    holds the information rather than the derivative.
+    """
+    try:
+        with md.open(encoding="utf-8") as fh:
+            for i, line in enumerate(fh):
+                if i > 40:  # title lives at the top of the front matter, or nowhere
+                    break
+                if line.startswith("title:"):
+                    return line[len("title:") :].strip().strip("\"'")
+                if i and line.rstrip() == "---":
+                    break
+    except OSError:
+        pass
+    return None
+
+
 def build_link_index(
     briefs_root: Path | None, content_root: Path | None, min_claims: int = 0
 ) -> dict:
@@ -1612,7 +1635,7 @@ def build_link_index(
             )
     if content_root:
         for md in Path(content_root).glob("pages/*/*.en.md"):
-            add(md.parent.name, md.name[: -len(".en.md")], None)
+            add(md.parent.name, md.name[: -len(".en.md")], _page_title(md))
     return {"exact": exact, "by_slug": by_slug, "stems": stems, "by_text": by_text}
 
 
