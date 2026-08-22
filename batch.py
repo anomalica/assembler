@@ -413,6 +413,84 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def report_spend(content_root: str, since: str | None) -> int:
+    """Report what assembly ACTUALLY cost, read back from the articles.
+
+    The AI-operation ledger that ADR 0037 specifies has no table in either
+    database, so the only surviving record of a run is the `built_by.tokens` block
+    the assembler stamps into each article it writes. That made two unexplained
+    runs recoverable after the fact - 6.3M tokens across 31 pages on 21 August -
+    but only by hand-written queries at the time they were needed.
+
+    This makes that recovery a command, so "what did that cost" is answerable by
+    whoever asks rather than by whoever can write the query.
+    """
+    root = Path(content_root).expanduser()
+    files = sorted(root.glob("pages/*/*.en.md"))
+    if since:
+        try:
+            out = subprocess.run(
+                ["git", "log", "--format=", "--name-only", f"{since}..HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.split()
+        except (subprocess.CalledProcessError, OSError) as exc:
+            print(f"cannot read git history in {root}: {exc}", file=sys.stderr)
+            return 2
+        touched = {n for n in out if n.endswith(".en.md")}
+        # A run that was interrupted leaves its last pages uncommitted, and those
+        # are precisely the ones somebody is asking about. Git history alone would
+        # miss them - it missed 527k tokens across two pages when this was first
+        # asked by hand.
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        touched |= {
+            line[3:].strip().strip('"')
+            for line in dirty
+            if line[3:].strip().strip('"').endswith(".en.md")
+        }
+        files = [f for f in files if str(f.relative_to(root)) in touched]
+
+    rows, unstamped = [], []
+    for f in files:
+        tokens = asm.article_tokens(f)
+        (rows.append((f, tokens)) if tokens else unstamped.append(f))
+
+    tot_in = sum(t.get("input", 0) for _, t in rows)
+    tot_out = sum(t.get("output", 0) for _, t in rows)
+    scope = f"{since}..HEAD" if since else "all pages"
+    print("=" * 60, file=sys.stderr)
+    print(f"ASSEMBLY SPEND, READ BACK FROM THE ARTICLES ({scope})", file=sys.stderr)
+    print(
+        f"  {len(rows)} stamped article(s), {len(unstamped)} without a stamp",
+        file=sys.stderr,
+    )
+    print(
+        f"  input {tot_in:,} + output {tot_out:,} = {tot_in + tot_out:,} tokens",
+        file=sys.stderr,
+    )
+    if unstamped:
+        names = ", ".join(f.name for f in unstamped[:4])
+        print(
+            f"  unstamped (written before stamping, or by another tool): {names}"
+            + (" ..." if len(unstamped) > 4 else ""),
+            file=sys.stderr,
+        )
+    print("=" * 60, file=sys.stderr)
+    for f, t in sorted(
+        rows, key=lambda r: -(r[1].get("input", 0) + r[1].get("output", 0))
+    )[:10]:
+        n = t.get("input", 0) + t.get("output", 0)
+        print(f"  {n:>10,}  {f.name}", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--nodes", nargs="*", help="Node names/uuids to assemble")
@@ -444,6 +522,16 @@ def main() -> int:
         default=0.0,
         help="Seconds to wait between calls, to pace a run against the shared "
         "subscription rate-limit (calls are sequential regardless).",
+    )
+    ap.add_argument(
+        "--report-spend",
+        action="store_true",
+        help="Report what assembly actually cost, summed from each article's "
+        "built_by.tokens, and exit. The only surviving record of a run.",
+    )
+    ap.add_argument(
+        "--since",
+        help="With --report-spend, limit to pages changed since this git revision.",
     )
     ap.add_argument(
         "--allow-suspect-names",
@@ -496,6 +584,9 @@ def main() -> int:
         help="Spend money: generate the batch. Without this, only the estimate prints.",
     )
     args = ap.parse_args()
+
+    if args.report_spend:
+        return report_spend(args.content_root, args.since)
 
     nodes = _read_items(args, "nodes")
     records = _read_items(args, "records")

@@ -301,3 +301,30 @@ def test_an_organisation_carrying_an_acronym_is_normal():
 def test_a_real_person_passes():
     for who in ("David Fravor", "Luis Elizondo", "Jacques Vallée", "J. Allen Hynek"):
         assert a.suspect_entity_name(who, "person") is None
+
+
+def test_article_tokens_reads_the_stamp_back(tmp_path):
+    """The only surviving record of a run: the ledger ADR 0037 specifies has no
+    table in either database, so two unexplained runs were only reconstructable
+    from these stamps."""
+    good = tmp_path / "a.en.md"
+    good.write_text(
+        "---\ntitle: X\nbuilt_by:\n  model: claude-sonnet-5\n"
+        "  tokens:\n    input: 80946\n    output: 25728\n---\n\nbody\n"
+    )
+    assert a.article_tokens(good) == {"input": 80946, "output": 25728}
+
+    bare = tmp_path / "b.en.md"
+    bare.write_text("---\ntitle: X\n---\n\nbody\n")
+    assert a.article_tokens(bare) is None
+
+    assert a.article_tokens(tmp_path / "missing.en.md") is None
+
+
+def test_article_tokens_survives_broken_front_matter(tmp_path):
+    """A malformed article must not crash a spend report - the report is what you
+    reach for when something has already gone wrong."""
+    bad = tmp_path / "c.en.md"
+    bad.write_text("---\ntitle: [unclosed\n---\n\nbody\n")
+    assert a.article_tokens(bad) is None
+    assert a.article_tokens(tmp_path / "d.en.md") is None

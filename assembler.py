@@ -1589,6 +1589,28 @@ _LINK_INDEX: dict | None = None
 _ACRONYM_TITLE_RE = re.compile(r"^(.*?)\s*\(([A-Z0-9][A-Z0-9&/. -]{1,})\)\s*$")
 
 
+def article_tokens(md: Path) -> dict | None:
+    """The `built_by.tokens` block a written article carries, or None.
+
+    Read back rather than looked up: the AI-operation ledger ADR 0037 specifies
+    does not exist in either database, so this stamp is the only record that a
+    given article was generated and what it drew.
+    """
+    try:
+        text = md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    try:
+        fm = yaml.safe_load(m.group(1)) or {}
+    except yaml.YAMLError:
+        return None
+    tokens = (fm.get("built_by") or {}).get("tokens")
+    return tokens if isinstance(tokens, dict) and tokens else None
+
+
 def _page_title(md: Path) -> str | None:
     """The `title:` from a page's front matter, without parsing the whole file.
 
