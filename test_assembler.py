@@ -276,3 +276,28 @@ def test_real_pages_still_index_by_their_title(tmp_path):
         idx["stems"].get("united-states-navy")
         == "/organisations/united-states-navy-usn"
     )
+
+
+def test_a_person_carrying_an_acronym_is_a_corrupted_merge():
+    """A person does not have an acronym in their name; an organisation does. This
+    exact node is page-worthy today at 36 claims and 8 independent sources, and is
+    two people fused with a surname eaten by acronym expansion."""
+    assert a.suspect_entity_name("Unidentified Aerial Phenomena (UAP) Gerb", "person")
+    assert a.suspect_entity_name("[interviewer 2]", "person")
+    assert a.suspect_entity_name("", "person") == "no name"
+
+
+def test_an_organisation_carrying_an_acronym_is_normal():
+    """The naming convention writes them this way - 90 current proposals do."""
+    for org in (
+        "United States Air Force (USAF)",
+        "National Aeronautics and Space Administration (NASA)",
+        "Advanced Aerospace Threat Identification Program (AATIP)",
+    ):
+        assert a.suspect_entity_name(org, "organisation") is None
+    assert a.suspect_entity_name("Unidentified Flying Object (UFO)", "topic") is None
+
+
+def test_a_real_person_passes():
+    for who in ("David Fravor", "Luis Elizondo", "Jacques Vallée", "J. Allen Hynek"):
+        assert a.suspect_entity_name(who, "person") is None

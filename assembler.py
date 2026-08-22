@@ -606,6 +606,34 @@ def is_described_speaker(name: str | None) -> bool:
     return bool(name and _DESCRIBED_SPEAKER_RE.match(name))
 
 
+# A person does not have an acronym in their name. An ORGANISATION does - the
+# naming convention writes "United States Air Force (USAF)" - so the same shape is
+# normal on 90 of the current non-person proposals and corrupt on a person.
+#
+# It catches a specific, dangerous failure: a merge that fused two people and let
+# acronym expansion eat a real surname, e.g. "Unidentified Aerial Phenomena (UAP)
+# Gerb" - 36 claims, 8 independent sources, page-worthy. Assembled, that publishes
+# a confident, heavily-cited article about somebody who does not exist, wearing the
+# shape that reads as most authoritative.
+_ACRONYM_IN_NAME_RE = re.compile(r"\((?=[^)]*[A-Z]{2})[A-Z0-9&/. -]{2,}\)")
+
+
+def suspect_entity_name(name: str | None, node_type: str | None) -> str | None:
+    """Why this node should not become a page, or None if it looks fine.
+
+    A guard against the GRAPH being wrong, not against the writer. The writer is
+    the last place such an error is still fixable - after it, a reader sees a
+    fluent article about a person who was never real.
+    """
+    if not name:
+        return "no name"
+    if is_described_speaker(name):
+        return "describes an unidentified person rather than naming one"
+    if node_type == "person" and _ACRONYM_IN_NAME_RE.search(name):
+        return "person name contains an expanded acronym - probably a corrupted merge"
+    return None
+
+
 def node_slug(node: dict) -> str:
     """URL slug for a node dict, via the canonical slugifier. Honours
     metadata.explicit_slug (ADR 0028 pattern short URLs)."""

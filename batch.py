@@ -92,6 +92,25 @@ def _target_path(args, kind: str, item: str) -> Path | None:
     return asm.output_path(Path(args.content_root), section, asm.node_slug(node))
 
 
+def _check_suspect_names(args, kind: str, items: list[str]) -> dict[str, str]:
+    """Items whose NAME says the node is not a real entity, mapped to the reason.
+
+    Refused in the pre-flight for the same reason as a slug collision: the failure
+    is invisible afterwards. A corrupted merge assembles into a fluent, heavily
+    cited article about a person who does not exist, and nothing downstream - not
+    the citation check, not the link resolver, not a human skim - flags it.
+    """
+    suspect: dict[str, str] = {}
+    for item in items:
+        node = _resolve_node(args, kind, item)
+        if node is None:
+            continue
+        reason = asm.suspect_entity_name(node.get("name"), node.get("type"))
+        if reason:
+            suspect[item] = f'"{node.get("name")}" - {reason}'
+    return suspect
+
+
 def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[str]]:
     """Items in this run that would write to the SAME file.
 
@@ -427,6 +446,13 @@ def main() -> int:
         "subscription rate-limit (calls are sequential regardless).",
     )
     ap.add_argument(
+        "--allow-suspect-names",
+        action="store_true",
+        help="Assemble items whose name does not look like a real entity (a "
+        "described speaker, or a person carrying an expanded acronym). Off by "
+        "default: the resulting article reads as authoritative and is not.",
+    )
+    ap.add_argument(
         "--allow-slug-collisions",
         action="store_true",
         help="Proceed even when two items in the run write to the same file "
@@ -488,6 +514,24 @@ def main() -> int:
     kind, items = chosen[0]
 
     resolved, _ = estimate(args, kind, items)
+
+    suspect = _check_suspect_names(args, kind, resolved)
+    if suspect:
+        print(
+            f"\nSUSPECT ENTITY NAME: {len(suspect)} item(s) name something that "
+            "does not look like a real entity. Assembling one publishes a confident, "
+            "well-cited article about a subject that does not exist.",
+            file=sys.stderr,
+        )
+        for item, why in suspect.items():
+            print(f"  {item}\n      {why}", file=sys.stderr)
+        if not args.allow_suspect_names:
+            print(
+                "\nRefusing to run. Fix the node in the graph, or drop these from the "
+                "work list, or pass --allow-suspect-names to assemble them anyway.",
+                file=sys.stderr,
+            )
+            return 2
 
     clashes = _check_slug_collisions(args, kind, resolved)
     if clashes:
