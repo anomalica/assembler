@@ -1530,6 +1530,22 @@ def validate_article(text: str) -> tuple[dict, str]:
                 "'references' list - model probably emitted references in body "
                 "without a clear separator, recovery missed them"
             )
+        # Every citation must land IN RANGE. A <sup>199</sup> against 60
+        # references is a sentence that claims a source and has none - the exact
+        # failure this project exists not to publish. Found on 10 of 70 live
+        # pages, worst of them citing 44 references that do not exist, because
+        # the only check here was that SOME references existed.
+        cited = {
+            int(n)
+            for group in re.findall(r"<sup>([\d,\s]+)</sup>", body)
+            for n in re.findall(r"\d+", group)
+        }
+        dangling = sorted(n for n in cited if n < 1 or n > len(refs))
+        if dangling:
+            raise ValueError(
+                f"body cites reference(s) {dangling[:8]} but only {len(refs)} "
+                "exist - a citation pointing at nothing"
+            )
 
     # description is plain text (it also becomes the SEO meta description) -
     # strip any markdown emphasis the model added.
@@ -1634,6 +1650,46 @@ def _page_title(md: Path) -> str | None:
     return None
 
 
+def _link_index_fingerprint(
+    briefs_root: Path | None, content_root: Path | None, min_claims: int
+) -> str:
+    """A cheap key for the built index: every input file's name and mtime.
+
+    Stat-ing 653 briefs costs milliseconds; PARSING them costs 51 seconds, which
+    the batch driver was paying once per page because each page is its own
+    process. The fingerprint is what lets that parse be done once.
+    """
+    h = hashlib.sha256(f"v1|{min_claims}".encode())
+    for root, pattern in ((briefs_root, "*.yaml"), (content_root, "pages/*/*.en.md")):
+        if not root:
+            continue
+        for f in sorted(Path(root).glob(pattern)):
+            try:
+                h.update(f"{f}|{f.stat().st_mtime_ns}|".encode())
+            except OSError:
+                continue
+    return h.hexdigest()
+
+
+def _index_to_json(index: dict) -> dict:
+    """Sets are not JSON; everything else round-trips as-is."""
+    return {
+        "exact": sorted(index["exact"]),
+        "by_slug": {k: sorted(v) for k, v in index["by_slug"].items()},
+        "stems": index["stems"],
+        "by_text": index["by_text"],
+    }
+
+
+def _index_from_json(d: dict) -> dict:
+    return {
+        "exact": set(d["exact"]),
+        "by_slug": {k: set(v) for k, v in d["by_slug"].items()},
+        "stems": d["stems"],
+        "by_text": d["by_text"],
+    }
+
+
 def build_link_index(
     briefs_root: Path | None, content_root: Path | None, min_claims: int = 0
 ) -> dict:
@@ -1689,6 +1745,39 @@ def build_link_index(
     return {"exact": exact, "by_slug": by_slug, "stems": stems, "by_text": by_text}
 
 
+def cached_link_index(
+    briefs_root: Path | None,
+    content_root: Path | None,
+    min_claims: int,
+    cache_path: Path | None,
+) -> dict:
+    """build_link_index, reusing a cached result while its inputs are unchanged.
+
+    A batch runs one process per page for isolation - a page that dies cannot take
+    the run with it - and the cost of that isolation was rebuilding this index
+    every time. The fingerprint makes the cache safe: any brief or page added,
+    touched or removed changes it, so a stale index cannot survive a graph move.
+    """
+    if cache_path is None:
+        return build_link_index(briefs_root, content_root, min_claims)
+    fingerprint = _link_index_fingerprint(briefs_root, content_root, min_claims)
+    try:
+        blob = json.loads(cache_path.read_text())
+        if blob.get("fingerprint") == fingerprint:
+            return _index_from_json(blob["index"])
+    except (OSError, ValueError, KeyError):
+        pass
+    index = build_link_index(briefs_root, content_root, min_claims)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"fingerprint": fingerprint, "index": _index_to_json(index)})
+        )
+    except OSError:
+        pass
+    return index
+
+
 def set_link_index(index: dict | None) -> None:
     global _LINK_INDEX
     _LINK_INDEX = index
@@ -1725,6 +1814,41 @@ def _fix_body_links(body: str, index: dict | None = None) -> str:
         return f"[{display}]({target})" if target else display
 
     return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
+
+
+def renumber_citations(body: str, references: list) -> tuple[str, list]:
+    """Renumber <sup>N</sup> by FIRST APPEARANCE and reorder references to match.
+
+    The model numbers by the reference array's position, not by where the citation
+    lands in the prose, so a reader meets "8, 9, 17, 15, 16" - and on the worst
+    page, a body whose first citation is 110. Measured across the corpus: 32 of 70
+    pages are out of order.
+
+    Purely presentational: every <sup>N</sup> still points at the same reference it
+    did, because the references move with the numbers. References the body never
+    cites keep their relative order and are appended after the cited ones rather
+    than dropped, so nothing is lost.
+    """
+    if not references:
+        return body, references
+    order: list[int] = []
+    for group in re.findall(r"<sup>([\d,\s]+)</sup>", body):
+        for n in re.findall(r"\d+", group):
+            n = int(n)
+            if n not in order and 1 <= n <= len(references):
+                order.append(n)
+    if not order or order == sorted(order):
+        return body, references
+    mapping = {old: new for new, old in enumerate(order, start=1)}
+    cited = [references[old - 1] for old in order]
+    uncited = [r for i, r in enumerate(references, start=1) if i not in mapping]
+
+    def _sub(m: re.Match) -> str:
+        nums = re.findall(r"\d+", m.group(1))
+        renumbered = [str(mapping.get(int(n), int(n))) for n in nums]
+        return f"<sup>{', '.join(renumbered)}</sup>"
+
+    return re.sub(r"<sup>([\d,\s]+)</sup>", _sub, body), cited + uncited
 
 
 def _fix_canonical_text(text: str) -> str:
@@ -1901,6 +2025,11 @@ def render_article(
         frontmatter = {k: v for k, v in frontmatter.items() if k != "ai_usage"}
         frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
     body = _fix_body_links(_rewrite_link_display(body))
+    # Last, and on both together: renumbering the citations moves the references
+    # with them, so this has to see the final reference list.
+    body, renumbered = renumber_citations(body, frontmatter.get("references") or [])
+    if renumbered:
+        frontmatter["references"] = renumbered
     return (
         "---\n"
         + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
@@ -1934,6 +2063,11 @@ def render_record_page(
     if ai_usage:
         frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
     body = _fix_body_links(_rewrite_link_display(body))
+    # Last, and on both together: renumbering the citations moves the references
+    # with them, so this has to see the final reference list.
+    body, renumbered = renumber_citations(body, frontmatter.get("references") or [])
+    if renumbered:
+        frontmatter["references"] = renumbered
     return (
         "---\n"
         + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
@@ -2131,6 +2265,12 @@ def main() -> int:
         help="Call Claude and print the article to stdout, do not write file",
     )
     ap.add_argument(
+        "--link-index-cache",
+        help="Reuse the body-link index across invocations via this file, keyed on "
+        "every brief and page mtime. Rebuilding it costs ~51s and a batch pays that "
+        "once per page without this.",
+    )
+    ap.add_argument(
         "--link-min-claims",
         type=int,
         default=0,
@@ -2170,10 +2310,11 @@ def main() -> int:
     # set rather than files on disk, so the same brief yields the same article
     # whether it is assembled first or ninetieth in a batch.
     set_link_index(
-        build_link_index(
+        cached_link_index(
             Path(args.briefs_root) if args.briefs_root else None,
             Path(args.content_root),
-            min_claims=args.link_min_claims,
+            args.link_min_claims,
+            Path(args.link_index_cache) if args.link_index_cache else None,
         )
     )
 

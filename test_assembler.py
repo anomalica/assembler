@@ -328,3 +328,50 @@ def test_article_tokens_survives_broken_front_matter(tmp_path):
     bad.write_text("---\ntitle: [unclosed\n---\n\nbody\n")
     assert a.article_tokens(bad) is None
     assert a.article_tokens(tmp_path / "d.en.md") is None
+
+
+def test_citations_are_renumbered_by_first_appearance():
+    """Readers met "8, 9, 17, 15, 16" because the model numbered by the reference
+    array's position, not by where the citation lands in the prose. 32 of 70
+    published pages were out of order."""
+    body = "Alpha.<sup>3</sup> Beta.<sup>1</sup> Gamma.<sup>3, 2</sup>"
+    refs = [{"text": "one"}, {"text": "two"}, {"text": "three"}, {"text": "spare"}]
+    nb, nr = a.renumber_citations(body, refs)
+    assert nb == "Alpha.<sup>1</sup> Beta.<sup>2</sup> Gamma.<sup>1, 3</sup>"
+    # every citation still points at the reference it did before
+    assert (
+        nr[0]["text"] == "three" and nr[1]["text"] == "one" and nr[2]["text"] == "two"
+    )
+    # an uncited reference is kept, not dropped
+    assert nr[3]["text"] == "spare" and len(nr) == len(refs)
+
+
+def test_already_ordered_citations_are_left_alone():
+    body = "A.<sup>1</sup> B.<sup>2</sup>"
+    refs = [{"text": "x"}, {"text": "y"}]
+    assert a.renumber_citations(body, refs) == (body, refs)
+
+
+def test_a_citation_pointing_at_nothing_is_rejected():
+    """<sup>199</sup> against 60 references is a sentence claiming a source it
+    does not have. Ten live pages carried this; the only check was that SOME
+    references existed."""
+    bad = (
+        "---\ntitle: T\ndescription: d\nreferences:\n- text: a\n- text: b\n---\n\n"
+        "X.<sup>1</sup> Y.<sup>7</sup>\n"
+    )
+    try:
+        a.validate_article(bad)
+    except ValueError as exc:
+        assert "pointing at nothing" in str(exc)
+    else:
+        raise AssertionError("dangling citation was accepted")
+
+
+def test_in_range_citations_still_validate():
+    ok = (
+        "---\ntitle: T\ndescription: d\nreferences:\n- text: a\n- text: b\n---\n\n"
+        "X.<sup>1</sup> Y.<sup>2</sup>\n"
+    )
+    fm, _ = a.validate_article(ok)
+    assert len(fm["references"]) == 2

@@ -34,8 +34,10 @@ rather than whenever someone next builds.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -329,6 +331,11 @@ def generate(args, kind: str, items: list[str]) -> int:
     # back to whatever happens to be on disk at the time.
     common += ["--briefs-root", args.briefs_root, "--link-min-claims"]
     common += [str(args.link_min_claims)]
+    # Forward the index cache so the children share one build. Rebuilding it costs
+    # ~51s of yaml parsing, and a batch pays that PER PAGE without this - it was
+    # the single largest term in wall-clock, larger than some generations.
+    if args.link_index_cache:
+        common += ["--link-index-cache", args.link_index_cache]
     if kind == "nodes":
         common += ["--db", args.db]
     elif kind == "briefs":
@@ -337,64 +344,95 @@ def generate(args, kind: str, items: list[str]) -> int:
         common += ["--digests-root", args.digests_root]
     else:
         common += ["--digests-root", args.digests_root]
-    ok = 0
-    failed: list[str] = []
-    # Throttling and breakage are counted apart, and only the second one can end
-    # the run. A shared counter is what turns a full plan window into a batch
-    # that reports every remaining brief as failed - the failure this guards.
-    consecutive_hard = 0
-    throttled_waits = 0
-    blind_waits = 0
-    waited_total = 0.0
+    # One worker per lane. Each page is its own process for isolation, so the
+    # pool just decides how many run at once; the per-item semantics below are
+    # identical to the sequential path and --workers 1 reproduces it exactly.
+    state = {
+        "ok": 0,
+        "failed": [],
+        "consecutive_hard": 0,
+        "throttled_waits": 0,
+        "blind_waits": 0,
+        "waited_total": 0.0,
+        "abort": False,
+        "done": 0,
+    }
+    lock = threading.Lock()
     max_wait = args.max_wait_hours * 3600.0
-    i = 0
-    while i < len(items):
-        item = items[i]
-        if i > 0 and args.delay:
-            # Space calls out so a paced run doesn't burst the shared
-            # subscription rate-limit (each call is already sequential).
-            time.sleep(args.delay)
-        print(f"\n=== [{i + 1}/{len(items)}] {item} ===", file=sys.stderr)
-        code, reset = _run_one([sys.executable, "assembler.py", flag, item, *common])
+    total = len(items)
 
-        if code == asm._EXIT_PLAN_RATE_LIMITED:
-            nap = _wait_out_window(reset, blind_waits)
-            blind_waits = blind_waits + 1 if reset is None else 0
-            if waited_total + nap > max_wait:
-                print(
-                    f"\nPlan throttled and the {args.max_wait_hours}h wait budget is "
-                    f"spent. Stopping with {ok} done, {len(items) - i} not attempted.",
-                    file=sys.stderr,
-                )
-                break
-            waited_total += nap
-            throttled_waits += 1
-            until = time.strftime("%H:%M %Z", time.localtime(time.time() + nap))
-            print(
-                f"  plan window full - sleeping {nap / 60:.0f} min (until ~{until}), "
-                f"then retrying this item. Not counted as a failure.",
-                file=sys.stderr,
+    def work(index: int, item: str) -> None:
+        while True:
+            with lock:
+                if state["abort"]:
+                    return
+            print(f"\n=== [{index + 1}/{total}] {item} ===", file=sys.stderr)
+            code, reset = _run_one(
+                [sys.executable, "assembler.py", flag, item, *common]
             )
-            time.sleep(nap)
-            continue  # same item, no strike, no advance
 
-        if code == 0:
-            ok += 1
-            consecutive_hard = 0
-        else:
-            failed.append(item)
-            consecutive_hard += 1
-            if consecutive_hard >= args.max_consecutive_failures:
+            if code == asm._EXIT_PLAN_RATE_LIMITED:
+                # Not a failure: the window is full and the brief is untouched.
+                with lock:
+                    nap = _wait_out_window(reset, state["blind_waits"])
+                    state["blind_waits"] = (
+                        state["blind_waits"] + 1 if reset is None else 0
+                    )
+                    if state["waited_total"] + nap > max_wait:
+                        print(
+                            f"\nPlan throttled and the {args.max_wait_hours}h wait "
+                            "budget is spent. Stopping.",
+                            file=sys.stderr,
+                        )
+                        state["abort"] = True
+                        return
+                    state["waited_total"] += nap
+                    state["throttled_waits"] += 1
+                until = time.strftime("%H:%M %Z", time.localtime(time.time() + nap))
                 print(
-                    f"\nABORTING: {consecutive_hard} consecutive failures "
-                    f"(--max-consecutive-failures). Something is broken beyond one "
-                    f"bad brief; {len(items) - i - 1} items not attempted.",
+                    f"  plan window full - sleeping {nap / 60:.0f} min (until "
+                    f"~{until}), then retrying this item. Not a failure.",
                     file=sys.stderr,
                 )
-                i += 1
-                break
-        i += 1
+                time.sleep(nap)
+                continue  # same item, no strike
 
+            with lock:
+                state["done"] += 1
+                if code == 0:
+                    state["ok"] += 1
+                    state["consecutive_hard"] = 0
+                else:
+                    state["failed"].append(item)
+                    state["consecutive_hard"] += 1
+                    if state["consecutive_hard"] >= args.max_consecutive_failures:
+                        print(
+                            f"\nABORTING: {state['consecutive_hard']} consecutive "
+                            "failures (--max-consecutive-failures). Something is "
+                            "broken beyond one bad brief.",
+                            file=sys.stderr,
+                        )
+                        state["abort"] = True
+            return
+
+    workers = max(1, args.workers)
+    if workers == 1:
+        for i, item in enumerate(items):
+            if i and args.delay:
+                time.sleep(args.delay)
+            work(i, item)
+            if state["abort"]:
+                break
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(work, i, item) for i, item in enumerate(items)]
+            for f in futures:
+                f.result()
+
+    ok = state["ok"]
+    failed = state["failed"]
+    throttled_waits = state["throttled_waits"]
+    waited_total = state["waited_total"]
     print(f"\nBatch: {ok} ok, {len(failed)} failed", file=sys.stderr)
     if throttled_waits:
         print(
@@ -522,6 +560,18 @@ def main() -> int:
         default=0.0,
         help="Seconds to wait between calls, to pace a run against the shared "
         "subscription rate-limit (calls are sequential regardless).",
+    )
+    ap.add_argument(
+        "--link-index-cache",
+        help="Share one body-link index across the run via this file (keyed on "
+        "brief and page mtimes). Without it every page rebuilds it, ~51s each.",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Pages to generate at once (default 1). Each is its own process, so "
+        "this only sets how many lanes run; per-item behaviour is unchanged.",
     )
     ap.add_argument(
         "--report-spend",
