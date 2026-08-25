@@ -336,9 +336,11 @@ def generate(args, kind: str, items: list[str]) -> int:
     # the single largest term in wall-clock, larger than some generations.
     if args.link_index_cache:
         common += ["--link-index-cache", args.link_index_cache]
-    if kind == "nodes":
-        common += ["--db", args.db]
-    elif kind == "briefs":
+    # The graph goes to every mode, not just --node: it is also where a page's
+    # prior slugs live, and those become the redirect aliases. Without it a
+    # rebuilt page silently loses its redirects, which is how two pages 404'd.
+    common += ["--db", args.db]
+    if kind == "briefs":
         # Briefs are the sole source, but the digests-root lets the assembler
         # carry forward each contributing record's ai_usage into the article.
         common += ["--digests-root", args.digests_root]

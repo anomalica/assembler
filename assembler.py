@@ -334,6 +334,61 @@ def related_from_digest(digest: dict) -> list[dict]:
     return nodes
 
 
+def slug_aliases(
+    node: dict, section: str, db_path: str | None, content_root: Path | None
+) -> list[str]:
+    """Every path that used to point at this entity, for Hugo to redirect from.
+
+    A rename moves a slug silently and a merge retires a name, so each of tonight's
+    176 renames is a potential 404 for every page that ever linked to the old one.
+    The graph keeps the history - the identity pass deliberately preserves each
+    victim name as an alias on the survivor - so the redirect set is derivable
+    rather than maintained by hand. Hand-maintained ones do not survive: the two
+    written this evening were dropped the moment their pages were rebuilt.
+
+    Both shapes are emitted. Hugo builds an alias at the path as written, and every
+    existing inbound link carries the language prefix, so a bare alias alone leaves
+    them all 404ing while looking fixed.
+    """
+    names = list(node.get("aliases") or [])  # brief-supplied, when it carries them
+    if not names and db_path and Path(db_path).is_file() and node.get("id"):
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            names = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT alias FROM aliases WHERE node_id = ?", (node["id"],)
+                )
+            ]
+            conn.close()
+        except sqlite3.Error:
+            names = []
+    current = node_slug(node)
+    live = set()
+    if content_root:
+        live = {
+            f"/{md.parent.name}/{md.name[: -len('.en.md')]}"
+            for md in Path(content_root).glob("pages/*/*.en.md")
+        }
+    out: list[str] = []
+    for name in names:
+        alias = slugify(name)
+        if not alias or alias == current:
+            continue
+        path = f"/{section}/{alias}"
+        if path in live:
+            # Another entity is published here; redirecting would shadow a real
+            # page, which is worse than the dead link it would fix.
+            print(
+                f"  alias SKIPPED (would shadow a live page): {path}", file=sys.stderr
+            )
+            continue
+        for form in (f"{path}/", f"/en{path}/"):
+            if form not in out:
+                out.append(form)
+    return out
+
+
 def entity_url(node_type: str, name: str, content_root: Path) -> str | None:
     """Encyclopaedia link for an entity: a bare, language-agnostic /<section>/<slug>
     (the site adds the language prefix at render time). Returned only when the
@@ -2118,6 +2173,38 @@ def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> 
     return block
 
 
+def stamp_aliases(article: str, aliases: list[str]) -> str:
+    """Put the redirect paths in the front matter, high up where a human reads.
+
+    Regenerated on every write rather than preserved, because preserving is what
+    failed: a hand-written alias survives only until its page is next rebuilt, and
+    two were silently dropped that way this evening - the pages 404'd for readers
+    while the front matter looked fine everywhere else.
+    """
+    if not aliases:
+        return article
+    parsed = _split_article(article)
+    if parsed is None:
+        return article
+    frontmatter, body = parsed
+    rebuilt: dict = {}
+    for key, value in frontmatter.items():
+        if key == "aliases":
+            continue
+        rebuilt[key] = value
+        if key == "title":  # directly under the title, before the prose fields
+            rebuilt["aliases"] = aliases
+    if "aliases" not in rebuilt:
+        rebuilt = {"aliases": aliases, **rebuilt}
+    return (
+        "---\n"
+        + yaml.safe_dump(rebuilt, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + body.strip()
+        + "\n"
+    )
+
+
 def stamp_built_by(article: str, block: dict) -> str:
     """Add the generator block plus the output hash, LAST - after every body
     transform has run, so body_sha256 covers the bytes actually written. Hashing
@@ -2512,6 +2599,10 @@ def main() -> int:
     article = _preserve_authored_fields(article, out)
     # Last, so body_sha256 covers the final body - after the canonical-text fix
     # and after any preserved human field is folded back in.
+    # Before built_by, which hashes the final bytes.
+    article = stamp_aliases(
+        article, slug_aliases(node, section, args.db, Path(args.content_root))
+    )
     article = stamp_built_by(
         article, built_by_block(assemble_entry, prompt, directives)
     )

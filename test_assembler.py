@@ -375,3 +375,43 @@ def test_in_range_citations_still_validate():
     )
     fm, _ = a.validate_article(ok)
     assert len(fm["references"]) == 2
+
+
+def test_aliases_are_regenerated_not_preserved(tmp_path):
+    """Preserving is what failed: a hand-written alias survives only until its
+    page is next rebuilt, and two pages 404'd that way."""
+    art = (
+        "---\ntitle: X\naliases:\n- /people/stale/\ndescription: d\n"
+        "references:\n- text: a\n---\n\nBody.<sup>1</sup>\n"
+    )
+    out = a.stamp_aliases(art, ["/people/new/", "/en/people/new/"])
+    assert "/people/stale/" not in out
+    assert "/people/new/" in out and "/en/people/new/" in out
+
+
+def test_no_aliases_leaves_the_article_untouched():
+    art = (
+        "---\ntitle: X\ndescription: d\nreferences:\n- text: a\n---\n\nB.<sup>1</sup>\n"
+    )
+    assert a.stamp_aliases(art, []) == art
+
+
+def test_an_alias_never_shadows_a_live_page(tmp_path):
+    """Redirecting onto a published page is worse than the dead link it fixes."""
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    (pages / "taken.en.md").write_text("---\ntitle: Taken\n---\n\nb\n")
+    node = {
+        "id": None,
+        "type": "person",
+        "name": "Someone",
+        "aliases": ["Taken", "Free"],
+    }
+    out = a.slug_aliases(node, "people", None, tmp_path)
+    assert "/people/taken/" not in out
+    assert "/people/free/" in out and "/en/people/free/" in out
+
+
+def test_an_alias_equal_to_the_current_slug_is_dropped():
+    node = {"id": None, "type": "person", "name": "Jane Doe", "aliases": ["Jane Doe"]}
+    assert a.slug_aliases(node, "people", None, None) == []
