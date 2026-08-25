@@ -724,7 +724,7 @@ Your ENTIRE response must be a single YAML+markdown document in this exact shape
 
 ---
 title: "<the node's display name>"
-description: "<one-sentence PLAIN-TEXT summary of what this {node_type} is - no markdown (no *italics*, **bold**, or backticks); this also becomes the page's search-engine description>"
+description: "<one-sentence PLAIN-TEXT summary of what this {node_type} IS, in the world - no markdown (no *italics*, **bold**, or backticks). It also becomes the search-engine description and appears in listings, so it travels further than the body. State who or what the subject is and what the sources say about them. NEVER describe the subject by their relationship to this corpus, this graph, or Anomalica - our data model is not a fact about the world, and a phrase like \"linked to Anomalica's UAP-related network\" is both self-referential and an editorial characterisation. Where a subject appears here only through an association, state that association as the plain fact it is (\"whose legislative assistant later followed him to the Pentagon\"), never as membership of a network or movement. This matters most for real, living, notable people, where an inferred association is a claim about them that the body does not support.>"
 metadata:
   <type-appropriate fields - role/affiliation/rank for persons; date/location for events; founded/headquartered for organisations; status/type for objects; etc. Omit metadata block entirely if you have nothing to say>
 references:
