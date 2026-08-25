@@ -415,3 +415,39 @@ def test_an_alias_never_shadows_a_live_page(tmp_path):
 def test_an_alias_equal_to_the_current_slug_is_dropped():
     node = {"id": None, "type": "person", "name": "Jane Doe", "aliases": ["Jane Doe"]}
     assert a.slug_aliases(node, "people", None, None) == []
+
+
+def test_related_slugs_follow_a_rename(tmp_path):
+    """A brief freezes slugs at synthesise time; the graph moved three times in one
+    evening. Matched on node id, so a rename is followed rather than guessed."""
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, name TEXT, node_type TEXT, retired_at TEXT)"
+    )
+    conn.execute("INSERT INTO nodes VALUES ('n1','alien abduction','topic',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('n2','Gone','topic','2026-08-22')")
+    conn.commit()
+    conn.close()
+    related = [
+        {
+            "id": "n1",
+            "name": "alien abduction phenomenon",
+            "type": "topic",
+            "metadata": {"explicit_slug": "alien-abduction-phenomenon"},
+        },
+        {"id": "n2", "name": "Gone", "type": "topic", "metadata": None},
+    ]
+    out = a.refresh_related_slugs(related, str(db))
+    assert len(out) == 1, "a node merged away has no page and must be dropped"
+    assert out[0]["name"] == "alien abduction"
+    assert out[0]["metadata"] is None, "the frozen explicit_slug must not survive"
+
+
+def test_related_slugs_survive_an_unreadable_graph():
+    """A graph we cannot read is not a reason to write nothing."""
+    related = [{"id": "x", "name": "N", "type": "topic"}]
+    assert a.refresh_related_slugs(related, "/nonexistent/g.db") == related
+    assert a.refresh_related_slugs(related, None) == related

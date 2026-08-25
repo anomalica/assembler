@@ -567,6 +567,54 @@ def claims_from_brief(brief: dict) -> list[dict]:
     return out
 
 
+def refresh_related_slugs(related: list[dict], db_path: str | None) -> list[dict]:
+    """Re-resolve each linkable entity's slug from the LIVE graph, by node id.
+
+    A brief freezes slugs at synthesise time and the graph moves underneath it -
+    three times in one evening during the link-value run, each move silently
+    invalidating the cross-links of every page built before it. ADR 0036 makes the
+    brief the sole source for CLAIMS, which is about not inventing facts; what an
+    entity is currently CALLED is not a fact the brief owns, and resolving it
+    invents nothing.
+
+    Matched on node_id rather than name, so a rename is followed rather than
+    guessed. A node that no longer exists live - merged away or retired - is
+    dropped from the linkable set: it has no page to link to, and its slug would
+    resolve to nothing.
+    """
+    if not db_path or not related or not Path(db_path).is_file():
+        return related
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        live = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                "SELECT id, name, node_type FROM nodes WHERE retired_at IS NULL"
+            )
+        }
+        conn.close()
+    except sqlite3.Error:
+        return related  # a graph we cannot read is not a reason to write nothing
+    out: list[dict] = []
+    dropped = 0
+    for r in related:
+        node_id = r.get("id")
+        if node_id and node_id in live:
+            name, node_type = live[node_id]
+            out.append({**r, "name": name, "type": node_type, "metadata": None})
+        elif node_id:
+            dropped += 1  # merged away or retired - no page exists
+        else:
+            out.append(r)
+    if dropped:
+        print(
+            f"  {dropped} linkable entit{'y' if dropped == 1 else 'ies'} dropped "
+            "(merged away since the brief was built)",
+            file=sys.stderr,
+        )
+    return out
+
+
 def related_from_brief(brief: dict) -> list[dict]:
     """The brief's related_nodes ("you may link to" set), most-shared first as
     the synthesiser ranked them. Each carries its FINAL slug as explicit_slug so
@@ -2424,7 +2472,7 @@ def main() -> int:
             return 2
         node = brief_node(brief)
         claims = claims_from_brief(brief)
-        related = related_from_brief(brief)
+        related = refresh_related_slugs(related_from_brief(brief), args.db)
     elif args.record:
         loaded = load_digest(Path(args.digests_root), args.record)
         if not loaded:
