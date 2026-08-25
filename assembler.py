@@ -334,6 +334,47 @@ def related_from_digest(digest: dict) -> list[dict]:
     return nodes
 
 
+def _prior_paths(content_root: Path | None, slug: str, section: str) -> list[str]:
+    """Sections this slug has previously been published under, from git history.
+
+    A page's URL is (section, slug) and the two move independently: section comes
+    from the node TYPE, so a type change relocates the page without touching its
+    name. AATIP went organisation -> project in a merge and 404'd for exactly this
+    reason - name history could not see it, because the name never changed.
+
+    The graph records prior NAMES (node_merges) but not prior TYPES. The content
+    repo does record it, precisely and for free: an alias exists to catch a URL
+    that once worked, and git knows every path this file has ever occupied.
+    """
+    if not content_root:
+        return []
+    try:
+        out = subprocess.run(
+            [
+                "git",
+                "log",
+                "--all",
+                "--pretty=format:",
+                "--name-only",
+                "--",
+                f"pages/*/{slug}.en.md",
+            ],
+            cwd=str(content_root),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    seen: list[str] = []
+    for line in out.split():
+        parts = line.strip().split("/")
+        if len(parts) == 3 and parts[0] == "pages" and parts[2] == f"{slug}.en.md":
+            if parts[1] != section and parts[1] not in seen:
+                seen.append(parts[1])
+    return seen
+
+
 def slug_aliases(
     node: dict, section: str, db_path: str | None, content_root: Path | None
 ) -> list[str]:
@@ -371,6 +412,16 @@ def slug_aliases(
             for md in Path(content_root).glob("pages/*/*.en.md")
         }
     out: list[str] = []
+    # Paths this slug held under a different section - a type change moves the
+    # page without changing its name, so name history alone misses these.
+    for prior_section in _prior_paths(content_root, current, section):
+        path = f"/{prior_section}/{current}"
+        if path in live:
+            print(
+                f"  alias SKIPPED (would shadow a live page): {path}", file=sys.stderr
+            )
+            continue
+        out.extend([f"{path}/", f"/en{path}/"])
     for name in names:
         alias = slugify(name)
         if not alias or alias == current:

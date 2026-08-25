@@ -451,3 +451,27 @@ def test_related_slugs_survive_an_unreadable_graph():
     related = [{"id": "x", "name": "N", "type": "topic"}]
     assert a.refresh_related_slugs(related, "/nonexistent/g.db") == related
     assert a.refresh_related_slugs(related, None) == related
+
+
+def test_aliases_cover_a_type_change_not_just_a_rename(tmp_path, monkeypatch):
+    """A page's URL is (section, slug) and the two move independently: section
+    comes from the node TYPE, so a type change relocates the page without
+    touching its name. AATIP went organisation -> project and 404'd twice,
+    because name history cannot see a type change."""
+    import subprocess as sp
+
+    calls = {}
+
+    class R:
+        stdout = "pages/organisations/x.en.md\npages/projects/x.en.md\n"
+
+    def fake_run(cmd, **kw):
+        calls["cmd"] = cmd
+        return R()
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    monkeypatch.setattr(a.subprocess, "run", fake_run)
+    node = {"id": None, "type": "project", "name": "X", "aliases": []}
+    out = a.slug_aliases(node, "projects", None, tmp_path)
+    assert "/organisations/x/" in out and "/en/organisations/x/" in out
+    assert "/projects/x/" not in out, "the current path is not an alias of itself"
