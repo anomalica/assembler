@@ -1,3 +1,12 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Run artefacts from a batch programme: brief snapshots, work lists, logs and
+# the link-index cache. All regenerable, and a work list describes a graph state
+# that has already moved.
+.briefs-*/
+.work-*.txt
+.run-*.log
+.synth*.log
+.link-index-cache.json
