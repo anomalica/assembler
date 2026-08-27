@@ -475,3 +475,44 @@ def test_aliases_cover_a_type_change_not_just_a_rename(tmp_path, monkeypatch):
     out = a.slug_aliases(node, "projects", None, tmp_path)
     assert "/organisations/x/" in out and "/en/organisations/x/" in out
     assert "/projects/x/" not in out, "the current path is not an alias of itself"
+
+
+def test_tags_are_closed_not_generated():
+    """metadata.role is populated on 137 of 144 people and holds 131 DISTINCT
+    values. Free text that is near-unique per entity groups nothing, so a tag
+    outside the vocabulary is dropped rather than passed through."""
+    kept = a.filter_tags(
+        ["pilot", "FastEagle 02", "witness", "naval aviator"], "person"
+    )
+    assert kept == ["pilot", "witness"]
+
+
+def test_tags_are_capped():
+    kept = a.filter_tags(
+        ["pilot", "witness", "author", "scientist", "engineer"], "person"
+    )
+    assert len(kept) == a.MAX_TAGS
+
+
+def test_tags_come_out_in_vocabulary_order_not_model_order():
+    """Stable ordering across pages, so a filter UI and a diff both behave."""
+    assert a.filter_tags(["witness", "pilot"], "person") == ["pilot", "witness"]
+
+
+def test_a_type_with_no_vocabulary_gets_no_tags():
+    assert a.filter_tags(["anything"], "nonesuch") == []
+    assert a.filter_tags("pilot", "person") == [], "a bare string is not a tag list"
+
+
+def test_all_invented_tags_drop_the_field(tmp_path):
+    art = (
+        "---\ntitle: X\ntags:\n- made up\ndescription: d\n"
+        "references:\n- text: x\n---\n\nB.<sup>1</sup>\n"
+    )
+    assert "tags" not in a.stamp_tags(art, "person")
+
+
+def test_vocabularies_are_lowercase_and_unique():
+    for node_type, vocab in a.TAG_VOCABULARY.items():
+        assert len(set(vocab)) == len(vocab), f"{node_type} has a duplicate"
+        assert all(v == v.lower() for v in vocab), f"{node_type} has a capital"

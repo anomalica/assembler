@@ -63,15 +63,130 @@ ENTITY_TYPES = [
     "document",
 ]
 
-# Workbench origin used to build the per-claim deep-link URL stamped into
-# each reference. Override via env var when the workbench is deployed
-# elsewhere. Public-hash convention: first 56 chars of the SHA-256
-# content_hash (no "sha256:" prefix). Matches the URL the workbench uses
-# for its existing record routes.
+# Workbench origin used to build the per-claim deep-link URL stamped into each
+# reference. The DEPLOYED origin is the default because these URLs are baked
+# into artefacts and outlive the machine that wrote them: the corpus carries
+# 9,368 references pointing at http://localhost:5173, which resolve to nothing
+# from any machine but the one that generated them, reviewer or not. Local work
+# sets the env var; a durable artefact should never inherit a developer's
+# loopback address by default.
+# Public-hash convention: first 56 chars of the SHA-256 content_hash (no
+# "sha256:" prefix). Matches the URL the workbench uses for its record routes.
 WORKBENCH_ORIGIN = os.environ.get(
-    "ANOMALICA_WORKBENCH_ORIGIN", "http://localhost:5173"
+    "ANOMALICA_WORKBENCH_ORIGIN", "https://workbench.anomalica.is"
 ).rstrip("/")
 PUBLIC_HASH_LENGTH = 56
+
+# Closed tag vocabulary, per node type. The site's tag filter has been built and
+# has never rendered, because no page carries tags.
+#
+# It must be CLOSED, and that is the whole design. metadata.role is populated on
+# 137 of 144 people and holds 131 DISTINCT values - "US Navy pilot, F/A-18F Super
+# Hornet, FastEagle 02" is a sentence, not a category, and free text that is
+# near-unique per entity groups nothing. A tag GENERATED per page would rebuild
+# those 131 categories in a different shape, so the model chooses from this list
+# and anything outside it is dropped rather than passed through.
+#
+# Drawn from what the corpus actually holds rather than from a taxonomy: the
+# recurring role fragments across 144 people are author, president, founder,
+# physicist, investigative journalist, remote viewer, astronaut, astronomer,
+# engineer, businessman, researcher.
+TAG_VOCABULARY: dict[str, tuple[str, ...]] = {
+    "person": (
+        "pilot",
+        "military officer",
+        "intelligence officer",
+        "government official",
+        "politician",
+        "scientist",
+        "engineer",
+        "journalist",
+        "author",
+        "business figure",
+        "academic",
+        "ufologist",
+        "astronaut",
+        "witness",
+        "religious figure",
+    ),
+    "organisation": (
+        "military",
+        "intelligence agency",
+        "government body",
+        "research institute",
+        "university",
+        "media",
+        "advocacy group",
+        "company",
+        "international body",
+    ),
+    "project": (
+        "government programme",
+        "military programme",
+        "research programme",
+        "private venture",
+        "investigation",
+    ),
+    "topic": (
+        "phenomenon",
+        "technology",
+        "hypothesis",
+        "secrecy and disclosure",
+        "consciousness",
+        "historical episode",
+    ),
+    "place": (
+        "military site",
+        "research site",
+        "incident site",
+        "city or region",
+        "country",
+    ),
+    "event": (
+        "sighting",
+        "encounter",
+        "congressional hearing",
+        "disclosure",
+        "investigation",
+        "crash retrieval",
+    ),
+    "object": (
+        "aircraft",
+        "vessel",
+        "spacecraft",
+        "artefact",
+        "recorded media",
+        "sensor system",
+    ),
+    "document": (
+        "government report",
+        "testimony",
+        "memo",
+        "correspondence",
+        "media article",
+    ),
+}
+
+MAX_TAGS = 3
+
+
+def allowed_tags(node_type: str | None) -> tuple[str, ...]:
+    return TAG_VOCABULARY.get(node_type or "", ())
+
+
+def filter_tags(raw: object, node_type: str | None) -> list[str]:
+    """Keep only vocabulary values, in vocabulary order, capped at MAX_TAGS.
+
+    Same refusal discipline as the name check and the citation gate: a value
+    outside the list is DROPPED, not passed through, because one invented tag
+    becomes a category of one and the point of the filter is grouping.
+    """
+    vocab = allowed_tags(node_type)
+    if not vocab or not isinstance(raw, list):
+        return []
+    seen = {str(t).strip().lower() for t in raw if isinstance(t, (str, int))}
+    return [t for t in vocab if t in seen][:MAX_TAGS]
+
 
 # Frontmatter keys the assembler NEVER generates - they are human-authored
 # (reviewers write `directives` strings via the workbench). A (re)assembly fully
@@ -824,6 +939,8 @@ Your ENTIRE response must be a single YAML+markdown document in this exact shape
 ---
 title: "<the node's display name>"
 description: "<one-sentence PLAIN-TEXT summary of what this {node_type} IS, in the world - no markdown (no *italics*, **bold**, or backticks). It also becomes the search-engine description and appears in listings, so it travels further than the body. State who or what the subject is and what the sources say about them. NEVER describe the subject by their relationship to this corpus, this graph, or Anomalica - our data model is not a fact about the world, and a phrase like \"linked to Anomalica's UAP-related network\" is both self-referential and an editorial characterisation. Where a subject appears here only through an association, state that association as the plain fact it is (\"whose legislative assistant later followed him to the Pentagon\"), never as membership of a network or movement. This matters most for real, living, notable people, where an inferred association is a claim about them that the body does not support.>"
+tags:
+{tags_block}
 metadata:
   <type-appropriate fields - role/affiliation/rank for persons; date/location for events; founded/headquartered for organisations; status/type for objects; etc. Omit metadata block entirely if you have nothing to say>
 references:
@@ -1052,6 +1169,26 @@ def format_claim(c: dict, idx: int) -> str:
     return "\n".join(parts)
 
 
+def format_tags_block(node_type: str | None) -> str:
+    """The allowed tag values for this node type, as an instruction.
+
+    The list is shown IN FULL rather than described, because the model cannot
+    choose from a closed set it has not been given, and a near-miss ("naval
+    aviator" for "pilot") is dropped by the filter and helps nobody.
+    """
+    vocab = allowed_tags(node_type)
+    if not vocab:
+        return "  []  # no vocabulary for this type - emit an empty list"
+    return (
+        f"  <choose 1-{MAX_TAGS} values from this list and NOTHING else, as a YAML "
+        "list of plain lowercase strings. These are filter categories, so pick the "
+        "ones a reader would browse by, not every one that could apply. A value "
+        "not on this list is DROPPED, so inventing one loses the tag entirely: "
+        + ", ".join(vocab)
+        + ">"
+    )
+
+
 def build_prompt(
     node: dict,
     claims: list[dict],
@@ -1063,6 +1200,7 @@ def build_prompt(
         node_name=node["name"],
         node_type=node["type"],
         related_block=format_related_block(related),
+        tags_block=format_tags_block(node.get("type")),
         claims_block=claims_block,
         directives_block=format_directives_block(directives or []),
     )
@@ -2045,8 +2183,10 @@ def _augment_references(
     - quote: the verbatim source text the claim was drawn from
     - claim_id: the claim's UUID, for workbench scroll-to-claim
     - record_hash: the source record's public_hash (first 56 of sha256)
-    - workbench_url: review-only deep-link into the workbench (site gates it out
-      of public builds)
+    - workbench_url: deep-link to the CLAIM in the workbench. A claim is a fact
+      and is not copyrightable, so it may be surfaced publicly; the record and
+      ingest views, which show the source text, are the copyrighted half and
+      stay gated. (Mark, 2026-08-27.)
     - inspection_url: public, language-agnostic deep-link to the source record's
       public inspection page, /records/<slug>#claim-<uuid>. Emitted only when
       that record page exists in content_root (so the site renders it iff
@@ -2270,6 +2410,38 @@ def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> 
         }
     )
     return block
+
+
+def stamp_tags(article: str, node_type: str | None) -> str:
+    """Reduce the model's tags to the closed vocabulary, or drop the field.
+
+    Enforced here rather than trusted from the prompt for the same reason the
+    citation range is: an instruction is a request, and the only thing that makes
+    a vocabulary closed is refusing what falls outside it. One invented tag is a
+    category of one, and a filter full of categories of one is the free-text
+    problem again.
+    """
+    parsed = _split_article(article)
+    if parsed is None:
+        return article
+    frontmatter, body = parsed
+    if "tags" not in frontmatter:
+        return article
+    kept = filter_tags(frontmatter.get("tags"), node_type)
+    rebuilt: dict = {}
+    for key, value in frontmatter.items():
+        if key == "tags":
+            if kept:
+                rebuilt["tags"] = kept
+            continue
+        rebuilt[key] = value
+    return (
+        "---\n"
+        + yaml.safe_dump(rebuilt, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + body.strip()
+        + "\n"
+    )
 
 
 def stamp_aliases(article: str, aliases: list[str]) -> str:
@@ -2699,6 +2871,7 @@ def main() -> int:
     # Last, so body_sha256 covers the final body - after the canonical-text fix
     # and after any preserved human field is folded back in.
     # Before built_by, which hashes the final bytes.
+    article = stamp_tags(article, node.get("type"))
     article = stamp_aliases(
         article, slug_aliases(node, section, args.db, Path(args.content_root))
     )
