@@ -2370,6 +2370,32 @@ def _public_hash(content_hash: str | None) -> str | None:
     return h[:PUBLIC_HASH_LENGTH] if len(h) >= PUBLIC_HASH_LENGTH else h
 
 
+def _claim_fingerprint(claim: dict) -> str | None:
+    """Stable identity for a claim, or None if the fields are not present.
+
+    Uses anomalica-common's mapping helper rather than calling claim_fingerprint
+    directly: a digest names these fields text/type/quote/location while the hash
+    takes content/claim_type/original_excerpt/location_in_record, and two
+    consumers mapping by hand produce different keys for the same claim - the
+    exact failure the fingerprint exists to prevent.
+    """
+    try:
+        from anomalica_common.digest import claim_fingerprint
+
+        content = claim.get("content") or claim.get("text")
+        claim_type = claim.get("claim_type") or claim.get("type")
+        if not content or not claim_type:
+            return None
+        return claim_fingerprint(
+            content=content,
+            claim_type=claim_type,
+            original_excerpt=claim.get("original_excerpt") or claim.get("quote"),
+            location_in_record=claim.get("location_in_record") or claim.get("location"),
+        )
+    except Exception:
+        return None
+
+
 def _augment_references(
     frontmatter: dict, claims: list[dict], content_root: Path | None = None
 ) -> dict:
@@ -2427,6 +2453,18 @@ def _augment_references(
             ph = _public_hash(c.get("record_content_hash"))
             if cid:
                 out["claim_id"] = cid
+            # The DURABLE half of a citation. claim_id is a fresh uuid on every
+            # emission, so a re-digest orphans every page built before it - 649
+            # of 9,326 references after one round. claim_fingerprint is derived
+            # only from the claim's own text, so the same sentence from the same
+            # source keys the same after re-digestion. Stored ALONGSIDE the id
+            # rather than replacing it: the workbench anchor is keyed on the id,
+            # so the id stays the link and the fingerprint is what re-finds the
+            # current one. Deliberately paired with record_hash - the fingerprint
+            # is digest-LOCAL, so the same sentence in two records collides.
+            fp = _claim_fingerprint(c)
+            if fp:
+                out["claim_fingerprint"] = fp
             if ph:
                 out["record_hash"] = ph
                 out["workbench_url"] = f"{WORKBENCH_ORIGIN}/{ph}#claim-{cid}"

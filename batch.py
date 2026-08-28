@@ -546,15 +546,38 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
     # and highlight nothing, which is worse than a missing link because it looks
     # like it worked.
     live_claims: set[str] = set()
+    # (record public hash, claim fingerprint) -> the claim's CURRENT id. The
+    # fingerprint survives re-digestion where the id does not, so a citation that
+    # would have been orphaned can instead be REPAIRED: same sentence, same
+    # source, new id. Paired with the record hash because the fingerprint is
+    # digest-local and the same sentence in two records would otherwise collide.
+    by_fingerprint: dict[tuple[str, str], str] = {}
     if db_path and Path(db_path).is_file():
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             live_claims = {str(r[0]) for r in conn.execute("SELECT id FROM claims")}
+            for cid, content, ctype, excerpt, loc, chash in conn.execute(
+                """SELECT c.id, c.content, c.claim_type, c.original_excerpt,
+                          c.location_in_record, r.content_hash
+                   FROM claims c JOIN records r ON r.id = c.record_id"""
+            ):
+                fp = asm._claim_fingerprint(
+                    {
+                        "content": content,
+                        "claim_type": ctype,
+                        "original_excerpt": excerpt,
+                        "location_in_record": loc,
+                    }
+                )
+                ph = asm._public_hash(chash)
+                if fp and ph:
+                    by_fingerprint[(ph, fp)] = str(cid)
             conn.close()
         except sqlite3.Error:
             live_claims = set()
+            by_fingerprint = {}
 
-    kept = dropped = restored = orphaned = 0
+    kept = dropped = restored = orphaned = repaired = 0
     changed_files = 0
     for md in pages:
         text = md.read_text(encoding="utf-8")
@@ -573,6 +596,20 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
             if not isinstance(r, dict):
                 continue
             claim_id = str(r.get("claim_id") or "")
+            # Before declaring a claim gone, try to re-find it by fingerprint: a
+            # re-digest re-mints the id but not the sentence, so the citation is
+            # repairable rather than dead.
+            fp = str(r.get("claim_fingerprint") or "")
+            ph = str(r.get("record_hash") or "")
+            if live_claims and claim_id and claim_id not in live_claims and fp and ph:
+                current = by_fingerprint.get((ph, fp))
+                if current:
+                    r["claim_id"] = current
+                    r["workbench_url"] = f"{asm.WORKBENCH_ORIGIN}/{ph}#claim-{current}"
+                    r.pop("inspection_url", None)
+                    claim_id = current
+                    repaired += 1
+                    touched = True
             # A claim that no longer exists cannot be shown anywhere. Strip both
             # links and leave the reference text, which is still true.
             if live_claims and claim_id and claim_id not in live_claims:
@@ -621,6 +658,10 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
         file=sys.stderr,
     )
     print(f"  restored  {restored:6,}  a record page now carries it", file=sys.stderr)
+    print(
+        f"  repaired  {repaired:6,}  id re-minted by a re-digest, re-found by fingerprint",
+        file=sys.stderr,
+    )
     print(
         f"  orphaned  {orphaned:6,}  claim no longer in the graph - no link",
         file=sys.stderr,

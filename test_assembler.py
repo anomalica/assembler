@@ -615,3 +615,40 @@ def test_openrouter_refuses_without_a_key(monkeypatch):
         assert "OPENROUTER_API_KEY" in str(exc)
     else:
         raise AssertionError("spent without a key")
+
+
+def test_claim_fingerprint_survives_a_re_mint():
+    """claim_id is a fresh uuid on every emission, so a re-digest orphans every
+    page built before it. The fingerprint is derived from the claim's own text."""
+    c = {
+        "content": "The object accelerated away.",
+        "claim_type": "observation",
+        "original_excerpt": "it accelerated",
+        "location_in_record": "char:10-24",
+    }
+    assert a._claim_fingerprint({**c, "id": "one"}) == a._claim_fingerprint(
+        {**c, "id": "two"}
+    )
+    assert a._claim_fingerprint({**c, "content": "different"}) != a._claim_fingerprint(
+        c
+    )
+    assert a._claim_fingerprint({"content": "x"}) is None, "needs a claim_type"
+
+
+def test_fingerprint_uses_the_shared_field_mapping():
+    """A digest names these text/type/quote/location; the hash takes
+    content/claim_type/original_excerpt/location_in_record. Both spellings must
+    produce the same key or two consumers silently disagree."""
+    digest_shape = {
+        "text": "X.",
+        "type": "observation",
+        "quote": "q",
+        "location": "char:1-2",
+    }
+    graph_shape = {
+        "content": "X.",
+        "claim_type": "observation",
+        "original_excerpt": "q",
+        "location_in_record": "char:1-2",
+    }
+    assert a._claim_fingerprint(digest_shape) == a._claim_fingerprint(graph_shape)
