@@ -410,7 +410,11 @@ def generate(args, kind: str, items: list[str]) -> int:
             print(f"\n=== [{index + 1}/{total}] {item} ===", file=sys.stderr)
             started = time.monotonic()
             code, reset = _run_one(
-                [sys.executable, "assembler.py", flag, item, *common]
+                # `--record=<item>`, not `--record <item>`: three digest names
+                # begin with a hyphen, and argparse reads a bare one as a flag.
+                # Cost one item of a five-item run to find; would have cost three
+                # of the 77.
+                [sys.executable, "assembler.py", f"{flag}={item}", *common]
             )
             elapsed = time.monotonic() - started
             # Wall-clock per page, always, not just on failure. A completion at
