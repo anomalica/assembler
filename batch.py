@@ -369,8 +369,18 @@ def generate(args, kind: str, items: list[str]) -> int:
                 if state["abort"]:
                     return
             print(f"\n=== [{index + 1}/{total}] {item} ===", file=sys.stderr)
+            started = time.monotonic()
             code, reset = _run_one(
                 [sys.executable, "assembler.py", flag, item, *common]
+            )
+            elapsed = time.monotonic() - started
+            # Wall-clock per page, always, not just on failure. A completion at
+            # 870s against a 900s timeout is a different finding from one at
+            # 240s, and pass/fail throws that distinction away - which is exactly
+            # the signal needed to tell whether a brief is near its ceiling.
+            print(
+                f"  [{item}] {elapsed:.0f}s wall, exit {code}",
+                file=sys.stderr,
             )
 
             if code == asm._EXIT_PLAN_RATE_LIMITED:
