@@ -197,7 +197,23 @@ def _prompt_chars(args, kind: str, item: str) -> int | None:
 
 def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     """Print the spend estimate. Returns (resolved, unresolved) item lists."""
-    in_price, out_price = PRICING.get(args.model, PRICING["sonnet"])
+    # An OpenRouter model is a DIFFERENT cost shape, not just a different price:
+    # its per-token rate comes from the shared table, its tokenizer is not the
+    # one CHARS_PER_TOKEN was fitted to, and the large fixed term - the Claude
+    # CLI's own system prompt - does not exist on that route at all. Using the
+    # Claude constants here priced a metered Luna run at Sonnet's rate and
+    # reported it as "no metered spend", which is the one thing this gate must
+    # never say about a run that costs money.
+    via_openrouter = asm.is_openrouter_model(args.model)
+    if via_openrouter:
+        from anomalica_common.llm.cost import price_for
+
+        in_price, out_price = price_for(args.model)
+        chars_per_token, fixed_in = 3.5, 0
+    else:
+        in_price, out_price = PRICING.get(args.model, PRICING["sonnet"])
+        chars_per_token, fixed_in = CHARS_PER_TOKEN, FIXED_INPUT_TOKENS
+
     resolved: list[str] = []
     unresolved: list[str] = []
     total_in_tokens = 0
@@ -207,17 +223,18 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
             unresolved.append(item)
             continue
         resolved.append(item)
-        total_in_tokens += FIXED_INPUT_TOKENS + round(chars / CHARS_PER_TOKEN)
+        total_in_tokens += fixed_in + round(chars / chars_per_token)
 
     out_tokens = len(resolved) * EST_OUTPUT_TOKENS
     in_cost = total_in_tokens * in_price / 1_000_000
     out_cost = out_tokens * out_price / 1_000_000
     total = in_cost + out_cost
-    on_api = asm._use_api()
+    on_api = asm._use_api() or via_openrouter
 
     print("=" * 60, file=sys.stderr)
     if on_api:
-        print("BATCH SPEND ESTIMATE (metered Anthropic API)", file=sys.stderr)
+        provider = "OpenRouter" if via_openrouter else "Anthropic API"
+        print(f"BATCH SPEND ESTIMATE (metered - {provider})", file=sys.stderr)
     else:
         print(
             "BATCH PRE-FLIGHT (Claude subscription - no metered spend, "
@@ -353,6 +370,10 @@ def generate(args, kind: str, items: list[str]) -> int:
     # the single largest term in wall-clock, larger than some generations.
     if args.link_index_cache:
         common += ["--link-index-cache", args.link_index_cache]
+    # Record pages resolve their copyright status from the ingest store; without
+    # this the gate fails closed and every record page would show no source.
+    if args.ingests_root:
+        common += ["--ingests-root", args.ingests_root]
     # The graph goes to every mode, not just --node: it is also where a page's
     # prior slugs live, and those become the redirect aliases. Without it a
     # rebuilt page silently loses its redirects, which is how two pages 404'd.
@@ -699,6 +720,11 @@ def main() -> int:
         default=0.0,
         help="Seconds to wait between calls, to pace a run against the shared "
         "subscription rate-limit (calls are sequential regardless).",
+    )
+    ap.add_argument(
+        "--ingests-root",
+        default="../ingests",
+        help="ingests repo - where a record page's copyright status is read from",
     )
     ap.add_argument(
         "--link-index-cache",
