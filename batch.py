@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+import yaml
 
 import assembler as asm
 
@@ -463,6 +466,116 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def retarget_links(content_root: str, apply: bool) -> int:
+    """Keep inspection_url only where the record page actually carries the claim.
+
+    A record page is a SUMMARY - Mark's ruling - so it lists a fraction of the
+    claims drawn from its source, while an entity page cites hundreds from the
+    same record. The mismatch is permanent BY DESIGN and must not be closed by
+    making record pages carry every claim; that would undo the summary shape.
+
+    Measured before this ran: 3,294 claim links from entity pages into record
+    pages, of which ~173 resolve. The rest land on the right page at the top,
+    with the cited claim nowhere on it - worse than being sent somewhere that
+    has it. So where the record page does not carry the claim, inspection_url is
+    dropped and workbench_url (which renders the exact claim) becomes the link.
+
+    A post-pass rather than a rule inside the writer, because a page cannot know
+    which claims a record page will carry when that page is built later.
+    Idempotent and re-runnable: as the missing record pages land, re-running
+    UPGRADES links back from the workbench to the record page wherever one now
+    carries the claim. Run it after every build.
+    """
+    root = Path(content_root).expanduser()
+    pages = sorted(root.glob("pages/*/*.en.md"))
+
+    # what each record page actually carries
+    carries: dict[str, set[str]] = {}
+    for md in root.glob("pages/records/*.en.md"):
+        fm = _front_matter(md)
+        carries[md.name[: -len(".en.md")]] = {
+            str(r.get("claim_id"))
+            for r in (fm.get("references") or [])
+            if isinstance(r, dict) and r.get("claim_id")
+        }
+
+    kept = dropped = restored = 0
+    changed_files = 0
+    for md in pages:
+        text = md.read_text(encoding="utf-8")
+        m = re.match(r"^(---\n)(.*?)(\n---\n)(.*)$", text, re.S)
+        if not m:
+            continue
+        try:
+            fm = yaml.safe_load(m.group(2)) or {}
+        except yaml.YAMLError:
+            continue
+        refs = fm.get("references")
+        if not isinstance(refs, list):
+            continue
+        touched = False
+        for r in refs:
+            if not isinstance(r, dict):
+                continue
+            claim_id = str(r.get("claim_id") or "")
+            slug = _inspection_slug(r.get("inspection_url"))
+            resolves = bool(slug and claim_id and claim_id in carries.get(slug, set()))
+            if r.get("inspection_url"):
+                if resolves:
+                    kept += 1
+                else:
+                    r.pop("inspection_url")
+                    dropped += 1
+                    touched = True
+            elif claim_id:
+                # A record page may have appeared since; upgrade back to it.
+                for rec_slug, ids in carries.items():
+                    if claim_id in ids:
+                        r["inspection_url"] = f"/records/{rec_slug}#claim-{claim_id}"
+                        restored += 1
+                        touched = True
+                        break
+        if touched and apply:
+            fm["references"] = refs
+            md.write_text(
+                "---\n"
+                + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+                + "\n---\n"
+                + m.group(4)
+            )
+        if touched:
+            changed_files += 1
+
+    verb = "rewritten" if apply else "would change"
+    print("=" * 60, file=sys.stderr)
+    print(f"INSPECTION-URL RETARGET ({verb})", file=sys.stderr)
+    print(f"  kept      {kept:6,}  record page carries the claim", file=sys.stderr)
+    print(
+        f"  dropped   {dropped:6,}  it does not - workbench link stands alone",
+        file=sys.stderr,
+    )
+    print(f"  restored  {restored:6,}  a record page now carries it", file=sys.stderr)
+    print(f"  files     {changed_files:6,}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    if not apply:
+        print("Dry run - pass --apply to write.", file=sys.stderr)
+    return 0
+
+
+def _front_matter(md: Path) -> dict:
+    try:
+        m = re.match(r"^---\n(.*?)\n---\n", md.read_text(encoding="utf-8"), re.S)
+        return (yaml.safe_load(m.group(1)) or {}) if m else {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _inspection_slug(url: object) -> str | None:
+    if not isinstance(url, str) or not url.startswith("/records/"):
+        return None
+    return url[len("/records/") :].split("#", 1)[0] or None
+
+
 def report_spend(content_root: str, since: str | None) -> int:
     """Report what assembly ACTUALLY cost, read back from the articles.
 
@@ -586,6 +699,18 @@ def main() -> int:
         "this only sets how many lanes run; per-item behaviour is unchanged.",
     )
     ap.add_argument(
+        "--retarget-links",
+        action="store_true",
+        help="Keep inspection_url only where the record page carries that claim; "
+        "otherwise drop it so the workbench link stands. Idempotent - re-run "
+        "after every build to upgrade links as record pages land.",
+    )
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --retarget-links, write the changes (default is a dry run).",
+    )
+    ap.add_argument(
         "--report-spend",
         action="store_true",
         help="Report what assembly actually cost, summed from each article's "
@@ -649,6 +774,9 @@ def main() -> int:
 
     if args.report_spend:
         return report_spend(args.content_root, args.since)
+
+    if args.retarget_links:
+        return retarget_links(args.content_root, args.apply)
 
     nodes = _read_items(args, "nodes")
     records = _read_items(args, "records")
