@@ -45,8 +45,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
+import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -197,6 +201,34 @@ def _prompt_chars(args, kind: str, item: str) -> int | None:
     return len(asm.build_prompt(node, claims, related))
 
 
+def openrouter_budget_remaining() -> tuple[float, float] | None:
+    """(spent_today, daily_limit) from OpenRouter, or None if unreadable.
+
+    The daily budget is a SHARED workspace pool - this component, the digester's
+    benchmarks and anything else on OpenRouter draw the same $3 - and no consumer
+    can see the others' spend when sizing work. Every estimate here had been
+    "what will this cost" and never "what is left", which is how a four-model run
+    got three 403s halfway through rather than a refusal up front.
+    """
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/key",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = (json.loads(resp.read().decode()) or {}).get("data") or {}
+    except (OSError, ValueError):
+        return None
+    limit = data.get("limit")
+    spent = data.get("usage_daily")
+    if limit is None or spent is None:
+        return None
+    return float(spent), float(limit)
+
+
 def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     """Print the spend estimate. Returns (resolved, unresolved) item lists."""
     # An OpenRouter model is a DIFFERENT cost shape, not just a different price:
@@ -268,6 +300,30 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
             f"bill the metered API instead.)",
             file=sys.stderr,
         )
+    if via_openrouter:
+        budget = openrouter_budget_remaining()
+        if budget is None:
+            print(
+                "  daily budget: UNREADABLE - proceeding blind, check before a "
+                "large run",
+                file=sys.stderr,
+            )
+        else:
+            spent, limit = budget
+            left = max(0.0, limit - spent)
+            print(
+                f"  shared daily budget: ${spent:,.2f} of ${limit:,.2f} used, "
+                f"${left:,.2f} left (POOLED across every component on OpenRouter)",
+                file=sys.stderr,
+            )
+            if total > left:
+                print(
+                    f"  *** THIS RUN ESTIMATES ${total:,.2f} AND ONLY ${left:,.2f} "
+                    "REMAINS. It will 403 partway through, leaving some items "
+                    "built and some not. Wait for the daily reset or cut the "
+                    "list. ***",
+                    file=sys.stderr,
+                )
     if unresolved:
         print(
             f"  {len(unresolved)} unresolved (skipped): {', '.join(unresolved[:5])}"
