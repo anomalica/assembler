@@ -36,7 +36,12 @@ from pathlib import Path
 
 import yaml
 from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
-from anomalica_common.llm import PlanRateLimited, accumulate, usage_entry
+from anomalica_common.llm import (
+    PlanRateLimited,
+    accumulate,
+    is_openrouter_model,
+    usage_entry,
+)
 from anomalica_common.llm.transport import _raise_if_plan_limited
 from anomalica_common.slug import SECTION_BY_TYPE as _COMMON_SECTION_BY_TYPE
 from anomalica_common.slug import node_slug as _node_slug
@@ -1417,6 +1422,8 @@ def _get_usage() -> dict:
 def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Generate the article. Defaults to the Claude subscription via the CLI;
     set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
+    if is_openrouter_model(model):
+        return _call_openrouter(prompt, model)
     return _call_api(prompt, model) if _use_api() else _call_cli(prompt, model)
 
 
@@ -1511,6 +1518,76 @@ def _estimate_article_cost(model: str) -> dict:
         "usd_low": usd * 0.6,
         "usd_high": usd * 1.4,
     }
+
+
+def _call_openrouter(prompt: str, model: str) -> str:
+    """Generate via OpenRouter (OpenAI-compatible chat), for non-Anthropic models.
+
+    METERED - real money, per token, and therefore behind the same spend gate as
+    the Anthropic API path. There is deliberately NO env toggle: the transport is
+    selected by the MODEL ID carrying a provider prefix ("openai/gpt-5.6-luna"),
+    so it cannot be reached by setting a flag and forgetting which model is
+    configured. Asking for a provider-qualified model IS asking to spend.
+
+    anomalica-common's _call_openrouter is not reused here despite the name: it is
+    shaped for extraction and runs the response through a JSON extractor, which
+    would destroy a markdown article. The spend gate IS shared, which is the part
+    that matters.
+    """
+    import urllib.error
+    import urllib.request
+
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set - export it from the Safe "
+            "(sops -d --extract '[\"OPENROUTER_API_KEY\"]' store/anomalica.yaml)"
+        )
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": _API_MAX_TOKENS,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "X-Title": "anomalica-assembler",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_CLI_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()[:300]
+        raise RuntimeError(f"OpenRouter {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenRouter unreachable: {exc.reason}") from exc
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {str(body)[:300]}")
+    finish = choices[0].get("finish_reason")
+    if finish == "length":
+        raise RuntimeError(
+            f"OpenRouter response hit max_tokens ({_API_MAX_TOKENS}); article "
+            "truncated. Raise _API_MAX_TOKENS."
+        )
+    usage = body.get("usage") or {}
+    _record_usage(
+        {
+            "input_tokens": usage.get("prompt_tokens") or 0,
+            "output_tokens": usage.get("completion_tokens") or 0,
+        }
+    )
+    return (choices[0].get("message") or {}).get("content") or ""
 
 
 def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
@@ -2848,7 +2925,9 @@ def main() -> int:
     # the digester and ingester use, so the wording and the authorisation are
     # identical. use_api is passed in: spend_confirmed's fallback reads the
     # global ANOMALICA_USE_API, and this component resolves ASSEMBLER_USE_API.
-    if _use_api():
+    # An OpenRouter model is metered too, so the gate must fire for it - the
+    # toggle alone would let a provider-qualified model spend unchecked.
+    if _use_api() or is_openrouter_model(args.model):
         from anomalica_common.llm import spend_confirmed
 
         if not spend_confirmed(

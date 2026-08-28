@@ -582,3 +582,36 @@ def test_source_display_is_driven_by_copyright_and_fails_closed():
 def test_a_record_summary_is_shorter_than_a_biography():
     assert "300-400 words" in a.format_length_block("source")
     assert "3-6 paragraphs" in a.format_length_block("person")
+
+
+def test_openrouter_is_selected_by_model_id_not_a_flag(monkeypatch):
+    """No env toggle on purpose: a provider-qualified model IS the request to
+    spend, so the metered path cannot be reached by setting a flag and forgetting
+    which model is configured."""
+    from anomalica_common.llm import is_openrouter_model
+
+    assert is_openrouter_model("openai/gpt-5.6-luna")
+    assert not is_openrouter_model("sonnet")
+
+    calls = {}
+    monkeypatch.setattr(a, "_call_openrouter", lambda p, m: calls.setdefault("or", m))
+    monkeypatch.setattr(a, "_call_cli", lambda p, m=None: calls.setdefault("cli", m))
+    monkeypatch.setattr(a, "_call_api", lambda p, m=None: calls.setdefault("api", m))
+
+    a.call_claude("x", model="openai/gpt-5.6-luna")
+    assert calls == {"or": "openai/gpt-5.6-luna"}, "must not touch the other paths"
+
+    calls.clear()
+    monkeypatch.setattr(a, "_use_api", lambda: False)
+    a.call_claude("x", model="sonnet")
+    assert "cli" in calls and "or" not in calls
+
+
+def test_openrouter_refuses_without_a_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    try:
+        a._call_openrouter("x", "openai/gpt-5.6-luna")
+    except RuntimeError as exc:
+        assert "OPENROUTER_API_KEY" in str(exc)
+    else:
+        raise AssertionError("spent without a key")
