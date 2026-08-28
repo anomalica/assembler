@@ -2533,6 +2533,22 @@ def _augment_references(
                 out["claim_fingerprint"] = fp
             if ph:
                 out["record_hash"] = ph
+                # The RAW status, not a permission. A page cannot currently
+                # answer the copyright question about itself - every check has to
+                # join back to the ingests store - which is why 5,739 reproduced
+                # passages went unnoticed: the pages carried nothing to check.
+                # Raw rather than "do_not_quote" so the RULE stays with the
+                # consumer and a rule change does not require rewriting pages.
+                # A SNAPSHOT, never the authority: filter on this, decide on a
+                # live read of the store.
+                raw = (
+                    load_ingest_meta(
+                        ingests_root or _INGESTS_ROOT, c.get("record_content_hash")
+                    )
+                    or {}
+                ).get("status")
+                if raw:
+                    out["copyright_status"] = raw
                 out["workbench_url"] = f"{WORKBENCH_ORIGIN}/{ph}#claim-{cid}"
             rec_slug = c.get("record_friendly_name")
             if (
@@ -2662,6 +2678,33 @@ def source_display_mode(status: str | None, source_type: str | None) -> str:
     return "none"
 
 
+# A `licensed` record must carry evidence of the licence. Per
+# decisions/drafts/source-types-and-copyright.md:89, one without any is
+# indistinguishable from a mislabelled `restricted` record and is treated as
+# restricted. All six in the store carry none.
+_LICENCE_EVIDENCE = ("holder", "granted_by", "granted_at", "licence_url", "expires")
+
+
+def effective_copyright_status(copyright_block: dict | None) -> str:
+    """The status to ACT on, which is not always the status recorded.
+
+    Kept separate from the raw status so the stored value stays what the ingester
+    wrote and the interpretation lives in one place. A caller wanting to know
+    what a record CLAIMS reads `status`; one deciding what may be published reads
+    this.
+    """
+    if not isinstance(copyright_block, dict):
+        return "unresolved"
+    status = copyright_block.get("status")
+    if not status:
+        return "unresolved"
+    if status == "licensed" and not any(
+        copyright_block.get(k) for k in _LICENCE_EVIDENCE
+    ):
+        return "restricted"
+    return str(status)
+
+
 def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dict:
     """Copyright status and source pointer for a record, from its ingest.
 
@@ -2673,8 +2716,17 @@ def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dic
     full = content_hash.split(":", 1)[-1]
     # Store filenames carry a schema suffix ({hash}.v2.md), and it changes with
     # the record schema, so match on the hash rather than assuming the tail.
-    store = Path(ingests_root) / "store"
-    candidates = sorted(store.glob(f"{full}*.md")) if store.is_dir() else []
+    # BOTH store roots. store/v1/ holds 163 older records and is where every
+    # `licensed` status lives - a lookup that misses it does not fail, it returns
+    # "unresolved", which happens to get the same treatment as licensed today.
+    # That is failing LUCKY, not failing safe: the moment unresolved stops
+    # meaning "drop", six licensed records become permitted without anyone
+    # touching the copyright logic. The same incomplete-lookup bug hit the
+    # assimilator today in the opposite direction.
+    candidates: list[Path] = []
+    for store in (Path(ingests_root) / "store", Path(ingests_root) / "store" / "v1"):
+        if store.is_dir():
+            candidates.extend(sorted(store.glob(f"{full}*.md")))
     path = next(
         (c for c in candidates if not c.name.endswith(".verification.json")), None
     )
@@ -2688,10 +2740,12 @@ def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dic
         return {}
     if not isinstance(fm, dict):
         return {}
-    status = (fm.get("copyright") or {}).get("status")
+    copyright_block = fm.get("copyright") or {}
+    status = copyright_block.get("status")
     source_type = fm.get("source_type")
     out = {
         "status": status,
+        "effective_status": effective_copyright_status(copyright_block),
         "type": source_type,
         "display": source_display_mode(status, source_type),
     }

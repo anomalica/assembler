@@ -596,7 +596,10 @@ def strip_restricted_quotes(content_root: str, ingests_root: str, apply: bool) -
             return "unresolved"
         if record_hash not in status_cache:
             meta = asm.load_ingest_meta(ing, record_hash) or {}
-            status_cache[record_hash] = meta.get("status") or "unresolved"
+            # EFFECTIVE for the decision - a `licensed` record with no evidence
+            # of a licence is treated as restricted - and it is what gets
+            # stamped, so the page records what was acted on.
+            status_cache[record_hash] = meta.get("effective_status") or "unresolved"
         return status_cache[record_hash]
 
     kept: dict[str, int] = {}
@@ -616,9 +619,17 @@ def strip_restricted_quotes(content_root: str, ingests_root: str, apply: bool) -
             continue
         touched = False
         for r in refs:
-            if not isinstance(r, dict) or not r.get("quote"):
+            if not isinstance(r, dict):
                 continue
             st = status_of(r.get("record_hash"))
+            # Stamp EVERY reference, not only those still carrying a quote - the
+            # references that most need to say what they are are precisely the
+            # ones whose quote has already been removed.
+            if st != "unresolved" and r.get("copyright_status") != st:
+                r["copyright_status"] = st
+                touched = True
+            if not r.get("quote"):
+                continue
             if st in _QUOTABLE:
                 kept[st] = kept.get(st, 0) + 1
             else:

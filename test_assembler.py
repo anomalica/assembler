@@ -692,3 +692,37 @@ def test_the_quote_gate_fails_closed(tmp_path):
     assert a._may_reproduce("c" * 64, tmp_path) is False, "unknown record"
     assert a._may_reproduce("a" * 64, None) is False, "no store to check against"
     assert a._may_reproduce(None, tmp_path) is False, "no hash"
+
+
+def test_licensed_without_evidence_is_treated_as_restricted():
+    """A `licensed` record with no evidence of the licence is indistinguishable
+    from a mislabelled `restricted` one. All six in the store carry none."""
+    assert a.effective_copyright_status({"status": "licensed"}) == "restricted"
+    assert a.effective_copyright_status({"status": "licensed", "holder": "X"}) == (
+        "licensed"
+    )
+
+
+def test_effective_status_is_unresolved_when_nothing_is_known():
+    assert a.effective_copyright_status(None) == "unresolved"
+    assert a.effective_copyright_status({}) == "unresolved"
+    assert a.effective_copyright_status({"status": None}) == "unresolved"
+
+
+def test_the_ingest_lookup_searches_both_store_roots(tmp_path):
+    """store/v1/ holds 163 older records and every `licensed` status. A lookup
+    that misses it returns 'unresolved' rather than failing - which is the same
+    treatment licensed gets today, so the bug would have stayed invisible."""
+    v1 = tmp_path / "store" / "v1"
+    v1.mkdir(parents=True)
+    (tmp_path / "store" / ("f" * 64 + ".v2.md")).write_text(
+        "---\ncopyright:\n  status: public_domain\n---\n\nb\n"
+    )
+    (v1 / ("e" * 64 + ".md")).write_text(
+        "---\ncopyright:\n  status: licensed\n---\n\nb\n"
+    )
+    top = a.load_ingest_meta(tmp_path, "f" * 64)
+    old = a.load_ingest_meta(tmp_path, "e" * 64)
+    assert top.get("status") == "public_domain"
+    assert old.get("status") == "licensed", "store/v1 must resolve"
+    assert old.get("effective_status") == "restricted", "no licence evidence"
