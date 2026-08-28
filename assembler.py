@@ -1360,7 +1360,14 @@ def build_prompt(
 # off. Model ids belong to one owner.
 API_MODEL_MAP = _COMMON_API_MODEL_MAP
 
-_API_MAX_TOKENS = 16000
+# Output cap per generation. 16,000 was set against Claude, whose article output
+# runs ~3-7k tokens. Three of four models in the writing bakeoff hit it and were
+# refused - not because they write badly but because they REASON, and reasoning
+# tokens bill and count as output while never appearing on the page (Sonnet: 47k
+# output for 1,264 visible words). A cap sized on visible prose rejects a whole
+# class of model for a reason that has nothing to do with the prose.
+# Env-tunable so a model that needs more room does not need an edit.
+_API_MAX_TOKENS = int(os.environ.get("ASSEMBLER_MAX_OUTPUT_TOKENS", "48000"))
 
 # Total generation attempts before giving up - a flaky pass that trips
 # validate_article or date-fidelity is regenerated rather than hard-failed.
