@@ -580,8 +580,25 @@ def test_source_display_is_driven_by_copyright_and_fails_closed():
 
 
 def test_a_record_summary_is_shorter_than_a_biography():
-    assert "300-400 words" in a.format_length_block("source")
-    assert "3-6 paragraphs" in a.format_length_block("person")
+    """Assert the INTENT, not the wording - the entity instruction has already
+    been rewritten once and a test pinned to its phrasing broke without the
+    behaviour changing."""
+    import re
+
+    def target(node_type):
+        text = a.format_length_block(node_type)
+        return max(int(n.replace(",", "")) for n in re.findall(r"[\d,]{3,}", text))
+
+    assert target("source") < target("person")
+    assert target("source") <= 400, "a record page is a summary"
+
+
+def test_the_entity_instruction_asks_for_citation_breadth():
+    """A page can get longer without citing more, and the citation count is the
+    one that matters - measured 13 -> 38 references when this was added."""
+    text = a.format_length_block("person").lower()
+    assert "distinct claims" in text
+    assert "thrown away" in text or "broadly" in text
 
 
 def test_openrouter_is_selected_by_model_id_not_a_flag(monkeypatch):
