@@ -1502,6 +1502,14 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
 # ceilings rather than means by design (see batch.py's own notes).
 FIXED_INPUT_TOKENS = 34_400
 EST_OUTPUT_TOKENS = 32_000
+# A RECORD page is capped at 300-400 words by its own prompt, so it cannot
+# produce the reference-heavy output an unconstrained entity page can. Measured
+# across five real record builds: median 3,545 output tokens, max 4,250. The
+# 32,000 ceiling is nine times that, and a gate that over-states by an order of
+# magnitude gets argued with instead of obeyed - which is worse than one that is
+# slightly tight. Kept at roughly 2x the observed maximum, so it is still a
+# ceiling and still errs high.
+EST_OUTPUT_TOKENS_RECORD = 8_000
 CHARS_PER_TOKEN = 2.6
 
 

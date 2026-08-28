@@ -82,6 +82,7 @@ PRICING = {
 CHARS_PER_TOKEN = asm.CHARS_PER_TOKEN
 FIXED_INPUT_TOKENS = asm.FIXED_INPUT_TOKENS
 EST_OUTPUT_TOKENS = asm.EST_OUTPUT_TOKENS
+EST_OUTPUT_TOKENS_RECORD = asm.EST_OUTPUT_TOKENS_RECORD
 
 
 def _read_items(args, kind: str) -> list[str]:
@@ -226,7 +227,8 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         resolved.append(item)
         total_in_tokens += fixed_in + round(chars / chars_per_token)
 
-    out_tokens = len(resolved) * EST_OUTPUT_TOKENS
+    per_item_out = EST_OUTPUT_TOKENS_RECORD if kind == "records" else EST_OUTPUT_TOKENS
+    out_tokens = len(resolved) * per_item_out
     in_cost = total_in_tokens * in_price / 1_000_000
     out_cost = out_tokens * out_price / 1_000_000
     total = in_cost + out_cost
@@ -249,7 +251,7 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     )
     print(
         f"  input ~{total_in_tokens:,} tokens, output ~{out_tokens:,} tokens "
-        f"(~{EST_OUTPUT_TOKENS}/item)",
+        f"(~{per_item_out}/item)",
         file=sys.stderr,
     )
     if on_api:
