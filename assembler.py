@@ -1210,7 +1210,21 @@ def format_length_block(node_type: str | None) -> str:
             "the source ITSELF below this summary wherever rights allow, so "
             "summarise it - do not retell it,"
         )
-    return "3-6 paragraphs of British English,"
+    # An ENTITY page had no length or coverage instruction at all, so each model
+    # wrote to its own inclination: 1,326 words and 55 references from one, 292
+    # and 13 from another, on the same brief. That measured the ABSENCE OF A
+    # CONSTRAINT rather than the models. Both numbers are named because a page
+    # can grow longer without citing more, and the citation count is the one that
+    # matters here - an assertion nobody can trace is worth less than no
+    # assertion.
+    return (
+        "800-1,200 words in 4-6 paragraphs of British English. Cover the subject "
+        "BROADLY rather than dwelling on whichever episode the claims happen to "
+        "describe in most detail: draw on as many DISTINCT claims as the evidence "
+        "supports, and prefer citing thirty claims once each over citing five "
+        "claims repeatedly. A claim in the data that no sentence uses is evidence "
+        "thrown away,"
+    )
 
 
 def score_article(
