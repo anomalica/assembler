@@ -336,7 +336,11 @@ def generate(args, kind: str, items: list[str]) -> int:
     # from the operator does not otherwise reach them, and the metered backstop
     # in _call_api would refuse every item. No-op on the subscription path,
     # which is not metered and never consults it.
-    if asm._use_api() and getattr(args, "confirm", False):
+    # Any metered route, not just the Anthropic toggle: an OpenRouter model is
+    # metered too, and its child gate would refuse every item without this.
+    if (asm._use_api() or asm.is_openrouter_model(args.model)) and getattr(
+        args, "confirm", False
+    ):
         common.append("--confirm-spend")
     # The briefs root goes to every mode, not just --brief: it is also the
     # proposal set the body-link resolver indexes, and a record page links to
