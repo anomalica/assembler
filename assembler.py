@@ -2118,6 +2118,8 @@ def _rewrite_link_display(body: str) -> str:
 # already returns null for a page that does not exist, and the site renders those
 # as plain text. This applies the same rule to prose, where the model bypassed it.
 _LINK_INDEX: dict | None = None
+# Set once in main(); the quote gate needs it wherever references are augmented.
+_INGESTS_ROOT: Path | None = None
 
 _ACRONYM_TITLE_RE = re.compile(r"^(.*?)\s*\(([A-Z0-9][A-Z0-9&/. -]{1,})\)\s*$")
 
@@ -2300,6 +2302,12 @@ def set_link_index(index: dict | None) -> None:
     _LINK_INDEX = index
 
 
+def set_ingests_root(root: Path | None) -> None:
+    """Where the copyright status is read from. Unset means nothing is quotable."""
+    global _INGESTS_ROOT
+    _INGESTS_ROOT = root
+
+
 def _resolve_link(url: str, display: str, index: dict) -> str | None:
     """The canonical /section/slug for a written link, or None to unlink it."""
     parts = url.strip("/").split("/")
@@ -2425,13 +2433,33 @@ def _claim_fingerprint(claim: dict) -> str | None:
         return None
 
 
+# Copyright statuses whose source text may be reproduced on a public page.
+# Mark's ruling, 2026-08-28: public_domain and publicly_accessible, "yes,
+# always". Everything else - restricted, licensed, unresolvable - is cited but
+# not quoted.
+_MAY_REPRODUCE = ("public_domain", "publicly_accessible", "open_licence")
+
+
+def _may_reproduce(content_hash: object, ingests_root: Path | None) -> bool:
+    """Whether this record's own text may appear on a public page. Fails closed."""
+    if not isinstance(content_hash, str) or ingests_root is None:
+        return False
+    return (load_ingest_meta(ingests_root, content_hash) or {}).get(
+        "status"
+    ) in _MAY_REPRODUCE
+
+
 def _augment_references(
-    frontmatter: dict, claims: list[dict], content_root: Path | None = None
+    frontmatter: dict,
+    claims: list[dict],
+    content_root: Path | None = None,
+    ingests_root: Path | None = None,
 ) -> dict:
     """For each reference the model produced, find the originating claim and
     augment the reference with deterministic provenance fields:
 
-    - quote: the verbatim source text the claim was drawn from
+    - quote: the verbatim source text the claim was drawn from, emitted ONLY
+      where the source's copyright status permits reproduction (fails closed)
     - claim_id: the claim's UUID, for workbench scroll-to-claim
     - record_hash: the source record's public_hash (first 56 of sha256)
     - workbench_url: deep-link to the CLAIM in the workbench. A claim is a fact
@@ -2476,7 +2504,16 @@ def _augment_references(
             c = by_source_loc.get((r.get("source") or "", r.get("location") or ""))
 
         if c:
-            if c.get("original_excerpt"):
+            # The verbatim source sentence. Emitted ONLY where the source may be
+            # redistributed - it is a quotation from a public-domain report and
+            # it is republication from a copyrighted book, and the difference is
+            # the copyright status rather than the length. A cleanup pass alone
+            # would not hold: the next build of a restricted source puts them
+            # straight back, so the rule belongs where the field is written.
+            # Fails closed - an unresolvable status emits nothing.
+            if c.get("original_excerpt") and _may_reproduce(
+                c.get("record_content_hash"), ingests_root or _INGESTS_ROOT
+            ):
                 out.setdefault("quote", c["original_excerpt"])
             cid = c.get("id")
             ph = _public_hash(c.get("record_content_hash"))
@@ -3013,6 +3050,7 @@ def main() -> int:
     # Built once, before any render: body links are resolved against the proposal
     # set rather than files on disk, so the same brief yields the same article
     # whether it is assembled first or ninetieth in a batch.
+    set_ingests_root(Path(args.ingests_root) if args.ingests_root else None)
     set_link_index(
         cached_link_index(
             Path(args.briefs_root) if args.briefs_root else None,

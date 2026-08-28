@@ -669,3 +669,26 @@ def test_fingerprint_uses_the_shared_field_mapping():
         "location_in_record": "char:1-2",
     }
     assert a._claim_fingerprint(digest_shape) == a._claim_fingerprint(graph_shape)
+
+
+def test_a_quote_is_only_emitted_where_the_source_may_be_reproduced(tmp_path):
+    """A verbatim sentence is a quotation from a public-domain report and
+    republication from a copyrighted book. 5,739 had been published from sources
+    that permit neither, one page carrying 62 consecutive from a single book."""
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / ("a" * 64 + ".v2.md")).write_text(
+        "---\ncopyright:\n  status: public_domain\nsource_type: pdf\n---\n\nbody\n"
+    )
+    (store / ("b" * 64 + ".v2.md")).write_text(
+        "---\ncopyright:\n  status: restricted\nsource_type: ebook\n---\n\nbody\n"
+    )
+    assert a._may_reproduce("a" * 64, tmp_path) is True
+    assert a._may_reproduce("b" * 64, tmp_path) is False
+
+
+def test_the_quote_gate_fails_closed(tmp_path):
+    """'We could not tell' is not a reason to publish someone's writing."""
+    assert a._may_reproduce("c" * 64, tmp_path) is False, "unknown record"
+    assert a._may_reproduce("a" * 64, None) is False, "no store to check against"
+    assert a._may_reproduce(None, tmp_path) is False, "no hash"
