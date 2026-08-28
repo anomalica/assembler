@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -501,7 +502,7 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
-def retarget_links(content_root: str, apply: bool) -> int:
+def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -> int:
     """Keep inspection_url only where the record page actually carries the claim.
 
     A record page is a SUMMARY - Mark's ruling - so it lists a fraction of the
@@ -534,7 +535,22 @@ def retarget_links(content_root: str, apply: bool) -> int:
             if isinstance(r, dict) and r.get("claim_id")
         }
 
-    kept = dropped = restored = 0
+    # Claims that still exist. Re-ingestion re-mints claim ids, so a page built
+    # before its source was re-digested cites ids the graph no longer holds -
+    # 649 of 9,326 published references, 6%, across 22 pages. Those get NO link:
+    # substituting the superseded record's new hash would open the right record
+    # and highlight nothing, which is worse than a missing link because it looks
+    # like it worked.
+    live_claims: set[str] = set()
+    if db_path and Path(db_path).is_file():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            live_claims = {str(r[0]) for r in conn.execute("SELECT id FROM claims")}
+            conn.close()
+        except sqlite3.Error:
+            live_claims = set()
+
+    kept = dropped = restored = orphaned = 0
     changed_files = 0
     for md in pages:
         text = md.read_text(encoding="utf-8")
@@ -553,6 +569,17 @@ def retarget_links(content_root: str, apply: bool) -> int:
             if not isinstance(r, dict):
                 continue
             claim_id = str(r.get("claim_id") or "")
+            # A claim that no longer exists cannot be shown anywhere. Strip both
+            # links and leave the reference text, which is still true.
+            if live_claims and claim_id and claim_id not in live_claims:
+                # Both pops must run: `a or b` short-circuits, so a reference
+                # carrying BOTH links would keep the workbench one.
+                had_inspection = r.pop("inspection_url", None) is not None
+                had_workbench = r.pop("workbench_url", None) is not None
+                if had_inspection or had_workbench:
+                    orphaned += 1
+                    touched = True
+                continue
             slug = _inspection_slug(r.get("inspection_url"))
             resolves = bool(slug and claim_id and claim_id in carries.get(slug, set()))
             if r.get("inspection_url"):
@@ -590,6 +617,10 @@ def retarget_links(content_root: str, apply: bool) -> int:
         file=sys.stderr,
     )
     print(f"  restored  {restored:6,}  a record page now carries it", file=sys.stderr)
+    print(
+        f"  orphaned  {orphaned:6,}  claim no longer in the graph - no link",
+        file=sys.stderr,
+    )
     print(f"  files     {changed_files:6,}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     if not apply:
@@ -816,7 +847,7 @@ def main() -> int:
         return report_spend(args.content_root, args.since)
 
     if args.retarget_links:
-        return retarget_links(args.content_root, args.apply)
+        return retarget_links(args.content_root, args.apply, args.db)
 
     nodes = _read_items(args, "nodes")
     records = _read_items(args, "records")

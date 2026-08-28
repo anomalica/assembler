@@ -1286,11 +1286,15 @@ def score_article(
             if dropped:
                 out["tag_findings"] = [f"outside the vocabulary: {dropped[:5]}"]
 
-    if claims is None:
+    # An EMPTY list is "no claims", not "claims provided and none matched". The
+    # date gate compares the body's dates against the source claims, so running
+    # it against nothing reports every date in the article as a fabrication -
+    # false failures that look exactly like real ones. Same for links.
+    if not claims:
         out["gates_skipped"].append("date_fidelity")
     else:
         out["date_findings"] = _check_date_fidelity(body, claims, related or [])
-    if related is None:
+    if not related:
         out["gates_skipped"].append("link_targets")
     else:
         out["link_findings"] = _check_link_targets(body, related)
