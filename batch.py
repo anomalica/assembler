@@ -564,6 +564,92 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+# Copyright statuses whose source text may be REPRODUCED on a public page.
+# Mark ruled on these directly ("yes, always"). Everything else - restricted,
+# licensed, and anything we cannot resolve - has its quote stripped.
+_QUOTABLE = ("public_domain", "publicly_accessible", "open_licence")
+
+
+def strip_restricted_quotes(content_root: str, ingests_root: str, apply: bool) -> int:
+    """Remove reproduced source text from references we may not redistribute.
+
+    A `quote` is the verbatim sentence a claim was drawn from. That is fine for a
+    public-domain report and it is redistribution for a copyrighted book - and
+    the published corpus carried 62 consecutive quotes from one book on a single
+    page. The brief pipeline has a working gate for exactly this; page references
+    are a different field written by a different component and predate it, so
+    nobody applied the rule there.
+
+    The REFERENCE stays - source, location, claim link, everything that makes the
+    citation checkable. Only the reproduced prose goes, so the page still says
+    where a fact came from and a reader can still follow it.
+
+    FAILS CLOSED: a reference whose status cannot be resolved loses its quote.
+    "We could not tell" is not a reason to publish someone's writing.
+    """
+    root = Path(content_root).expanduser()
+    ing = Path(ingests_root).expanduser()
+    status_cache: dict[str, str] = {}
+
+    def status_of(record_hash: object) -> str:
+        if not isinstance(record_hash, str) or not record_hash:
+            return "unresolved"
+        if record_hash not in status_cache:
+            meta = asm.load_ingest_meta(ing, record_hash) or {}
+            status_cache[record_hash] = meta.get("status") or "unresolved"
+        return status_cache[record_hash]
+
+    kept: dict[str, int] = {}
+    dropped: dict[str, int] = {}
+    changed_files = 0
+    for md in sorted(root.glob("pages/*/*.en.md")):
+        text = md.read_text(encoding="utf-8")
+        m = re.match(r"^(---\n)(.*?)(\n---\n)(.*)$", text, re.S)
+        if not m:
+            continue
+        try:
+            fm = yaml.safe_load(m.group(2)) or {}
+        except yaml.YAMLError:
+            continue
+        refs = fm.get("references")
+        if not isinstance(refs, list):
+            continue
+        touched = False
+        for r in refs:
+            if not isinstance(r, dict) or not r.get("quote"):
+                continue
+            st = status_of(r.get("record_hash"))
+            if st in _QUOTABLE:
+                kept[st] = kept.get(st, 0) + 1
+            else:
+                r.pop("quote")
+                dropped[st] = dropped.get(st, 0) + 1
+                touched = True
+        if touched:
+            changed_files += 1
+            if apply:
+                fm["references"] = refs
+                md.write_text(
+                    "---\n"
+                    + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+                    + "\n---\n"
+                    + m.group(4)
+                )
+
+    verb = "STRIPPED" if apply else "would strip"
+    print("=" * 60, file=sys.stderr)
+    print(f"RESTRICTED-QUOTE STRIP ({verb})", file=sys.stderr)
+    for st, n in sorted(dropped.items(), key=lambda x: -x[1]):
+        print(f"  dropped {n:6,}  {st}", file=sys.stderr)
+    for st, n in sorted(kept.items(), key=lambda x: -x[1]):
+        print(f"  kept    {n:6,}  {st}", file=sys.stderr)
+    print(f"  files   {changed_files:6,}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    if not apply:
+        print("Dry run - pass --apply to write.", file=sys.stderr)
+    return 0
+
+
 def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -> int:
     """Keep inspection_url only where the record page actually carries the claim.
 
@@ -873,6 +959,13 @@ def main() -> int:
         "this only sets how many lanes run; per-item behaviour is unchanged.",
     )
     ap.add_argument(
+        "--strip-restricted-quotes",
+        action="store_true",
+        help="Remove the verbatim `quote` from any reference whose source may not "
+        "be redistributed (restricted, licensed, or unresolvable). Keeps the "
+        "reference itself. Idempotent; run after every build.",
+    )
+    ap.add_argument(
         "--retarget-links",
         action="store_true",
         help="Keep inspection_url only where the record page carries that claim; "
@@ -948,6 +1041,9 @@ def main() -> int:
 
     if args.report_spend:
         return report_spend(args.content_root, args.since)
+
+    if args.strip_restricted_quotes:
+        return strip_restricted_quotes(args.content_root, args.ingests_root, args.apply)
 
     if args.retarget_links:
         return retarget_links(args.content_root, args.apply, args.db)
