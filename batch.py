@@ -29,6 +29,16 @@ Built to be left alone for days. Two things follow from that:
 
 The run ends with a Hugo build, so a page that breaks the site surfaces now
 rather than whenever someone next builds.
+
+AFTER ANY RUN THAT ADDS OR REBUILDS PAGES, re-target the reference links:
+
+  python batch.py --retarget-links --content-root ../content --apply
+
+A record page is a summary and carries a fraction of the claims an entity page
+cites from the same source, so a reference must point at whichever surface
+actually holds its claim. The pass is idempotent and works in BOTH directions -
+new record pages promote links back from the workbench - so it is safe and worth
+running every time rather than only when something looks wrong.
 """
 
 from __future__ import annotations
