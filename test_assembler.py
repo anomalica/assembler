@@ -516,3 +516,69 @@ def test_vocabularies_are_lowercase_and_unique():
     for node_type, vocab in a.TAG_VOCABULARY.items():
         assert len(set(vocab)) == len(vocab), f"{node_type} has a duplicate"
         assert all(v == v.lower() for v in vocab), f"{node_type} has a capital"
+
+
+GOOD_ARTICLE = (
+    "---\ntitle: David Fravor\ntags:\n- pilot\ndescription: d\n"
+    "references:\n- text: a\n- text: b\n---\n\nX.<sup>1</sup> Y.<sup>2</sup>\n"
+)
+
+
+def test_score_article_passes_a_clean_article():
+    r = a.score_article(GOOD_ARTICLE, claims=[], related=[], node_type="person")
+    assert r["ok"] and r["structure_ok"]
+    assert r["reference_count"] == 2
+
+
+def test_score_article_reports_skipped_gates_rather_than_passing_them():
+    """A missing input must never look like a clean score - a comparison harness
+    would read it as the model doing well."""
+    r = a.score_article(GOOD_ARTICLE, node_type="person")
+    assert set(r["gates_skipped"]) == {"date_fidelity", "link_targets"}
+
+
+def test_score_article_catches_a_dangling_citation():
+    bad = (
+        "---\ntitle: X\ndescription: d\nreferences:\n- text: a\n---\n\nY.<sup>9</sup>\n"
+    )
+    r = a.score_article(bad, claims=[], related=[], node_type="person")
+    assert not r["ok"] and r["citation_findings"]
+
+
+def test_score_article_catches_an_uncited_reference():
+    art = (
+        "---\ntitle: X\ndescription: d\nreferences:\n- text: a\n- text: b\n---\n\n"
+        "Y.<sup>1</sup>\n"
+    )
+    r = a.score_article(art, claims=[], related=[], node_type="person")
+    assert not r["ok"] and "never cited" in r["citation_findings"][0]
+
+
+def test_score_article_catches_a_corrupted_name_and_a_bad_tag():
+    art = (
+        "---\ntitle: Unidentified Aerial Phenomena (UAP) Gerb\ntags:\n- pilot\n"
+        "- made up\ndescription: d\nreferences:\n- text: a\n---\n\nY.<sup>1</sup>\n"
+    )
+    r = a.score_article(art, claims=[], related=[], node_type="person")
+    assert r["name_findings"] and r["tag_findings"] and not r["ok"]
+
+
+def test_score_article_never_rewrites_its_input():
+    before = GOOD_ARTICLE
+    a.score_article(GOOD_ARTICLE, claims=[], related=[], node_type="person")
+    assert GOOD_ARTICLE == before, "scoring must measure, never repair"
+
+
+def test_source_display_is_driven_by_copyright_and_fails_closed():
+    assert a.source_display_mode("public_domain", "pdf") == "text"
+    assert a.source_display_mode("public_domain", "video") == "embed"
+    assert a.source_display_mode("publicly_accessible", "video") == "embed"
+    # Publicly reachable is NOT redistributable - link, never reproduce.
+    assert a.source_display_mode("publicly_accessible", "pdf") == "link"
+    assert a.source_display_mode("restricted", "video") == "none"
+    assert a.source_display_mode(None, "video") == "none", "unknown fails closed"
+
+
+def test_a_record_summary_is_shorter_than_a_biography():
+    assert "300-400 words" in a.format_length_block("source")
+    assert "3-6 paragraphs" in a.format_length_block("person")

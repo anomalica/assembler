@@ -951,7 +951,7 @@ references:
   - <one entry per cited claim>
 ---
 
-<body prose, 3-6 paragraphs of British English, with inline citations as <sup>N</sup> matching the references list. Use ISO dates (2004-11-14). Don't invent any facts - every assertion must trace back to a CLAIM in the data below. Use the SAFE acronyms bare (UFO, UAP, CIA, FBI, NSA, NASA, DOD, FAA, NATO, UN, EU, US, USA, UK, USSR, GPS); expand domain acronyms on first use (Anomalous Aerial Vehicle (AAV), forward-looking infrared (FLIR), Advanced Aerospace Threat Identification Program (AATIP)).
+<body prose, {length_block} with inline citations as <sup>N</sup> matching the references list. Use ISO dates (2004-11-14). Don't invent any facts - every assertion must trace back to a CLAIM in the data below. Use the SAFE acronyms bare (UFO, UAP, CIA, FBI, NSA, NASA, DOD, FAA, NATO, UN, EU, US, USA, UK, USSR, GPS); expand domain acronyms on first use (Anomalous Aerial Vehicle (AAV), forward-looking infrared (FLIR), Advanced Aerospace Threat Identification Program (AATIP)).
 
 Within the body, link entities using markdown links of the form [Display Name](/<section>/<slug>), taking the slug verbatim from the LINKABLE ENTITIES list above. Link EVERY entity from that list the first time you mention it in the body - over-link rather than under-link. The site automatically removes any link whose target page does not yet exist, so a link that turns out dead costs nothing, but a missing link loses a real connection - so when in doubt, link it. For example: [2004 USS Nimitz encounter](/events/2004-uss-nimitz-encounter), [Strike Fighter Squadron 41 (VFA-41)](/organisations/strike-fighter-squadron-41-vfa-41). Use bare language-agnostic paths (no /en/ prefix); the site adds the language prefix at render time. Use ONLY slugs from the LINKABLE ENTITIES list - never invent or guess a slug for an entity not in the list (a guessed slug is silently dropped, losing the link). Use plain markdown links only, never raw HTML anchors.
 
@@ -1189,6 +1189,120 @@ def format_tags_block(node_type: str | None) -> str:
     )
 
 
+def format_length_block(node_type: str | None) -> str:
+    """How long the body should be. A RECORD page is not a biography.
+
+    Measured across the record pages built so far: median 901 body words, max
+    1,948, against ~1,200 for a full entity page. A summary of one source was
+    running nearly as long as a whole biography of a person, and for a source we
+    are allowed to SHOW - a public-domain transcript - it was paraphrasing a
+    document the reader can simply read.
+    """
+    if node_type == "source":
+        return (
+            "300-400 words in 2-3 tight paragraphs of British English, answering "
+            'only "what is in this source and why does it matter". The page shows '
+            "the source ITSELF below this summary wherever rights allow, so "
+            "summarise it - do not retell it,"
+        )
+    return "3-6 paragraphs of British English,"
+
+
+def score_article(
+    text: str,
+    claims: list[dict] | None = None,
+    related: list[dict] | None = None,
+    node_type: str | None = None,
+) -> dict:
+    """Objective quality gates over one generated article. STABLE ENTRY POINT.
+
+    Public and stable on purpose: these gates are the only objective prose scores
+    the project has, and a comparison harness calling the private helpers directly
+    would break silently the next time one is renamed. Everything here is a
+    measurement, never a rewrite - it reports, it does not repair.
+
+    `claims` and `related` are the same lists the article was generated from;
+    without them the date and link gates cannot run and are reported as skipped
+    rather than as passes, so a missing input can never look like a clean score.
+
+    Returns per-gate findings plus `ok`, true only when every gate that RAN
+    passed. A caller comparing models should also compare `gates_skipped`, since
+    a model that emits no links trivially cannot fail the link gate.
+    """
+    out: dict = {
+        "ok": False,
+        "structure_ok": False,
+        "structure_error": None,
+        "gates_skipped": [],
+        "date_findings": [],
+        "link_findings": [],
+        "citation_findings": [],
+        "name_findings": [],
+        "tag_findings": [],
+        "body_words": 0,
+        "reference_count": 0,
+    }
+    try:
+        fm, body = validate_article(text)
+    except ValueError as exc:
+        out["structure_error"] = str(exc)
+        # validate_article folds the in-range citation check into structure, so a
+        # dangling citation surfaces here rather than in citation_findings.
+        if "pointing at nothing" in str(exc):
+            out["citation_findings"] = [str(exc)]
+        return out
+
+    out["structure_ok"] = True
+    refs = fm.get("references") or []
+    out["reference_count"] = len(refs)
+    out["body_words"] = len(body.split())
+
+    cited = {
+        int(n)
+        for group in re.findall(r"<sup>([\d,\s]+)</sup>", body)
+        for n in re.findall(r"\d+", group)
+    }
+    uncited = [i for i in range(1, len(refs) + 1) if i not in cited]
+    if uncited:
+        out["citation_findings"] = [
+            f"{len(uncited)} reference(s) never cited in the body: {uncited[:8]}"
+        ]
+
+    title = fm.get("title")
+    reason = suspect_entity_name(title, node_type)
+    if reason:
+        out["name_findings"] = [f"{title!r}: {reason}"]
+
+    if node_type and allowed_tags(node_type):
+        raw = fm.get("tags")
+        if isinstance(raw, list):
+            kept = set(filter_tags(raw, node_type))
+            dropped = [t for t in raw if str(t).strip().lower() not in kept]
+            if dropped:
+                out["tag_findings"] = [f"outside the vocabulary: {dropped[:5]}"]
+
+    if claims is None:
+        out["gates_skipped"].append("date_fidelity")
+    else:
+        out["date_findings"] = _check_date_fidelity(body, claims, related or [])
+    if related is None:
+        out["gates_skipped"].append("link_targets")
+    else:
+        out["link_findings"] = _check_link_targets(body, related)
+
+    out["ok"] = not any(
+        out[k]
+        for k in (
+            "date_findings",
+            "link_findings",
+            "citation_findings",
+            "name_findings",
+            "tag_findings",
+        )
+    )
+    return out
+
+
 def build_prompt(
     node: dict,
     claims: list[dict],
@@ -1201,6 +1315,7 @@ def build_prompt(
         node_type=node["type"],
         related_block=format_related_block(related),
         tags_block=format_tags_block(node.get("type")),
+        length_block=format_length_block(node.get("type")),
         claims_block=claims_block,
         directives_block=format_directives_block(directives or []),
     )
@@ -2333,12 +2448,81 @@ def render_article(
     )
 
 
+# How a record page may present its own source, decided by the copyright status
+# the access gate already runs on. The statuses are not synonyms and the
+# distinction is the whole point:
+#
+#   public_domain        no rights to respect - the text itself can be shown.
+#   publicly_accessible  freely reachable AT ITS SOURCE. That permits pointing at
+#                        it, and permits the publisher's own embed (a YouTube
+#                        player is the publisher serving their video, not us
+#                        redistributing it). It does NOT permit reproducing the
+#                        document text here - that would widen the access model,
+#                        which needs Mark's sign-off and is not mine to take.
+#   restricted           summary and claims only.
+#
+# Emitted as data rather than markup: the assembler owns the copyright decision
+# because it is the only component reading the trustworthy field, and the site
+# owns how an embed looks.
+_EMBEDDABLE_MEDIA = ("video", "audio")
+
+
+def source_display_mode(status: str | None, source_type: str | None) -> str:
+    """'embed' | 'text' | 'link' | 'none' - what this page may show of its source."""
+    st = (source_type or "").lower()
+    if status == "public_domain":
+        return "embed" if st in _EMBEDDABLE_MEDIA else "text"
+    if status in ("publicly_accessible", "open_licence"):
+        return "embed" if st in _EMBEDDABLE_MEDIA else "link"
+    return "none"
+
+
+def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dict:
+    """Copyright status and source pointer for a record, from its ingest.
+
+    The digest does not carry copyright - only the ingest does, and it is the
+    field the access gate itself runs on, so it is the one to trust.
+    """
+    if not ingests_root or not content_hash:
+        return {}
+    full = content_hash.split(":", 1)[-1]
+    # Store filenames carry a schema suffix ({hash}.v2.md), and it changes with
+    # the record schema, so match on the hash rather than assuming the tail.
+    store = Path(ingests_root) / "store"
+    candidates = sorted(store.glob(f"{full}*.md")) if store.is_dir() else []
+    path = next(
+        (c for c in candidates if not c.name.endswith(".verification.json")), None
+    )
+    if path is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+        m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        fm = yaml.safe_load(m.group(1)) if m else None
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(fm, dict):
+        return {}
+    status = (fm.get("copyright") or {}).get("status")
+    source_type = fm.get("source_type")
+    out = {
+        "status": status,
+        "type": source_type,
+        "display": source_display_mode(status, source_type),
+    }
+    for key in ("source_url", "publisher", "date_published", "duration"):
+        if fm.get(key):
+            out[key.replace("source_", "")] = fm[key]
+    return out
+
+
 def render_record_page(
     article_fm: dict,
     body: str,
     metadata: dict,
     record_hash: str | None,
     ai_usage: list | None = None,
+    source: dict | None = None,
 ) -> str:
     """The public /records/ inspection page: the model's article (title,
     description, references, body) + source metadata + a record_hash the site
@@ -2353,6 +2537,11 @@ def render_record_page(
     }
     if record_hash:
         frontmatter["record_hash"] = record_hash
+    # What this page may show of its own source, decided here because this is the
+    # only component that reads the copyright status. `display` is the decision;
+    # the site owns how an embed or a document render looks.
+    if source:
+        frontmatter["source"] = source
     frontmatter["references"] = article_fm.get("references", [])
     if ai_usage:
         frontmatter["ai_usage"] = _clean_ai_usage(ai_usage)
@@ -2623,6 +2812,13 @@ def main() -> int:
         help="Call Claude and print the article to stdout, do not write file",
     )
     ap.add_argument(
+        "--ingests-root",
+        default=os.environ.get("ANOMALICA_INGESTS_ROOT", "../ingests"),
+        help="ingests repo, for a record page's copyright status and source "
+        "pointer - the digest does not carry them and the access gate runs on "
+        "the ingest's field, so it is the one to trust",
+    )
+    ap.add_argument(
         "--link-index-cache",
         help="Reuse the body-link index across invocations via this file, keyed on "
         "every brief and page mtime. Rebuilding it costs ~51s and a batch pays that "
@@ -2830,6 +3026,10 @@ def main() -> int:
         fm = _augment_references(fm, claims, content_root)
         rec = digest.get("record") or {}
         record_hash = _public_hash(rec.get("content_hash"))
+        source_meta = load_ingest_meta(
+            Path(args.ingests_root) if args.ingests_root else None,
+            (digest.get("record") or {}).get("content_hash"),
+        )
         article = render_record_page(
             fm,
             body,
@@ -2838,6 +3038,7 @@ def main() -> int:
             ai_usage=None
             if record_hash
             else accumulate(digest.get("ai_usage") or [], assemble_entry),
+            source=source_meta,
         )
     elif brief is not None:
         article = render_article(
