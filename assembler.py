@@ -3089,7 +3089,11 @@ def main() -> int:
     # global ANOMALICA_USE_API, and this component resolves ASSEMBLER_USE_API.
     # An OpenRouter model is metered too, so the gate must fire for it - the
     # toggle alone would let a provider-qualified model spend unchecked.
-    if _use_api() or is_openrouter_model(args.model):
+    # NOT for --dry-run, which prints the prompt and calls nothing. Refusing it
+    # as "this run spends real money" is false, and it made the only way to check
+    # that a slug resolves to the right digest be to authorise real spend - which
+    # is exactly backwards for a flag whose purpose is checking without paying.
+    if (_use_api() or is_openrouter_model(args.model)) and not args.dry_run:
         from anomalica_common.llm import spend_confirmed
 
         if not spend_confirmed(
@@ -3098,6 +3102,7 @@ def main() -> int:
             confirm=args.confirm_spend,
             echo=lambda m: print(m, file=sys.stderr),
             use_api=True,
+            flag="--confirm-spend",
         ):
             return 2
 

@@ -726,3 +726,35 @@ def test_the_ingest_lookup_searches_both_store_roots(tmp_path):
     assert top.get("status") == "public_domain"
     assert old.get("status") == "licensed", "store/v1 must resolve"
     assert old.get("effective_status") == "restricted", "no licence evidence"
+
+
+def test_dry_run_is_not_a_spend(monkeypatch):
+    """--dry-run prints the prompt and calls nothing, so refusing it as a metered
+    run is false - and it made the only way to check that a slug resolves to the
+    right digest be to authorise real spend, which is backwards for a flag whose
+    purpose is checking without paying."""
+    import inspect
+
+    src = inspect.getsource(a.main)
+    gate = src.index("spend_confirmed(")
+    guard = src.rindex("not args.dry_run", 0, gate)
+    assert guard < gate, "the spend gate must not fire on a dry run"
+
+
+def test_the_refusal_names_this_component_s_flag():
+    """The shared message hardcoded --confirm; this component's flag is
+    --confirm-spend, so the instruction sent the reader to an argparse error at
+    the moment they were trying to authorise correctly."""
+    from anomalica_common.llm import spend_confirmed
+
+    out = []
+    spend_confirmed(
+        a._estimate_article_cost("openai/gpt-5.6-luna"),
+        "openai/gpt-5.6-luna",
+        confirm=False,
+        echo=out.append,
+        use_api=True,
+        flag="--confirm-spend",
+    )
+    assert any("--confirm-spend" in line for line in out)
+    assert not any("with --confirm " in line for line in out)
