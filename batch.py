@@ -210,6 +210,22 @@ def openrouter_budget_remaining() -> tuple[float, float] | None:
     "what will this cost" and never "what is left", which is how a four-model run
     got three 403s halfway through rather than a refusal up front.
     """
+    # The SCHEDULER's reading first: it owns dispatch and therefore owns "how much
+    # of today's pool is left". Reading its value rather than the provider's keeps
+    # one number across every component instead of each computing its own.
+    try:
+        with urllib.request.urlopen(
+            os.environ.get(
+                "ANOMALICA_BUDGET_URL", "http://127.0.0.1:8001/api/budget/openrouter"
+            ),
+            timeout=5,
+        ) as resp:
+            d = json.loads(resp.read().decode()) or {}
+        if d.get("ok") and d.get("budgetUsd") is not None:
+            return float(d.get("usedUsd") or 0.0), float(d["budgetUsd"])
+    except (OSError, ValueError):
+        pass  # scheduler down: fall through to the provider
+
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
         return None
