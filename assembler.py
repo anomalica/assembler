@@ -1568,6 +1568,7 @@ def _estimate_article_cost(
     usd = in_tok / 1e6 * in_price + out_tok / 1e6 * out_price
     return {
         "items": 1,
+        "source_chars": prompt_chars,
         "est_input_tokens": in_tok,
         "est_output_tokens": out_tok,
         "usd": usd,
