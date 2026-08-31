@@ -2457,22 +2457,6 @@ def _claim_fingerprint(claim: dict) -> str | None:
         return None
 
 
-# Copyright statuses whose source text may be reproduced on a public page.
-# Mark's ruling, 2026-08-28: public_domain and publicly_accessible, "yes,
-# always". Everything else - restricted, licensed, unresolvable - is cited but
-# not quoted.
-_MAY_REPRODUCE = ("public_domain", "publicly_accessible", "open_licence")
-
-
-def _may_reproduce(content_hash: object, ingests_root: Path | None) -> bool:
-    """Whether this record's own text may appear on a public page. Fails closed."""
-    if not isinstance(content_hash, str) or ingests_root is None:
-        return False
-    return (load_ingest_meta(ingests_root, content_hash) or {}).get(
-        "status"
-    ) in _MAY_REPRODUCE
-
-
 def _augment_references(
     frontmatter: dict,
     claims: list[dict],
@@ -2528,16 +2512,23 @@ def _augment_references(
             c = by_source_loc.get((r.get("source") or "", r.get("location") or ""))
 
         if c:
-            # The verbatim source sentence. Emitted ONLY where the source may be
-            # redistributed - it is a quotation from a public-domain report and
-            # it is republication from a copyrighted book, and the difference is
-            # the copyright status rather than the length. A cleanup pass alone
-            # would not hold: the next build of a restricted source puts them
-            # straight back, so the rule belongs where the field is written.
-            # Fails closed - an unresolvable status emits nothing.
-            if c.get("original_excerpt") and _may_reproduce(
-                c.get("record_content_hash"), ingests_root or _INGESTS_ROOT
-            ):
+            # The verbatim source sentence, emitted REGARDLESS of the source's
+            # copyright status. A short attributed quotation beside the claim it
+            # supports is ordinary citation, protected by Japan's Copyright Act
+            # Article 32 with Article 48 attribution, and the project's quotation
+            # policy is explicit that such quotes "are published in full... and
+            # are NOT capped, truncated to a length limit, or gated".
+            #
+            # This was briefly gated on copyright status, by reasoning from the
+            # SOURCE-ACCESS table to an artefact that table does not cover. It
+            # stripped 5,449 quotes at a measured median of 26 words. The harm is
+            # not only legal over-caution: a claim with no quote beside it looks
+            # unevidenced, so suppressing them publishes a false statement about
+            # our own evidence, at scale.
+            #
+            # Quote is not body. Nothing here un-gates a full body or transcript;
+            # that gating lives in source_display_mode and is unchanged.
+            if c.get("original_excerpt"):
                 out.setdefault("quote", c["original_excerpt"])
             cid = c.get("id")
             ph = _public_hash(c.get("record_content_hash"))

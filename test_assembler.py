@@ -671,27 +671,41 @@ def test_fingerprint_uses_the_shared_field_mapping():
     assert a._claim_fingerprint(digest_shape) == a._claim_fingerprint(graph_shape)
 
 
-def test_a_quote_is_only_emitted_where_the_source_may_be_reproduced(tmp_path):
-    """A verbatim sentence is a quotation from a public-domain report and
-    republication from a copyrighted book. 5,739 had been published from sources
-    that permit neither, one page carrying 62 consecutive from a single book."""
-    store = tmp_path / "store"
-    store.mkdir()
-    (store / ("a" * 64 + ".v2.md")).write_text(
-        "---\ncopyright:\n  status: public_domain\nsource_type: pdf\n---\n\nbody\n"
+def test_a_restricted_source_still_carries_its_quote():
+    """A short attributed quotation beside the claim it supports is ordinary
+    citation, and the project's quotation policy is explicit that such quotes
+    "are published in full... and are NOT capped, truncated to a length limit, or
+    gated". This was briefly gated on copyright status, stripping 5,449 quotes at
+    a measured median of 26 words.
+
+    The harm was not only legal over-caution: a claim with no quote beside it
+    looks unevidenced, so suppressing them publishes a false statement about our
+    own evidence. This test exists so that re-imposing the gate breaks a test
+    rather than shipping.
+    """
+    claims = [
+        {
+            "id": "c1",
+            "content": "The object accelerated away.",
+            "original_excerpt": "it just accelerated away",
+            "record_content_hash": "d" * 64,
+            "record_title": "A Copyrighted Book",
+        }
+    ]
+    fm = {"references": [{"text": "The object accelerated away.", "claim_index": 1}]}
+    out = a._augment_references(fm, claims, None, None)
+    ref = out["references"][0]
+    assert ref["quote"] == "it just accelerated away", (
+        "a quote must be emitted whatever the source's copyright status"
     )
-    (store / ("b" * 64 + ".v2.md")).write_text(
-        "---\ncopyright:\n  status: restricted\nsource_type: ebook\n---\n\nbody\n"
-    )
-    assert a._may_reproduce("a" * 64, tmp_path) is True
-    assert a._may_reproduce("b" * 64, tmp_path) is False
 
 
-def test_the_quote_gate_fails_closed(tmp_path):
-    """'We could not tell' is not a reason to publish someone's writing."""
-    assert a._may_reproduce("c" * 64, tmp_path) is False, "unknown record"
-    assert a._may_reproduce("a" * 64, None) is False, "no store to check against"
-    assert a._may_reproduce(None, tmp_path) is False, "no hash"
+def test_quote_is_not_body():
+    """Nothing about quotes un-gates a full body or transcript. The
+    source-display rule is separate and still fails closed."""
+    assert a.source_display_mode("restricted", "pdf") == "none"
+    assert a.source_display_mode(None, "video") == "none"
+    assert a.source_display_mode("public_domain", "pdf") == "text"
 
 
 def test_licensed_without_evidence_is_treated_as_restricted():
