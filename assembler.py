@@ -1195,20 +1195,36 @@ def format_tags_block(node_type: str | None) -> str:
 
 
 def format_length_block(node_type: str | None) -> str:
-    """How long the body should be. A RECORD page is not a biography.
+    """How long the body should be, and for a record page, what shape.
 
-    Measured across the record pages built so far: median 901 body words, max
-    1,948, against ~1,200 for a full entity page. A summary of one source was
-    running nearly as long as a whole biography of a person, and for a source we
-    are allowed to SHOW - a public-domain transcript - it was paraphrasing a
-    document the reader can simply read.
+    A RECORD page opens with a summary and then covers the source properly -
+    Mark's shape, and deliberately NOT a word ceiling. A 300-400 word cap stood
+    here briefly and cost half the quoted evidence on every long page: rebuilt
+    records fell from 45 references to 22, because the ceiling bound before the
+    material ran out.
+
+    The observation behind the cap was real - record pages were running a median
+    901 body words, nearly as long as a whole biography, and for a source we are
+    allowed to SHOW they were paraphrasing a document the reader can just read.
+    But "do not waffle" is a far weaker claim than a number, and a ceiling makes
+    the page choose for the reader. Summary-first lets the reader choose: the
+    gist is the first paragraph, the detail is below it.
+
+    Note the site already renders `description` above the body, so a record page
+    carries two levels of summary - one line in the furniture, one paragraph in
+    the prose - and neither needed a new field.
     """
     if node_type == "source":
         return (
-            "300-400 words in 2-3 tight paragraphs of British English, answering "
-            'only "what is in this source and why does it matter". The page shows '
-            "the source ITSELF below this summary wherever rights allow, so "
-            "summarise it - do not retell it,"
+            "British English. OPEN with a short summary - two or three sentences "
+            "saying what this source is and why it matters - as its own first "
+            "paragraph, so a reader wanting only the gist can stop there. Then "
+            "cover the source PROPERLY below it: what it contains, what it "
+            "claims, what is notable in it, citing as many distinct claims as the "
+            "material supports. There is NO word limit and no target length - be "
+            "as long as the source needs and no longer. Do not pad, do not repeat "
+            "the summary in the body, and do not retell a document the page "
+            "already displays,"
         )
     # An ENTITY page had no length or coverage instruction at all, so each model
     # wrote to its own inclination: 1,326 words and 55 references from one, 292
@@ -1523,14 +1539,15 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
 # ceilings rather than means by design (see batch.py's own notes).
 FIXED_INPUT_TOKENS = 34_400
 EST_OUTPUT_TOKENS = 32_000
-# A RECORD page is capped at 300-400 words by its own prompt, so it cannot
-# produce the reference-heavy output an unconstrained entity page can. Measured
-# across five real record builds: median 3,545 output tokens, max 4,250. The
-# 32,000 ceiling is nine times that, and a gate that over-states by an order of
-# magnitude gets argued with instead of obeyed - which is worse than one that is
-# slightly tight. Kept at roughly 2x the observed maximum, so it is still a
-# ceiling and still errs high.
-EST_OUTPUT_TOKENS_RECORD = 8_000
+# A RECORD page is shorter than an entity page but no longer capped, so this sits
+# between the two. Measured under the old 300-400 word cap: median 3,545 output
+# tokens, max 4,250. Removing the cap restores the fuller body those pages had
+# before - roughly 900 words and 45 references, which is about 2.5x the capped
+# reference count - so the old 8,000 would now understate. Set to 16,000: above
+# any plausible record page, still half the entity ceiling.
+# The estimate must never come in UNDER the spend, and a cap changing is exactly
+# the kind of thing that quietly invalidates a constant fitted before it.
+EST_OUTPUT_TOKENS_RECORD = 16_000
 CHARS_PER_TOKEN = 2.6
 
 

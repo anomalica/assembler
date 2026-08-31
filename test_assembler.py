@@ -579,18 +579,18 @@ def test_source_display_is_driven_by_copyright_and_fails_closed():
     assert a.source_display_mode(None, "video") == "none", "unknown fails closed"
 
 
-def test_a_record_summary_is_shorter_than_a_biography():
-    """Assert the INTENT, not the wording - the entity instruction has already
-    been rewritten once and a test pinned to its phrasing broke without the
-    behaviour changing."""
-    import re
+def test_a_record_page_opens_with_a_summary_and_has_no_word_ceiling():
+    """Mark replaced the 300-400 word cap with summary-then-body. The cap cost
+    half the quoted evidence on every long page - rebuilt records fell from 45
+    references to 22 - because it bound before the material ran out.
 
-    def target(node_type):
-        text = a.format_length_block(node_type)
-        return max(int(n.replace(",", "")) for n in re.findall(r"[\d,]{3,}", text))
-
-    assert target("source") < target("person")
-    assert target("source") <= 400, "a record page is a summary"
+    A ceiling makes the page choose for the reader; summary-first lets the reader
+    choose. This asserts both halves so re-imposing a cap breaks a test.
+    """
+    text = a.format_length_block("source").lower()
+    assert "summary" in text and "first paragraph" in text
+    assert "no word limit" in text
+    assert "300-400" not in text and "300 to 400" not in text
 
 
 def test_the_entity_instruction_asks_for_citation_breadth():
