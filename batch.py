@@ -747,6 +747,162 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
     return 0
 
 
+def _brief_page_block(brief: Path) -> dict:
+    """The `page:` mapping from a brief, read without parsing the whole file.
+
+    A brief carries every claim behind its article and runs to thousands of
+    lines, but the block naming the node sits in the first few. Parsing all 749
+    in full costs a minute; stopping at the end of the block makes the check
+    cheap enough to run on every batch, which is the only reason it gets run.
+    """
+    lines: list[str] = []
+    try:
+        with brief.open() as fh:
+            for line in fh:
+                if lines:
+                    # a new top-level key ends the block
+                    if line[:1] not in (" ", "\t", "\n", "#"):
+                        break
+                    lines.append(line)
+                elif line.startswith("page:"):
+                    lines.append(line)
+    except OSError:
+        return {}
+    if not lines:
+        return {}
+    try:
+        return (yaml.safe_load("".join(lines)) or {}).get("page") or {}
+    except yaml.YAMLError:
+        return {}
+
+
+def _merge_survivor(conn, node_id: str) -> str | None:
+    """The live node a retired one was merged into, or None.
+
+    Follows the chain: 354 of the recorded merges name a survivor that has since
+    been merged away itself, so the row against this node is often not the end of
+    the trail. Reads node_merges rather than comparing names - a name heuristic
+    scored "Roswell UAP Crash" closer to an unrelated 1948 crash sharing the
+    words "UAP" and "crash" than to its actual survivor "Roswell incident
+    (1947)", and a confidently wrong survivor is worse here than none: it invites
+    pointing the redirect at the wrong article.
+    """
+    seen = {node_id}
+    current = node_id
+    while True:
+        row = conn.execute(
+            "SELECT m.survivor_id, n.retired_at FROM node_merges m "
+            "JOIN nodes n ON n.id = m.survivor_id "
+            "WHERE m.victim_id = ? AND m.undone_at IS NULL",
+            (current,),
+        ).fetchone()
+        if row is None:
+            return None
+        survivor, retired = row
+        if not retired:
+            return survivor
+        if survivor in seen:  # a cycle would otherwise spin here forever
+            return None
+        seen.add(survivor)
+        current = survivor
+
+
+def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
+    """Report published pages whose node has been retired from the graph.
+
+    Nothing in the pipeline removes an artefact when its node retires, so a merge
+    leaves the losing side's page and brief published and serving. The Roswell
+    duplicate was caught by a human and the doubly-expanded AAV topic by an
+    ad-hoc sweep; both were found by accident rather than by the system noticing.
+    Run here because a check that runs on every batch beats a propagation step
+    somebody has to remember, even though the root fix belongs upstream.
+
+    Reports and never prunes. Removing the page is only safe once the URL
+    redirects to the survivor, and this cannot know whether the site has that
+    entry - pruning first would turn a wrong page into a silent 404.
+    """
+    root = Path(content_root).expanduser()
+    briefs = Path(briefs_root).expanduser()
+    if not briefs.is_dir():
+        print(f"briefs dir not found: {briefs}", file=sys.stderr)
+        return 2
+
+    conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True)
+    rows = conn.execute("SELECT id, node_type, name, retired_at FROM nodes").fetchall()
+    by_id = {r[0]: r for r in rows}
+    [r for r in rows if not r[3]]
+    claims = dict(
+        conn.execute("SELECT node_id, count(*) FROM claim_node_refs GROUP BY node_id")
+    )
+
+    stale: list[tuple] = []
+    for brief in sorted(briefs.glob("*.yaml")):
+        page = _brief_page_block(brief)
+        if not page:
+            continue
+        node_id = page.get("node_id")
+        row = by_id.get(node_id)
+        if row is not None and not row[3]:
+            continue  # node is live - nothing to say
+        section = asm.SECTION_BY_TYPE.get(
+            page.get("node_type"), f"{page.get('node_type')}s"
+        )
+        md = root / "pages" / section / f"{page.get('slug')}.en.md"
+        if not md.is_file():
+            continue  # brief alone is harmless; only a PUBLISHED page misleads
+
+        survivor = None
+        if row is not None:
+            survivor = by_id.get(_merge_survivor(conn, node_id))
+        stale.append((md, brief, row, claims.get(node_id, 0), survivor))
+
+    if not stale:
+        print(
+            f"no stale pages: every published page maps to a live node ({len(rows)} nodes)"
+        )
+        return 0
+
+    print(
+        f"STALE PAGE: {len(stale)} published page(s) built from a node that is no "
+        "longer live. Each is serving as though it were current.",
+        file=sys.stderr,
+    )
+    for md, brief, row, held, survivor in stale:
+        url = "/" + md.as_posix().split("pages/", 1)[1].replace(".en.md", "/")
+        print(f"\n  {url}", file=sys.stderr)
+        if row is None:
+            print("      node   : GONE from the graph entirely", file=sys.stderr)
+        else:
+            print(
+                f"      node   : {row[2][:64]!r}\n"
+                f"      retired: {row[3]}   claims now: {held}",
+                file=sys.stderr,
+            )
+        if survivor is not None:
+            sec = asm.SECTION_BY_TYPE.get(survivor[1], f"{survivor[1]}s")
+            spage = root / "pages" / sec / f"{asm.slugify(survivor[2])}.en.md"
+            print(
+                f"      survivor: {survivor[2][:56]!r} "
+                f"({claims.get(survivor[0], 0)} claims, page "
+                f"{'built' if spage.is_file() else 'NOT BUILT'})",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "      survivor: none found - nothing to redirect to",
+                file=sys.stderr,
+            )
+        print(f"      brief  : {brief}", file=sys.stderr)
+
+    print(
+        "\nNot pruned, deliberately. Get the redirect to the survivor in place at "
+        "the site first, then remove the page and its brief - in that order. "
+        "Removing the page first converts a wrong page into a silent 404.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _front_matter(md: Path) -> dict:
     try:
         m = re.match(r"^---\n(.*?)\n---\n", md.read_text(encoding="utf-8"), re.S)
@@ -901,6 +1057,13 @@ def main() -> int:
         help="With --retarget-links, write the changes (default is a dry run).",
     )
     ap.add_argument(
+        "--check-orphans",
+        action="store_true",
+        help="Report published pages whose node has been retired from the graph "
+        "(a merge leaves the losing side published), and exit. Reports only - "
+        "the page cannot be pruned until its URL redirects to the survivor.",
+    )
+    ap.add_argument(
         "--report-spend",
         action="store_true",
         help="Report what assembly actually cost, summed from each article's "
@@ -964,6 +1127,9 @@ def main() -> int:
 
     if args.report_spend:
         return report_spend(args.content_root, args.since)
+
+    if args.check_orphans:
+        return check_orphans(args.content_root, args.briefs_root, args.db)
 
     if args.retarget_links:
         return retarget_links(args.content_root, args.apply, args.db)

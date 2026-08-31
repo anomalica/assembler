@@ -800,3 +800,139 @@ def test_the_refusal_names_this_component_s_flag():
     )
     assert any("--confirm-spend" in line for line in out)
     assert not any("with --confirm " in line for line in out)
+
+
+def _orphan_fixture(tmp_path):
+    """A content root with two pages: one whose node is live, one merged away."""
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, node_type TEXT, name TEXT, retired_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE node_merges (merge_id TEXT, survivor_id TEXT, victim_id TEXT, "
+        "undone_at TEXT)"
+    )
+    conn.execute("CREATE TABLE claim_node_refs (node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('live','topic','Good Topic',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('dead','topic','Old Topic','2026-08-25')")
+    conn.execute("INSERT INTO node_merges VALUES ('m1','live','dead',NULL)")
+    conn.execute("INSERT INTO claim_node_refs VALUES ('live')")
+    conn.commit()
+    conn.close()
+
+    briefs = tmp_path / "briefs"
+    briefs.mkdir()
+    pages = tmp_path / "pages" / "topics"
+    pages.mkdir(parents=True)
+    for node_id, slug in (("live", "good-topic"), ("dead", "old-topic")):
+        (briefs / f"{slug}.yaml").write_text(
+            "schema: anomalica/brief/1\n"
+            "page:\n"
+            f"  node_id: {node_id}\n"
+            "  node_type: topic\n"
+            f"  slug: {slug}\n"
+            "claims:\n"
+            "- claim_id: c1\n"
+        )
+        (pages / f"{slug}.en.md").write_text("---\ntitle: x\n---\nbody\n")
+    return db, briefs, tmp_path
+
+
+def test_check_orphans_names_the_merge_survivor(tmp_path, capsys):
+    """A merge leaves the losing page published. The report must name the live
+    node to redirect to, read from node_merges - a name heuristic scored an
+    unrelated 1948 crash above the real survivor of "Roswell UAP Crash"."""
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    rc = batch.check_orphans(str(content), str(briefs), str(db))
+    err = capsys.readouterr().err
+    assert rc == 1, "a stale published page is a finding, not a clean run"
+    assert "old-topic" in err
+    assert "2026-08-25" in err, "the retirement date says how long it has been wrong"
+    assert "Good Topic" in err, "the survivor must be named or there is nothing to do"
+    assert "good-topic" not in err.split("survivor")[0], "the live page is not stale"
+
+
+def test_check_orphans_never_prunes(tmp_path):
+    """Reporting only. Removing the page before the redirect exists converts a
+    wrong page into a silent 404, which is worse than the wrong page."""
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    batch.check_orphans(str(content), str(briefs), str(db))
+    assert (content / "pages" / "topics" / "old-topic.en.md").is_file()
+    assert (briefs / "old-topic.yaml").is_file()
+
+
+def test_check_orphans_follows_a_merge_chain(tmp_path, capsys):
+    """354 recorded merges name a survivor that was itself merged away later, so
+    the row against this node is usually not the end of the trail."""
+    import sqlite3
+
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE nodes SET retired_at='2026-08-26' WHERE id='live'")
+    conn.execute("INSERT INTO nodes VALUES ('final','topic','Final Topic',NULL)")
+    conn.execute("INSERT INTO node_merges VALUES ('m2','final','live',NULL)")
+    conn.commit()
+    conn.close()
+    batch.check_orphans(str(content), str(briefs), str(db))
+    assert "Final Topic" in capsys.readouterr().err
+
+
+def test_check_orphans_clean_corpus_is_silent(tmp_path, capsys):
+    """Every page mapping to a live node must exit 0, or the check cannot be run
+    on every batch without becoming noise that gets ignored."""
+    import sqlite3
+
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    (content / "pages" / "topics" / "old-topic.en.md").unlink()
+    conn = sqlite3.connect(db)
+    conn.commit()
+    conn.close()
+    assert batch.check_orphans(str(content), str(briefs), str(db)) == 0
+    assert "no stale pages" in capsys.readouterr().out
+
+
+def test_brief_page_block_reads_without_parsing_the_whole_file(tmp_path):
+    """Parsing 749 full briefs costs a minute; the check only runs if it is cheap.
+    It must also survive a brief that is invalid LATER in the file - four were,
+    and full parsing dropped them entirely."""
+    import batch
+
+    good = tmp_path / "a.yaml"
+    good.write_text(
+        "schema: x\npage:\n  node_id: n1\n  slug: s\nclaims:\n- claim_id: c\n"
+    )
+    assert batch._brief_page_block(good)["node_id"] == "n1"
+
+    broken = tmp_path / "b.yaml"
+    broken.write_text(
+        "schema: x\npage:\n  node_id: n2\n  slug: s2\n"
+        "claims:\n- original_excerpt: 'unterminated\n\n  claim_type: t\n"
+    )
+    assert batch._brief_page_block(broken)["node_id"] == "n2"
+
+
+def test_link_index_says_when_a_brief_is_unreadable(tmp_path, capsys):
+    """Skipping a bad brief is right; doing it silently dropped Thomas Wilson
+    (200 claims) and United States Navy (183) from the linkable set, so prose
+    about them rendered unlinked with nothing explaining why."""
+    briefs = tmp_path / "briefs"
+    briefs.mkdir()
+    (briefs / "ok.yaml").write_text(
+        "page:\n  slug: ok\n  node_type: topic\n  title: OK\n  claim_count: 5\n"
+    )
+    (briefs / "bad.yaml").write_text("page:\n  slug: 'unterminated\n bad: [\n")
+    idx = a.build_link_index(briefs, None, 0)
+    assert "ok" in idx["by_slug"]
+    err = capsys.readouterr().err
+    assert "bad.yaml" in err and "NOT linkable" in err

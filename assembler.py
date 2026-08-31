@@ -2284,10 +2284,15 @@ def build_link_index(
             stems.setdefault(slugify(m.group(1)), path)
 
     if briefs_root:
+        unreadable: list[str] = []
         for bf in sorted(Path(briefs_root).glob("*.yaml")):
             try:
                 page = (yaml.safe_load(bf.read_text()) or {}).get("page") or {}
             except (OSError, yaml.YAMLError):
+                # Skipping is right - one bad brief must not stop a build - but
+                # doing it silently drops that entity from the linkable set, so
+                # prose about it renders unlinked and nothing says why.
+                unreadable.append(bf.name)
                 continue
             slug, node_type = page.get("slug"), page.get("node_type")
             if not (slug and node_type):
@@ -2298,6 +2303,13 @@ def build_link_index(
                 SECTION_BY_TYPE.get(node_type, node_type + "s"),
                 slug,
                 page.get("title"),
+            )
+        if unreadable:
+            print(
+                f"warning: {len(unreadable)} brief(s) could not be parsed and are "
+                f"NOT linkable: {', '.join(unreadable[:6])}"
+                + (" ..." if len(unreadable) > 6 else ""),
+                file=sys.stderr,
             )
     if content_root:
         for md in Path(content_root).glob("pages/*/*.en.md"):
