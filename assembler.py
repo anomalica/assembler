@@ -1534,14 +1534,37 @@ EST_OUTPUT_TOKENS_RECORD = 8_000
 CHARS_PER_TOKEN = 2.6
 
 
-def _estimate_article_cost(model: str) -> dict:
-    """A one-article estimate dict for the shared spend gate. Same per-item
-    figures batch.py uses for its own pre-flight, so a single run and a batch of
-    one quote the same number."""
+def _estimate_article_cost(
+    model: str, prompt_chars: int | None = None, is_record: bool = False
+) -> dict:
+    """A one-article estimate for the shared spend gate, sized on THIS article.
+
+    It used to take only the model, so it never opened the digest or the brief
+    and returned the same figure for every page: a 9 KiB digest and a 2.4 MiB one
+    were both quoted at $0.05. The constant sits near the corpus median, which is
+    why it looked plausible - measured across 353 pages that recorded real
+    consumption, input runs a median of 70,656 tokens against the constant's
+    34,400, and a heavy page 544,043. It understated a typical page 2x and a
+    heavy one 15x while overstating output on most, so the errors cancelled on an
+    average page and hid the fact that nothing was being measured.
+
+    A gate that prints a number it did not compute is worse than one that prints
+    nothing: it manufactures exactly the confidence that skips the check.
+    """
     from anomalica_common.llm.cost import price_for
 
     in_price, out_price = price_for(API_MODEL_MAP.get(model, model))
-    in_tok, out_tok = FIXED_INPUT_TOKENS, EST_OUTPUT_TOKENS
+    if prompt_chars is None:
+        in_tok, out_tok = FIXED_INPUT_TOKENS, EST_OUTPUT_TOKENS
+    else:
+        via_openrouter = is_openrouter_model(model)
+        chars_per_token = 3.5 if via_openrouter else CHARS_PER_TOKEN
+        fixed = 0 if via_openrouter else FIXED_INPUT_TOKENS
+        in_tok = fixed + round(prompt_chars / chars_per_token)
+        # A record page is capped at 300-400 words by its own prompt and cannot
+        # produce the reference-heavy output an entity page can; measured median
+        # 3,545 output tokens against an entity page's 32,000 ceiling.
+        out_tok = EST_OUTPUT_TOKENS_RECORD if is_record else EST_OUTPUT_TOKENS
     usd = in_tok / 1e6 * in_price + out_tok / 1e6 * out_price
     return {
         "items": 1,
@@ -3089,23 +3112,6 @@ def main() -> int:
     # global ANOMALICA_USE_API, and this component resolves ASSEMBLER_USE_API.
     # An OpenRouter model is metered too, so the gate must fire for it - the
     # toggle alone would let a provider-qualified model spend unchecked.
-    # NOT for --dry-run, which prints the prompt and calls nothing. Refusing it
-    # as "this run spends real money" is false, and it made the only way to check
-    # that a slug resolves to the right digest be to authorise real spend - which
-    # is exactly backwards for a flag whose purpose is checking without paying.
-    if (_use_api() or is_openrouter_model(args.model)) and not args.dry_run:
-        from anomalica_common.llm import spend_confirmed
-
-        if not spend_confirmed(
-            _estimate_article_cost(args.model),
-            API_MODEL_MAP.get(args.model, args.model),
-            confirm=args.confirm_spend,
-            echo=lambda m: print(m, file=sys.stderr),
-            use_api=True,
-            flag="--confirm-spend",
-        ):
-            return 2
-
     # Built once, before any render: body links are resolved against the proposal
     # set rather than files on disk, so the same brief yields the same article
     # whether it is assembled first or ninetieth in a batch.
@@ -3180,6 +3186,26 @@ def main() -> int:
         return 0
 
     print(f"  prompt: {len(prompt):,} chars", file=sys.stderr)
+
+    # The spend gate, AFTER the prompt exists so it can be sized on this article
+    # rather than on a constant. Building the prompt calls no model, so paying
+    # for a real figure costs nothing. Positioned after the --dry-run return, so
+    # a dry run cannot reach it - a run that spends nothing is not gated, by
+    # construction rather than by a special case.
+    if _use_api() or is_openrouter_model(args.model):
+        from anomalica_common.llm import spend_confirmed
+
+        if not spend_confirmed(
+            _estimate_article_cost(
+                args.model, len(prompt), is_record=bool(args.record)
+            ),
+            API_MODEL_MAP.get(args.model, args.model),
+            confirm=args.confirm_spend,
+            echo=lambda m: print(m, file=sys.stderr),
+            use_api=True,
+            flag="--confirm-spend",
+        ):
+            return 2
 
     # Generation is non-deterministic: an occasional pass trips validate_article
     # or the date-fidelity guard (a fabricated year/date - site master found this

@@ -728,17 +728,45 @@ def test_the_ingest_lookup_searches_both_store_roots(tmp_path):
     assert old.get("effective_status") == "restricted", "no licence evidence"
 
 
-def test_dry_run_is_not_a_spend(monkeypatch):
+def test_dry_run_returns_before_the_spend_gate():
     """--dry-run prints the prompt and calls nothing, so refusing it as a metered
     run is false - and it made the only way to check that a slug resolves to the
-    right digest be to authorise real spend, which is backwards for a flag whose
-    purpose is checking without paying."""
+    right digest be to authorise real spend.
+
+    The exemption is POSITIONAL: the dry-run return precedes the gate, so a run
+    that spends nothing cannot reach it by construction rather than by a flag
+    test somebody has to remember to keep correct.
+    """
     import inspect
 
     src = inspect.getsource(a.main)
-    gate = src.index("spend_confirmed(")
-    guard = src.rindex("not args.dry_run", 0, gate)
-    assert guard < gate, "the spend gate must not fire on a dry run"
+    assert src.index("if args.dry_run:") < src.index("spend_confirmed(")
+
+
+def test_the_estimate_is_sized_on_this_article_not_a_constant():
+    """It took only the model, so a 9 KiB digest and a 2.4 MiB one were both
+    quoted at $0.05. A gate printing a number it did not compute manufactures the
+    confidence that skips the check."""
+    small = a._estimate_article_cost("openai/gpt-5.6-luna", 10_000)
+    large = a._estimate_article_cost("openai/gpt-5.6-luna", 2_400_000)
+    assert large["est_input_tokens"] > small["est_input_tokens"] * 100
+    assert large["usd"] > small["usd"]
+
+
+def test_a_record_page_is_estimated_on_its_own_output_ceiling():
+    """A record page is capped at 300-400 words; an entity page is not. One
+    ceiling for both overstates a record page's output roughly fourfold."""
+    rec = a._estimate_article_cost("openai/gpt-5.6-luna", 50_000, is_record=True)
+    ent = a._estimate_article_cost("openai/gpt-5.6-luna", 50_000, is_record=False)
+    assert rec["est_output_tokens"] < ent["est_output_tokens"]
+    assert rec["usd"] < ent["usd"]
+
+
+def test_an_unsized_estimate_still_returns_the_old_constant():
+    """Callers that cannot supply a length keep working rather than crashing -
+    but they get the constant, which is why the gate now always supplies one."""
+    est = a._estimate_article_cost("openai/gpt-5.6-luna")
+    assert est["est_input_tokens"] == a.FIXED_INPUT_TOKENS
 
 
 def test_the_refusal_names_this_component_s_flag():
