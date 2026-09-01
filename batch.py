@@ -61,12 +61,6 @@ import yaml
 
 import assembler as asm
 
-# USD per 1,000,000 tokens, (input, output). Source: claude-api model table.
-PRICING = {
-    "sonnet": (3.00, 15.00),
-    "opus": (5.00, 25.00),
-    "haiku": (1.00, 5.00),
-}
 # Measured, not assumed. The previous constants (3.5 chars/token, 3000 output
 # tokens, no per-call overhead) under-estimated a real run by ~3x on input and
 # ~9x on output, which breaks the one promise this file makes - that the figure
@@ -332,7 +326,13 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         in_price, out_price = price_for(args.model)
         chars_per_token, fixed_in = 3.5, 0
     else:
-        in_price, out_price = PRICING.get(args.model, PRICING["sonnet"])
+        # One price table, the shared one. A local copy here said sonnet was
+        # $3.00/$15.00 while the checked table said $2.00/$10.00, and a 106-page
+        # rebuild was costed 50% high off the stale copy. A second table cannot
+        # be kept current; it can only be wrong later.
+        from anomalica_common.llm.cost import price_for
+
+        in_price, out_price = price_for(args.model)
         chars_per_token, fixed_in = CHARS_PER_TOKEN, FIXED_INPUT_TOKENS
 
     resolved: list[str] = []
