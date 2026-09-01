@@ -150,31 +150,60 @@ def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[
 
 
 def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
-    """Items whose brief is not the redacted, published one.
+    """Items that must not be assembled, mapped to the reason, plus a soft list.
 
-    The assimilator keeps two brief directories and they are not two copies: the
-    internal one is PRE-REDACTION, and publishing strips excerpts whose record is
-    copyright-restricted (Fatima: 93 excerpts in, 4 out; all 89 dropped came from
-    restricted ebooks). A claim's excerpt is published verbatim as the page quote,
-    so building from the internal side puts material we may not redistribute on a
-    public page - and the internal side is always the NEWER one, so reaching for
-    it is the tempting move whenever a brief is missing.
+    Two hazards, both of which produce a plausible page rather than an error.
 
-    Refused rather than warned: widening the access model is not reversible once
-    it is on the CDN.
+    UNREDACTED: the assimilator keeps two brief directories and they are not two
+    copies. The internal one is PRE-REDACTION, and publishing strips excerpts
+    whose record is copyright-restricted (Fatima: 93 excerpts in, 4 out; the 89
+    dropped came from restricted ebooks). An excerpt is published verbatim as the
+    page quote, so building from the internal side puts material we may not
+    redistribute on a public page - and the internal side is always the NEWER
+    one, so reaching for it is the tempting move whenever a brief is missing.
+
+    NOT CURRENT: a brief whose node has been retired, or which sits at a slug the
+    node has since moved off. The first publishes a page for something that no
+    longer exists; the second publishes a SECOND page for a live entity, which is
+    how one person ends up with two articles. Derived from the graph rather than
+    a list of filenames, so it stays true as nodes merge and rename.
+
+    Refused rather than warned: a CDN leak is not reversible, and a duplicate
+    entity page is invisible until someone notices two of them.
     """
     if kind != "briefs":
         return {}, []
-    refuse, stale = {}, []
     root = Path(args.briefs_root).expanduser()
+    nodes, by_node = {}, {}
+    try:
+        conn = sqlite3.connect(f"file:{Path(args.db).expanduser()}?mode=ro", uri=True)
+        nodes = {
+            r[0]: r for r in conn.execute("SELECT id, name, retired_at FROM nodes")
+        }
+        for bf in sorted(root.glob("*.yaml")):
+            nid = _brief_page_block(bf).get("node_id")
+            if nid:
+                by_node.setdefault(nid, []).append(bf.stem)
+    except sqlite3.Error:
+        nodes = {}  # no graph: fall back to the publication check alone
+
+    refuse, stale = {}, []
     for item in items:
-        block = _brief_page_block(root / f"{item}.yaml", key="publication")
-        status = block.get("status")
-        if status == "redacted":
+        bf = root / f"{item}.yaml"
+        status = _brief_page_block(bf, key="publication").get("status")
+        if status and status != "redacted":
+            refuse[item] = f"publication.status is {status} - pre-redaction copy"
             continue
-        if status:
-            refuse[item] = status
-        else:
+        nid = _brief_page_block(bf).get("node_id")
+        row = nodes.get(nid) if nodes else None
+        if nodes and nid and row is None:
+            refuse[item] = "its node is not in the graph"
+        elif row is not None and row[2]:
+            refuse[item] = f"its node was retired {row[2]}"
+        elif nid and len(by_node.get(nid, [])) > 1:
+            others = [s for s in by_node[nid] if s != item]
+            refuse[item] = f"stale slug - the same node is also briefed as {others[0]}"
+        elif not status:
             stale.append(item)
     return refuse, stale
 
@@ -1203,17 +1232,18 @@ def main() -> int:
     refuse_pub, stale_pub = _check_publication(args, kind, resolved)
     if refuse_pub:
         print(
-            f"\nUNPUBLISHED BRIEF: {len(refuse_pub)} item(s) come from the internal, "
-            "PRE-REDACTION brief set. Those carry verbatim excerpts from sources we may "
-            "not redistribute, and an excerpt is published as the page quote.",
+            f"\nUNBUILDABLE BRIEF: {len(refuse_pub)} item(s) must not be assembled - "
+            "either a pre-redaction copy carrying excerpts we may not redistribute, or "
+            "a brief whose node is retired or has moved to another slug.",
             file=sys.stderr,
         )
-        for item, status in refuse_pub.items():
-            print(f"  {item}  (publication.status: {status})", file=sys.stderr)
+        for item, why in refuse_pub.items():
+            print(f"  {item}\n      {why}", file=sys.stderr)
         print(
-            "\nRefusing to run. Point --briefs-root at the published set - the output of "
-            "`assimilator publish-briefs`. If a brief is missing there, ask for a "
-            "republish and wait; do not change the root.",
+            "\nRefusing to run. For a pre-redaction copy, point --briefs-root at the "
+            "published set - the output of `assimilator publish-briefs`; if a brief is "
+            "missing there, ask for a republish and wait rather than changing the root. "
+            "For a retired or stale-slug brief, build the node's current brief instead.",
             file=sys.stderr,
         )
         return 2

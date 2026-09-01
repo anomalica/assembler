@@ -967,29 +967,46 @@ def test_strip_line_markers_leaves_clean_text_alone():
     assert a.strip_line_markers(12) == 12
 
 
-def _pub_brief(d, name: str, status: str | None):
+def _pub_brief(d, name: str, status: str | None, node_id: str = "n1"):
     body = (
-        "page:\n  node_id: n\n  node_type: topic\n  slug: s\nclaims:\n- claim_id: c\n"
+        f"page:\n  node_id: {node_id}\n  node_type: topic\n  slug: {name}\n"
+        "claims:\n- claim_id: c\n"
     )
     if status:
         body = f"publication:\n  status: {status}\n" + body
     (d / f"{name}.yaml").write_text(body)
 
 
-def test_preflight_refuses_an_unredacted_brief(tmp_path, capsys):
+def _pub_args(tmp_path, live=("n1",), retired=()):
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id TEXT, name TEXT, retired_at TEXT)")
+    for n in live:
+        conn.execute("INSERT INTO nodes VALUES (?,?,NULL)", (n, n))
+    for n in retired:
+        conn.execute("INSERT INTO nodes VALUES (?,?,'2026-08-25')", (n, n))
+    conn.commit()
+    conn.close()
+
+    class A:
+        briefs_root = str(tmp_path)
+
+    A.db = str(db)
+    return A()
+
+
+def test_preflight_refuses_an_unredacted_brief(tmp_path):
     """The internal brief set is PRE-REDACTION and is always the newer one, so
     reaching for it is the tempting move when a brief is missing. Its excerpts
     come from restricted sources and are published verbatim as the page quote."""
     import batch
 
     _pub_brief(tmp_path, "bad", "unredacted")
-
-    class A:
-        briefs_root = str(tmp_path)
-
-    refuse, stale = batch._check_publication(A(), "briefs", ["bad"])
-    assert refuse == {"bad": "unredacted"}, (
-        "must refuse, not warn - a CDN leak is final"
+    refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["bad"])
+    assert "pre-redaction" in refuse["bad"], (
+        "must refuse - a CDN leak is not reversible"
     )
     assert stale == []
 
@@ -999,22 +1016,52 @@ def test_preflight_accepts_the_published_set(tmp_path):
     import batch
 
     _pub_brief(tmp_path, "good", "redacted")
+    assert batch._check_publication(_pub_args(tmp_path), "briefs", ["good"]) == ({}, [])
+
+
+def test_preflight_refuses_a_brief_whose_node_was_retired(tmp_path):
+    """Building one publishes an article about something the graph says is gone.
+    Seven such briefs were sitting in the published set after a merge round."""
+    import batch
+
+    _pub_brief(tmp_path, "dead", "redacted", node_id="gone")
+    args = _pub_args(tmp_path, live=(), retired=("gone",))
+    refuse, _ = batch._check_publication(args, "briefs", ["dead"])
+    assert "retired" in refuse["dead"]
+
+
+def test_preflight_refuses_a_brief_at_a_stale_slug(tmp_path):
+    """Two briefs for ONE live node means two published pages for one entity -
+    the failure that put Elizondo on the site twice. Sixteen were in this state
+    after a rename round, and the node is live so nothing else flags them."""
+    import batch
+
+    _pub_brief(tmp_path, "old-slug", "redacted", node_id="n1")
+    _pub_brief(tmp_path, "new-slug", "redacted", node_id="n1")
+    refuse, _ = batch._check_publication(_pub_args(tmp_path), "briefs", ["old-slug"])
+    assert "stale slug" in refuse["old-slug"]
+    assert "new-slug" in refuse["old-slug"], "name the brief to build instead"
+
+
+def test_preflight_survives_an_unreadable_graph(tmp_path):
+    """No graph is not a reason to refuse everything - the redaction check still
+    stands on the file alone."""
+    import batch
+
+    _pub_brief(tmp_path, "good", "redacted")
 
     class A:
         briefs_root = str(tmp_path)
+        db = "/nonexistent/g.db"
 
     assert batch._check_publication(A(), "briefs", ["good"]) == ({}, [])
 
 
 def test_preflight_warns_on_a_brief_with_no_publication_block(tmp_path):
-    """64 briefs are leftovers for nodes no longer proposed. Not a leak risk, so
-    a warning rather than a refusal - but building from them is still wrong."""
+    """41 briefs are live nodes that fell below the page gate - a legitimate
+    audit record, not a page. Stale rather than unsafe, so a warning."""
     import batch
 
     _pub_brief(tmp_path, "old", None)
-
-    class A:
-        briefs_root = str(tmp_path)
-
-    refuse, stale = batch._check_publication(A(), "briefs", ["old"])
+    refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["old"])
     assert refuse == {} and stale == ["old"]
