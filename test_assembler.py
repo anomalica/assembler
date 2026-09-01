@@ -998,16 +998,16 @@ def _pub_args(tmp_path, live=("n1",), retired=()):
 
 
 def test_preflight_refuses_an_unredacted_brief(tmp_path):
-    """The internal brief set is PRE-REDACTION and is always the newer one, so
-    reaching for it is the tempting move when a brief is missing. Its excerpts
-    come from restricted sources and are published verbatim as the page quote."""
+    """The internal brief set is the one hazard: no publication marker, no prune,
+    and written by a different step. Not a copyright control - publishing
+    attributed quotations from restricted sources is the documented policy, and
+    5,414 published references already do it. "Build from the published set"
+    stands on consistency alone."""
     import batch
 
     _pub_brief(tmp_path, "bad", "unredacted")
     refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["bad"])
-    assert "pre-redaction" in refuse["bad"], (
-        "must refuse - a CDN leak is not reversible"
-    )
+    assert "unredacted" in refuse["bad"], "the internal copy must be refused"
     assert stale == []
 
 
@@ -1017,6 +1017,28 @@ def test_preflight_accepts_the_published_set(tmp_path):
 
     _pub_brief(tmp_path, "good", "redacted")
     assert batch._check_publication(_pub_args(tmp_path), "briefs", ["good"]) == ({}, [])
+
+
+def test_preflight_survives_the_publisher_renaming_its_status(tmp_path):
+    """An allow-list of {"redacted"} blocked the whole corpus within an hour of
+    the publisher renaming its status to "published". Only the internal copy is
+    a hazard, so deny that value rather than allowing an enumerated set."""
+    import batch
+
+    _pub_brief(tmp_path, "good", "published")
+    refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["good"])
+    assert refuse == {} and stale == []
+
+
+def test_preflight_surfaces_an_unrecognised_status(tmp_path):
+    """Denying the known-bad value fails OPEN on a new one, so an unknown status
+    must at least be said out loud rather than passing silently."""
+    import batch
+
+    _pub_brief(tmp_path, "odd", "some-new-mode")
+    refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["odd"])
+    assert refuse == {}
+    assert stale and "some-new-mode" in stale[0]
 
 
 def test_preflight_refuses_a_brief_whose_node_was_retired(tmp_path):

@@ -149,18 +149,28 @@ def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[
     return {p: its for p, its in seen.items() if len(its) > 1}
 
 
+# The internal, pre-publication copy is the one hazard; everything else is a
+# published set under whatever name upstream currently uses. Named as a DENY of
+# the bad value rather than an ALLOW of the good ones: an allow-list of
+# {"redacted"} blocked the entire corpus within the hour when the publisher
+# renamed its status to "published".
+_PUBLISHED_STATUSES = frozenset({"redacted", "published"})
+
+
 def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     """Items that must not be assembled, mapped to the reason, plus a soft list.
 
     Two hazards, both of which produce a plausible page rather than an error.
 
-    UNREDACTED: the assimilator keeps two brief directories and they are not two
-    copies. The internal one is PRE-REDACTION, and publishing strips excerpts
-    whose record is copyright-restricted (Fatima: 93 excerpts in, 4 out; the 89
-    dropped came from restricted ebooks). An excerpt is published verbatim as the
-    page quote, so building from the internal side puts material we may not
-    redistribute on a public page - and the internal side is always the NEWER
-    one, so reaching for it is the tempting move whenever a brief is missing.
+    UNREDACTED: the assimilator keeps two brief directories and they are not
+    two copies. The internal one has no publication marker, is not pruned, and is
+    written by a different step, so it drifts from what the corpus is built on.
+    NOT a copyright control - publishing short attributed quotations from
+    restricted sources is the documented policy (Article 32; "the line is
+    SUBSTANTIALITY, not length"), and 5,414 published references already carry
+    them. An earlier version of this docstring claimed a leak risk; that was
+    inferred from a redaction step that turned out to be a regression, not read
+    from the policy.
 
     NOT CURRENT: a brief whose node has been retired, or which sits at a slug the
     node has since moved off. The first publishes a page for something that no
@@ -191,9 +201,11 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     for item in items:
         bf = root / f"{item}.yaml"
         status = _brief_page_block(bf, key="publication").get("status")
-        if status and status != "redacted":
-            refuse[item] = f"publication.status is {status} - pre-redaction copy"
+        if status == "unredacted":
+            refuse[item] = "publication.status is unredacted - the internal copy"
             continue
+        if status and status not in _PUBLISHED_STATUSES:
+            stale.append(f"{item} (unrecognised publication.status: {status})")
         nid = _brief_page_block(bf).get("node_id")
         row = nodes.get(nid) if nodes else None
         if nodes and nid and row is None:
