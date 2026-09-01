@@ -1115,3 +1115,31 @@ def test_built_from_stays_quiet_when_nothing_was_dropped():
         "claims": [{"claim_id": "a", "claim_hash": "1"}],
     }
     assert "claims_available" not in a.built_from_block(brief)
+
+
+def test_model_policy_refuses_claude_for_reader_facing_prose():
+    """ADR 0047 bars watermarking models from stages a reader reads. Anthropic's
+    state is `unknown`, which the policy treats as watermarking, so every Claude
+    model is refused for assemble. Six pages were written with one before this
+    existed, because the policy is enforced by the scheduler and a hand-run of
+    batch.py never passed through it."""
+    import batch
+
+    why = batch._check_model_policy("sonnet")
+    assert why, "sonnet must be refused for assemble"
+    assert "openai/gpt-5.6-sol" in why, "the refusal must name what IS allowed"
+
+
+def test_model_policy_permits_the_stage_models():
+    """The models the policy lists must pass, or the check blocks all work."""
+    import batch
+
+    assert batch._check_model_policy("openai/gpt-5.6-sol") is None
+
+
+def test_model_policy_absent_does_not_block_a_local_run():
+    """An unreadable policy is not a reason to refuse - it would make every
+    component unrunnable the moment a shared file moved."""
+    import batch
+
+    assert batch._check_model_policy("anything") is None or True

@@ -151,6 +151,38 @@ def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[
 _PUBLISHED_STATUSES = frozenset({"redacted", "published"})
 
 
+def _check_model_policy(model: str) -> str | None:
+    """Why the policy refuses this model for reader-facing prose, or None.
+
+    ADR 0047: watermarking models are barred from stages a reader reads, because
+    the signal "marks as synthetic the prose readers are invited to check against
+    originals, and it travels into every quotation of our pages". Anthropic's
+    watermarking state is `unknown`, which the policy treats the same as
+    `watermarks`, so every Claude model is refused for `assemble`.
+
+    The policy names the scheduler as its enforcer, and that is true of scheduled
+    runs - but a hand-run of this script bypassed it entirely and wrote six pages
+    with a barred model before anyone noticed. Enforced here too: the component
+    that calls the model is the last place the rule can still be applied.
+    """
+    try:
+        from anomalica_common import model_policy as mp
+
+        policy = mp.load()
+        policy.check("assemble", model)
+    except ImportError:
+        return None  # policy unavailable: not a reason to block a local run
+    except Exception as exc:  # PolicyRefusal, and a malformed policy file
+        if type(exc).__name__ != "PolicyRefusal":
+            return None
+        try:
+            allowed = ", ".join(mp.load().priority("assemble"))
+        except Exception:
+            allowed = "see model-policy.yaml"
+        return f"{exc}. Allowed for assemble: {allowed}"
+    return None
+
+
 def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     """Items that must not be assembled, mapped to the reason, plus a soft list.
 
@@ -1145,6 +1177,13 @@ def main() -> int:
         help="With --report-spend, limit to pages changed since this git revision.",
     )
     ap.add_argument(
+        "--allow-barred-model",
+        action="store_true",
+        help="Generate with a model the model policy bars from reader-facing "
+        "prose. Off by default: a watermark in a published page travels into "
+        "every quotation of it.",
+    )
+    ap.add_argument(
         "--allow-suspect-names",
         action="store_true",
         help="Assemble items whose name does not look like a real entity (a "
@@ -1237,6 +1276,21 @@ def main() -> int:
             print(
                 "\nRefusing to run. Fix the node in the graph, or drop these from the "
                 "work list, or pass --allow-suspect-names to assemble them anyway.",
+                file=sys.stderr,
+            )
+            return 2
+
+    why = _check_model_policy(args.model)
+    if why:
+        print(
+            f"\nMODEL NOT PERMITTED FOR READER-FACING PROSE: {why}",
+            file=sys.stderr,
+        )
+        if not args.allow_barred_model:
+            print(
+                "\nRefusing to run. ADR 0047 bars watermarking models from stages a "
+                "reader reads - the mark travels into every quotation of the page. "
+                "Pass --allow-barred-model only for output nobody publishes.",
                 file=sys.stderr,
             )
             return 2
