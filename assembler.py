@@ -696,6 +696,22 @@ def brief_node(brief: dict) -> dict:
     }
 
 
+# yamlfmt's `retain_line_breaks` sentinel. The shared commit hook writes it INTO
+# string values, so a brief's excerpt arrives with the marker where a newline was;
+# a long value also loses everything after the break. Stripped on the way in, not
+# at render, so it reaches neither the prompt nor the page. This is a defence -
+# the truncated tails are gone and only regeneration brings them back.
+_YAMLFMT_LINE_MARKER = re.compile(r"[ \t]*#magic_+\^_\^_+line[ \t]*")
+
+
+def strip_line_markers(value):
+    """A brief string with yamlfmt's line sentinel removed."""
+    if not isinstance(value, str):
+        return value
+    cleaned = _YAMLFMT_LINE_MARKER.sub("\n", value)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def claims_from_brief(brief: dict) -> list[dict]:
     """Map the brief's ordered claim selection to the claim-dict shape
     format_claim / _augment_references / _check_date_fidelity consume, carrying
@@ -709,8 +725,8 @@ def claims_from_brief(brief: dict) -> list[dict]:
             {
                 "id": c.get("claim_id"),
                 "claim_hash": c.get("claim_hash"),
-                "content": c.get("content", ""),
-                "original_excerpt": c.get("original_excerpt"),
+                "content": strip_line_markers(c.get("content", "")),
+                "original_excerpt": strip_line_markers(c.get("original_excerpt")),
                 "claim_type": c.get("claim_type", "observation"),
                 "attestation": c.get("attestation") or "",
                 # ADR 0044. The assimilator derives this once in the brief so the

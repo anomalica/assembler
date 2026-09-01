@@ -936,3 +936,32 @@ def test_link_index_says_when_a_brief_is_unreadable(tmp_path, capsys):
     assert "ok" in idx["by_slug"]
     err = capsys.readouterr().err
     assert "bad.yaml" in err and "NOT linkable" in err
+
+
+def test_line_markers_never_reach_a_page():
+    """The shared commit hook writes yamlfmt's line sentinel INTO string values,
+    and the assembler publishes a claim's excerpt verbatim as the page quote. 18
+    briefs carry it across 30 excerpts, so without this it reaches a reader."""
+    brief = {
+        "claims": [
+            {
+                "claim_id": "c1",
+                "content": "Unit: 89 ATKS #magic___^_^___line Wing: 432 AEW",
+                "original_excerpt": "line one #magic___^_^___line line two",
+                "claim_type": "testimony",
+            }
+        ]
+    }
+    got = a.claims_from_brief(brief)[0]
+    assert "magic" not in got["original_excerpt"], "the marker must not reach the page"
+    assert "magic" not in got["content"], "nor the prompt the model writes from"
+    assert got["original_excerpt"] == "line one\nline two", "a newline was there"
+
+
+def test_strip_line_markers_leaves_clean_text_alone():
+    """A string with no marker must survive byte-identical - the strip runs on
+    every claim of every build and must not become a quiet rewriter of prose."""
+    clean = "Fravor said the AAV was 'holding like a Harrier'"
+    assert a.strip_line_markers(clean) == clean
+    assert a.strip_line_markers(None) is None
+    assert a.strip_line_markers(12) == 12
