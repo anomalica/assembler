@@ -1087,3 +1087,31 @@ def test_preflight_warns_on_a_brief_with_no_publication_block(tmp_path):
     _pub_brief(tmp_path, "old", None)
     refuse, stale = batch._check_publication(_pub_args(tmp_path), "briefs", ["old"])
     assert refuse == {} and stale == ["old"]
+
+
+def test_built_from_records_a_capped_brief():
+    """A brief is capped, so the biggest entities are written from a fraction of
+    the graph - Strieber's page from 600 of 2,457 claims. Without this the page
+    carries no trace of what it did not see."""
+    brief = {
+        "brief_hash": "h",
+        "page": {"claim_count": 2, "claim_count_total": 2457},
+        "claims": [
+            {"claim_id": "a", "claim_hash": "1"},
+            {"claim_id": "b", "claim_hash": "2"},
+        ],
+    }
+    block = a.built_from_block(brief)
+    assert block["claims_available"] == 2457
+    assert block["claims_used"] == 2
+
+
+def test_built_from_stays_quiet_when_nothing_was_dropped():
+    """775 of 790 briefs carry every claim their node holds. Recording an
+    equality on all of them would be noise in every page's front matter."""
+    brief = {
+        "brief_hash": "h",
+        "page": {"claim_count": 1, "claim_count_total": 1},
+        "claims": [{"claim_id": "a", "claim_hash": "1"}],
+    }
+    assert "claims_available" not in a.built_from_block(brief)

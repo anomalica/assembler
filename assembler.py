@@ -823,14 +823,28 @@ def built_from_block(brief: dict) -> dict:
     """The article-level audit field: the brief's brief_hash + the ORDERED list of
     {id, hash} the brief contained. Copied verbatim - the assembler computes no
     hash (single source: assimilator owns claim_hash, synthesiser owns brief_hash).
-    Lets staleness detection diff a page's built brief against a rebuilt one."""
-    return {
+    Lets staleness detection diff a page's built brief against a rebuilt one.
+
+    Records the node's FULL claim count alongside the brief's when the two differ.
+    A brief is capped, so the largest entities are written from a fraction of what
+    the graph holds - Whitley Strieber's page comes from 600 of 2,457 claims - and
+    without this the page carries no trace of the reduction. 6,288 claims sit
+    outside any brief corpus-wide. Kept as provenance rather than surfaced: the
+    reader is not owed our selection arithmetic, but an auditor asking "what did
+    this article NOT see" should not have to reconstruct it."""
+    claims = brief.get("claims") or []
+    page = brief.get("page") or {}
+    block = {
         "brief_hash": brief.get("brief_hash"),
         "claims": [
-            {"id": c.get("claim_id"), "hash": c.get("claim_hash")}
-            for c in brief.get("claims") or []
+            {"id": c.get("claim_id"), "hash": c.get("claim_hash")} for c in claims
         ],
     }
+    total = page.get("claim_count_total")
+    if isinstance(total, int) and total > len(claims):
+        block["claims_available"] = total
+        block["claims_used"] = len(claims)
+    return block
 
 
 def gather_upstream_ai_usage(claims: list[dict], digests_root: Path) -> list[dict]:
