@@ -149,6 +149,36 @@ def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[
     return {p: its for p, its in seen.items() if len(its) > 1}
 
 
+def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
+    """Items whose brief is not the redacted, published one.
+
+    The assimilator keeps two brief directories and they are not two copies: the
+    internal one is PRE-REDACTION, and publishing strips excerpts whose record is
+    copyright-restricted (Fatima: 93 excerpts in, 4 out; all 89 dropped came from
+    restricted ebooks). A claim's excerpt is published verbatim as the page quote,
+    so building from the internal side puts material we may not redistribute on a
+    public page - and the internal side is always the NEWER one, so reaching for
+    it is the tempting move whenever a brief is missing.
+
+    Refused rather than warned: widening the access model is not reversible once
+    it is on the CDN.
+    """
+    if kind != "briefs":
+        return {}, []
+    refuse, stale = {}, []
+    root = Path(args.briefs_root).expanduser()
+    for item in items:
+        block = _brief_page_block(root / f"{item}.yaml", key="publication")
+        status = block.get("status")
+        if status == "redacted":
+            continue
+        if status:
+            refuse[item] = status
+        else:
+            stale.append(item)
+    return refuse, stale
+
+
 def _load(args, kind: str, item: str):
     """(node, claims, related) for one item, read-only, or None if unresolvable.
     The single place a work item is turned into the assembler's inputs, so the
@@ -747,8 +777,8 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
     return 0
 
 
-def _brief_page_block(brief: Path) -> dict:
-    """The `page:` mapping from a brief, read without parsing the whole file.
+def _brief_page_block(brief: Path, key: str = "page") -> dict:
+    """One top-level mapping from a brief, read without parsing the whole file.
 
     A brief carries every claim behind its article and runs to thousands of
     lines, but the block naming the node sits in the first few. Parsing all 749
@@ -764,14 +794,14 @@ def _brief_page_block(brief: Path) -> dict:
                     if line[:1] not in (" ", "\t", "\n", "#"):
                         break
                     lines.append(line)
-                elif line.startswith("page:"):
+                elif line.startswith(f"{key}:"):
                     lines.append(line)
     except OSError:
         return {}
     if not lines:
         return {}
     try:
-        return (yaml.safe_load("".join(lines)) or {}).get("page") or {}
+        return (yaml.safe_load("".join(lines)) or {}).get(key) or {}
     except yaml.YAMLError:
         return {}
 
@@ -1169,6 +1199,31 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+
+    refuse_pub, stale_pub = _check_publication(args, kind, resolved)
+    if refuse_pub:
+        print(
+            f"\nUNPUBLISHED BRIEF: {len(refuse_pub)} item(s) come from the internal, "
+            "PRE-REDACTION brief set. Those carry verbatim excerpts from sources we may "
+            "not redistribute, and an excerpt is published as the page quote.",
+            file=sys.stderr,
+        )
+        for item, status in refuse_pub.items():
+            print(f"  {item}  (publication.status: {status})", file=sys.stderr)
+        print(
+            "\nRefusing to run. Point --briefs-root at the published set - the output of "
+            "`assimilator publish-briefs`. If a brief is missing there, ask for a "
+            "republish and wait; do not change the root.",
+            file=sys.stderr,
+        )
+        return 2
+    if stale_pub:
+        print(
+            f"\nwarning: {len(stale_pub)} brief(s) declare no publication status and may "
+            f"be stale leftovers: {', '.join(stale_pub[:5])}"
+            + (" ..." if len(stale_pub) > 5 else ""),
+            file=sys.stderr,
+        )
 
     clashes = _check_slug_collisions(args, kind, resolved)
     if clashes:

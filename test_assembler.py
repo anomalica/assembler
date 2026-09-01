@@ -965,3 +965,56 @@ def test_strip_line_markers_leaves_clean_text_alone():
     assert a.strip_line_markers(clean) == clean
     assert a.strip_line_markers(None) is None
     assert a.strip_line_markers(12) == 12
+
+
+def _pub_brief(d, name: str, status: str | None):
+    body = (
+        "page:\n  node_id: n\n  node_type: topic\n  slug: s\nclaims:\n- claim_id: c\n"
+    )
+    if status:
+        body = f"publication:\n  status: {status}\n" + body
+    (d / f"{name}.yaml").write_text(body)
+
+
+def test_preflight_refuses_an_unredacted_brief(tmp_path, capsys):
+    """The internal brief set is PRE-REDACTION and is always the newer one, so
+    reaching for it is the tempting move when a brief is missing. Its excerpts
+    come from restricted sources and are published verbatim as the page quote."""
+    import batch
+
+    _pub_brief(tmp_path, "bad", "unredacted")
+
+    class A:
+        briefs_root = str(tmp_path)
+
+    refuse, stale = batch._check_publication(A(), "briefs", ["bad"])
+    assert refuse == {"bad": "unredacted"}, (
+        "must refuse, not warn - a CDN leak is final"
+    )
+    assert stale == []
+
+
+def test_preflight_accepts_the_published_set(tmp_path):
+    """The published set must pass silently or the guard becomes noise."""
+    import batch
+
+    _pub_brief(tmp_path, "good", "redacted")
+
+    class A:
+        briefs_root = str(tmp_path)
+
+    assert batch._check_publication(A(), "briefs", ["good"]) == ({}, [])
+
+
+def test_preflight_warns_on_a_brief_with_no_publication_block(tmp_path):
+    """64 briefs are leftovers for nodes no longer proposed. Not a leak risk, so
+    a warning rather than a refusal - but building from them is still wrong."""
+    import batch
+
+    _pub_brief(tmp_path, "old", None)
+
+    class A:
+        briefs_root = str(tmp_path)
+
+    refuse, stale = batch._check_publication(A(), "briefs", ["old"])
+    assert refuse == {} and stale == ["old"]
