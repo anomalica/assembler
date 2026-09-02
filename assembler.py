@@ -2236,6 +2236,36 @@ def _display_name(canonical: str) -> str:
     return f"{first} {last}".strip()
 
 
+# Mark, 2026-09-03 (editorial-style.md, Acronyms): exactly two acronyms are
+# written bare in a TITLE - UFO and UAP - with no expansion and no bracketed
+# gloss. They are the platform's own subject, expanding UAP would force every
+# title to settle "Anomalous" against "Aerial", and a bare UFO translates where
+# a bracketed English expansion does not. The title only: node names keep
+# "Full Name (ACRONYM)" so the matcher and the slug are untouched, and body prose
+# keeps its own safe list. The parenthetical must be exactly (UFO) or (UAP) and
+# must follow its own expansion - "Unidentified Aerial Phenomena Task Force
+# (UAPTF)" is a proper name and stays.
+_BARE_TITLE_ACRONYM_RE = re.compile(
+    r"\bUnidentified (?:"
+    r"(?P<ufo>Flying Objects?)\s*\(UFO\)"
+    r"|(?P<uap>(?:Anomalous|Aerial) Phenomen(?:a|on))\s*\(UAP\)"
+    r")"
+)
+
+
+def collapse_bare_title_acronyms(title: str) -> str:
+    """'Unidentified Anomalous Phenomena (UAP)' -> 'UAP', anywhere in a title."""
+    return _BARE_TITLE_ACRONYM_RE.sub(
+        lambda m: "UFO" if m.group("ufo") else "UAP", title
+    )
+
+
+def _title_display(title: str) -> str:
+    """The headline a reader sees. _display_name alone also keys the link index
+    and rewrites link text, so the title-only collapse lives here, not there."""
+    return collapse_bare_title_acronyms(_display_name(title))
+
+
 def _rewrite_link_display(body: str) -> str:
     """Rewrite markdown links whose display text is a Last-comma-First person
     name. URL stays untouched (the slug is derived from the natural-order
@@ -2767,7 +2797,7 @@ def render_article(
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
-        frontmatter = {**frontmatter, "title": _display_name(frontmatter["title"])}
+        frontmatter = {**frontmatter, "title": _title_display(frontmatter["title"])}
     # built_from audit field (brief-sourced entity articles): the brief's freeze
     # is authoritative, so drop any model-emitted built_from first, then slot it
     # after metadata - or after description when the model omits the optional
@@ -2922,7 +2952,7 @@ def render_record_page(
     ({workbenchUrl}/{record_hash}). The facts/entities QA breakdown is NOT emitted
     - it is consolidated in the workbench, not the public site."""
     frontmatter = {
-        "title": _display_name(article_fm.get("title", "")),
+        "title": _title_display(article_fm.get("title", "")),
         "description": article_fm.get("description", ""),
         "noindex": True,
         "metadata": metadata,

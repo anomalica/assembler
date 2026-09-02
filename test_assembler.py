@@ -1325,3 +1325,48 @@ def test_direct_path_refuses_a_barred_model_before_building_anything(monkeypatch
         sys, "argv", ["assembler.py", "--brief", "x", "--model", "sonnet"]
     )
     assert a.main() == 2
+
+
+def test_titles_write_ufo_and_uap_bare():
+    """Mark, 2026-09-03: exactly two acronyms bare in a title, with no expansion
+    and no bracketed gloss. Deterministic on the way out, not by prompt."""
+    c = a.collapse_bare_title_acronyms
+    assert c("Unidentified Flying Object (UFO)") == "UFO"
+    assert c("Unidentified Anomalous Phenomena (UAP)") == "UAP"
+    assert c("Unidentified Aerial Phenomena (UAP)") == "UAP"
+    assert (
+        c("Unidentified Aerial Phenomena (UAP) Disclosure Act") == "UAP Disclosure Act"
+    )
+    assert (
+        c("2014-2015 US East Coast Unidentified Aerial Phenomena (UAP) encounters")
+        == "2014-2015 US East Coast UAP encounters"
+    )
+
+
+def test_title_collapse_leaves_proper_names_and_other_acronyms_alone():
+    """The parenthetical must be exactly (UFO) or (UAP) and follow its own
+    expansion. UAPTF is that office's name, not a gloss."""
+    c = a.collapse_bare_title_acronyms
+    assert c("Unidentified Aerial Phenomena Task Force (UAPTF)") == (
+        "Unidentified Aerial Phenomena Task Force (UAPTF)"
+    )
+    assert c("Central Intelligence Agency (CIA)") == "Central Intelligence Agency (CIA)"
+    assert c("Unidentified Flying Object") == "Unidentified Flying Object", (
+        "no gloss, no collapse"
+    )
+    assert c("Something (UAP)") == "Something (UAP)", (
+        "an acronym without its own expansion"
+    )
+
+
+def test_title_collapse_does_not_reach_names_or_the_link_index():
+    """Rule 3: node names, slugs and the link index keep the expanded form -
+    `ufo` is a matcher stopword, so a bare name would be all-stopword."""
+    assert (
+        a._display_name("Unidentified Flying Object (UFO)")
+        == "Unidentified Flying Object (UFO)"
+    )
+    assert (
+        a.slugify("Unidentified Flying Object (UFO)")
+        == "unidentified-flying-object-ufo"
+    )
