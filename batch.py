@@ -216,10 +216,10 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         nodes = {
             r[0]: r for r in conn.execute("SELECT id, name, retired_at FROM nodes")
         }
-        for bf in sorted(root.glob("*.yaml")):
+        for bf in asm.brief_files(root):
             nid = _brief_page_block(bf).get("node_id")
             if nid:
-                by_node.setdefault(nid, []).append(bf.stem)
+                by_node.setdefault(nid, []).append(asm.brief_ref(root, bf))
     except sqlite3.Error:
         nodes = {}  # no graph: fall back to the publication check alone
 
@@ -939,7 +939,7 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
     )
 
     stale: list[tuple] = []
-    for brief in sorted(briefs.glob("*.yaml")):
+    for brief in asm.brief_files(briefs):
         page = _brief_page_block(brief)
         if not page:
             continue

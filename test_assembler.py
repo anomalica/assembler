@@ -1143,3 +1143,87 @@ def test_model_policy_absent_does_not_block_a_local_run():
     import batch
 
     assert batch._check_model_policy("anything") is None or True
+
+
+def _sectioned_brief(
+    root, section, slug, node_id, node_type="topic", status="published"
+):
+    d = root / section
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{slug}.yaml").write_text(
+        f"publication:\n  status: {status}\n"
+        f"page:\n  node_id: {node_id}\n  node_type: {node_type}\n  slug: {slug}\n"
+        "  title: T\n  claim_count: 5\n"
+        "claims:\n- claim_id: c\n"
+    )
+
+
+def test_brief_files_sees_both_layouts(tmp_path):
+    """A brief moved from <root>/<slug>.yaml to <root>/<section>/<slug>.yaml.
+    A glob on the old layout alone matches nothing after the flip, and the
+    link index would then drop every link in every page with only a warning."""
+    (tmp_path / "flat.yaml").write_text("page:\n  node_id: a\n")
+    _sectioned_brief(tmp_path, "events", "nested", "b")
+    refs = sorted(a.brief_ref(tmp_path, p) for p in a.brief_files(tmp_path))
+    assert refs == ["events/nested", "flat"]
+
+
+def test_link_index_finds_a_sectioned_brief(tmp_path):
+    _sectioned_brief(tmp_path, "events", "apollo-14", "n1", node_type="event")
+    idx = a.build_link_index(tmp_path, None, 0)
+    assert "apollo-14" in idx["by_slug"], "the flip must not blind the link index"
+
+
+def test_check_orphans_walks_sectioned_briefs(tmp_path, capsys):
+    import sqlite3
+
+    import batch
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, node_type TEXT, name TEXT, retired_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE node_merges (merge_id TEXT, survivor_id TEXT, victim_id TEXT, undone_at TEXT)"
+    )
+    conn.execute("CREATE TABLE claim_node_refs (node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('dead','event','Old Event','2026-08-25')")
+    conn.commit()
+    conn.close()
+    briefs = tmp_path / "briefs"
+    _sectioned_brief(briefs, "events", "old-event", "dead", node_type="event")
+    pages = tmp_path / "pages" / "events"
+    pages.mkdir(parents=True)
+    (pages / "old-event.en.md").write_text("---\ntitle: x\n---\n")
+    assert batch.check_orphans(str(tmp_path), str(briefs), str(db)) == 1
+    assert "old-event" in capsys.readouterr().err
+
+
+def test_same_slug_in_two_sections_is_not_a_stale_slug(tmp_path):
+    """The reason for the move: an event and a project both called "Apollo 14"
+    are two nodes with two briefs. The stale-slug check keys on node id, so two
+    sections sharing a slug must NOT be reported as one node at two slugs."""
+    import batch
+
+    _sectioned_brief(tmp_path, "events", "apollo-14", "n-event", node_type="event")
+    _sectioned_brief(
+        tmp_path, "projects", "apollo-14", "n-project", node_type="project"
+    )
+    args = _pub_args(tmp_path, live=("n-event", "n-project"))
+    refuse, stale = batch._check_publication(
+        args, "briefs", ["events/apollo-14", "projects/apollo-14"]
+    )
+    assert refuse == {} and stale == []
+
+
+def test_stale_slug_refusal_names_the_sectioned_replacement(tmp_path):
+    import batch
+
+    _sectioned_brief(tmp_path, "topics", "old-name", "n1")
+    _sectioned_brief(tmp_path, "topics", "new-name", "n1")
+    args = _pub_args(tmp_path, live=("n1",))
+    refuse, _ = batch._check_publication(args, "briefs", ["topics/old-name"])
+    assert "topics/new-name" in refuse["topics/old-name"], (
+        "name the brief to build instead, with its section"
+    )

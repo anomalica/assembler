@@ -671,6 +671,27 @@ def build_facts(digest: dict, content_root: Path) -> list[dict]:
 # ----------------------------------------------------------------------------
 
 
+def brief_files(briefs_root) -> list:
+    """Every brief under the root, whichever layout it is in.
+
+    A brief moved from <root>/<slug>.yaml to <root>/<section>/<slug>.yaml - the
+    same two halves as the page it feeds - because a slug is only unique within a
+    node type, and an event and a project both called "Apollo 14" shared one file.
+    Both patterns are matched so the flip cannot blind a consumer: a glob on the
+    old layout alone would match nothing, and the link index would then drop
+    every link in every page with only a warning.
+    """
+    root = Path(briefs_root)
+    return sorted(set(root.glob("*.yaml")) | set(root.glob("*/*.yaml")))
+
+
+def brief_ref(briefs_root, path) -> str:
+    """The reference a brief is addressed by: "<section>/<slug>", or a bare slug
+    for a brief still in the flat layout."""
+    rel = Path(path).relative_to(Path(briefs_root))
+    return rel.with_suffix("").as_posix()
+
+
 def load_brief(briefs_root: Path, ref: str) -> tuple[dict, str] | None:
     """Locate and parse a synthesiser brief. `ref` is a page slug (the filename
     stem) or a path to a brief .yaml. Returns (brief, slug) or None."""
@@ -2250,7 +2271,11 @@ def _link_index_fingerprint(
     process. The fingerprint is what lets that parse be done once.
     """
     h = hashlib.sha256(f"v1|{min_claims}".encode())
-    for root, pattern in ((briefs_root, "*.yaml"), (content_root, "pages/*/*.en.md")):
+    for root, pattern in (
+        (briefs_root, "*.yaml"),
+        (briefs_root, "*/*.yaml"),
+        (content_root, "pages/*/*.en.md"),
+    ):
         if not root:
             continue
         for f in sorted(Path(root).glob(pattern)):
@@ -2315,7 +2340,7 @@ def build_link_index(
 
     if briefs_root:
         unreadable: list[str] = []
-        for bf in sorted(Path(briefs_root).glob("*.yaml")):
+        for bf in brief_files(briefs_root):
             try:
                 page = (yaml.safe_load(bf.read_text()) or {}).get("page") or {}
             except (OSError, yaml.YAMLError):
