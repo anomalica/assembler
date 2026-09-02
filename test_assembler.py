@@ -1309,3 +1309,19 @@ def test_check_orphans_reports_a_page_no_brief_owns(tmp_path, capsys):
     assert rc == 1
     assert "/topics/nobody/" in err, "an assembled page with no brief must be named"
     assert "index" not in err, "a section index page is not an article"
+
+
+def test_direct_path_refuses_a_barred_model_before_building_anything(monkeypatch):
+    """Master's follow-up: the dispatch check landed only after the link index
+    and prompt were built - 220 seconds on Socorro. The same check at parse
+    time must refuse before any of that starts."""
+    import sys
+
+    def built(*_a, **_k):
+        raise AssertionError("the link index was built for a run the policy refuses")
+
+    monkeypatch.setattr(a, "cached_link_index", built)
+    monkeypatch.setattr(
+        sys, "argv", ["assembler.py", "--brief", "x", "--model", "sonnet"]
+    )
+    assert a.main() == 2

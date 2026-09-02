@@ -3237,6 +3237,16 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    # Model policy, checked at parse time so the direct path refuses in seconds.
+    # The dispatch check in call_claude is the backstop and still runs; without
+    # this one it was reached only after the link index and prompt were built -
+    # 220 seconds on Socorro - before the run was told no.
+    try:
+        enforce_model_policy(args.model)
+    except Exception as exc:  # PolicyRefusal; anything else is still a refusal
+        print(f"MODEL NOT PERMITTED: {exc}", file=sys.stderr)
+        return 2
+
     # Pre-flight spend gate for the SINGLE-article path. batch.py has always
     # printed an estimate and refused without --confirm, but `assembler.py
     # --node ...` - the invocation this module's own docstring documents - went
