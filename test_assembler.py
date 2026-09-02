@@ -1227,3 +1227,16 @@ def test_stale_slug_refusal_names_the_sectioned_replacement(tmp_path):
     assert "topics/new-name" in refuse["topics/old-name"], (
         "name the brief to build instead, with its section"
     )
+
+
+def test_confirm_tail_never_calls_a_metered_run_the_subscription(monkeypatch):
+    """The last sentence before --confirm names the bill. For an OpenRouter
+    model with the Anthropic toggle off it said "the subscription" under a
+    banner reading "metered - OpenRouter"."""
+    import batch
+
+    monkeypatch.delenv("ASSEMBLER_USE_API", raising=False)
+    monkeypatch.delenv("ANOMALICA_USE_API", raising=False)
+    assert "METERED" in batch._confirm_tail("openai/gpt-5.6-sol")
+    assert "subscription" not in batch._confirm_tail("openai/gpt-5.6-sol")
+    assert "subscription" in batch._confirm_tail("sonnet")

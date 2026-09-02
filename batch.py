@@ -151,6 +151,19 @@ def _check_slug_collisions(args, kind: str, items: list[str]) -> dict[str, list[
 _PUBLISHED_STATUSES = frozenset({"redacted", "published"})
 
 
+def _confirm_tail(model: str) -> str:
+    """The last sentence the operator reads before typing --confirm: which bill
+    it lands on. Any metered route counts, not only the Anthropic toggle - an
+    OpenRouter model is metered whatever the toggle says. This sentence once
+    read "to generate on the subscription" for openai/gpt-5.6-sol, directly under
+    a banner that said "metered - OpenRouter", which is the one thing the gate
+    must never say about a run that costs money.
+    """
+    if asm._use_api() or asm.is_openrouter_model(model):
+        return "once the dollar amount above is cleared - this run is METERED"
+    return "to generate on the subscription"
+
+
 def _check_model_policy(model: str) -> str | None:
     """Why the policy refuses this model for reader-facing prose, or None.
 
@@ -1341,13 +1354,9 @@ def main() -> int:
             return 2
 
     if not args.confirm:
-        tail = (
-            "once the dollar amount above is cleared"
-            if asm._use_api()
-            else "to generate on the subscription"
-        )
         print(
-            f"\nPre-flight only - nothing generated. Re-run with --confirm {tail}.",
+            "\nPre-flight only - nothing generated. Re-run with --confirm "
+            f"{_confirm_tail(args.model)}.",
             file=sys.stderr,
         )
         return 0
