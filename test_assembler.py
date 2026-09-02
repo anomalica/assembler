@@ -1240,3 +1240,24 @@ def test_confirm_tail_never_calls_a_metered_run_the_subscription(monkeypatch):
     assert "METERED" in batch._confirm_tail("openai/gpt-5.6-sol")
     assert "subscription" not in batch._confirm_tail("openai/gpt-5.6-sol")
     assert "subscription" in batch._confirm_tail("sonnet")
+
+
+def test_check_orphans_reports_a_page_no_brief_owns(tmp_path, capsys):
+    """The sweep walks briefs, so a page whose brief is gone is invisible to it
+    by construction. The Australian Department of Defence page sat that way -
+    live node, zero claims, no brief, dead citations - until someone read it."""
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    (
+        content / "pages" / "topics" / "old-topic.en.md"
+    ).unlink()  # the retired case, out of the way
+    (content / "pages" / "topics" / "nobody.en.md").write_text("---\ntitle: x\n---\n")
+    (content / "pages" / "topics" / "index.en.md").write_text(
+        "---\ntitle: section\n---\n"
+    )
+    rc = batch.check_orphans(str(content), str(briefs), str(db))
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "/topics/nobody/" in err, "an assembled page with no brief must be named"
+    assert "index" not in err, "a section index page is not an article"
