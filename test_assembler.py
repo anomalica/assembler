@@ -620,8 +620,15 @@ def test_openrouter_is_selected_by_model_id_not_a_flag(monkeypatch):
 
     calls.clear()
     monkeypatch.setattr(a, "_use_api", lambda: False)
-    a.call_claude("x", model="sonnet")
-    assert "cli" in calls and "or" not in calls
+    # "sonnet" used to reach the CLI here. The policy now refuses every Claude
+    # model for reader-facing prose, so the assertion is that NO transport is
+    # touched, not that the CLI one is.
+    import pytest
+    from anomalica_common import model_policy as mp
+
+    with pytest.raises(mp.PolicyRefusal):
+        a.call_claude("x", model="sonnet")
+    assert calls == {}, "a refused model must not reach any transport"
 
 
 def test_openrouter_refuses_without_a_key(monkeypatch):
@@ -1137,12 +1144,53 @@ def test_model_policy_permits_the_stage_models():
     assert batch._check_model_policy("openai/gpt-5.6-sol") is None
 
 
-def test_model_policy_absent_does_not_block_a_local_run():
-    """An unreadable policy is not a reason to refuse - it would make every
-    component unrunnable the moment a shared file moved."""
-    import batch
+def test_default_model_comes_from_the_policy_not_a_constant():
+    """ADR 0047: the priority list for assemble decides what writes a page. A
+    constant "sonnet" sat here while the policy refused it."""
+    from anomalica_common import model_policy as mp
 
-    assert batch._check_model_policy("anything") is None or True
+    assert a.DEFAULT_MODEL == mp.load().choose("assemble")
+    assert a.DEFAULT_MODEL.startswith("openai/")
+
+
+def test_dispatch_refuses_a_barred_model_before_any_call(monkeypatch):
+    """The gap master named: a direct `python assembler.py` run never passed
+    through batch.py's pre-flight, so the check has to sit in the dispatch."""
+    from anomalica_common import model_policy as mp
+    import pytest
+
+    def boom(*_a, **_k):
+        raise AssertionError("a transport was reached with a barred model")
+
+    monkeypatch.setattr(a, "_call_cli", boom)
+    monkeypatch.setattr(a, "_call_api", boom)
+    monkeypatch.setattr(a, "_call_openrouter", boom)
+    with pytest.raises(mp.PolicyRefusal) as e:
+        a.call_claude("prompt", "sonnet")
+    assert "openai/gpt-5.6-sol" in str(e.value), (
+        "the refusal must name what IS permitted"
+    )
+
+
+def test_dispatch_lets_a_permitted_model_through(monkeypatch):
+    monkeypatch.setattr(a, "_call_openrouter", lambda prompt, model: f"ok:{model}")
+    assert a.call_claude("prompt", "openai/gpt-5.6-sol") == "ok:openai/gpt-5.6-sol"
+
+
+def test_dispatch_fails_closed_when_the_policy_cannot_be_read(monkeypatch):
+    """A missing shared file must not become permission to write reader-facing
+    prose with whatever was passed."""
+    from anomalica_common import model_policy as mp
+    import pytest
+
+    monkeypatch.setattr(
+        mp, "load", lambda *a, **k: (_ for _ in ()).throw(OSError("gone"))
+    )
+    monkeypatch.setattr(a, "_call_openrouter", lambda *a, **k: "must not run")
+    with pytest.raises(mp.PolicyRefusal):
+        a.call_claude("prompt", "openai/gpt-5.6-sol")
+    with pytest.raises(mp.PolicyRefusal):
+        a.call_claude("prompt", None)
 
 
 def _sectioned_brief(

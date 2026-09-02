@@ -52,7 +52,28 @@ DEFAULT_DB = "/db/knowledge.db"
 DEFAULT_CONTENT_ROOT = "/content"
 DEFAULT_DIGESTS_ROOT = "/digests"
 DEFAULT_BRIEFS_ROOT = os.environ.get("ANOMALICA_BRIEFS_DIR", "/briefs")
-DEFAULT_MODEL = "sonnet"
+
+
+def _policy_default_model() -> str | None:
+    """The best permitted model for reader-facing prose, from the model policy.
+
+    ADR 0047: every component resolves its model through the shared policy, and
+    the priority list for `assemble` is what may write a page a reader reads. A
+    constant here was the enforcement gap - "sonnet" sat in this file while the
+    policy refused it, and a direct `python assembler.py --node ...` run outside
+    the scheduler wrote pages with it. None when the policy cannot be read; the
+    dispatch then refuses rather than guessing, and import still succeeds so the
+    digester's gate and the tests can load this module.
+    """
+    try:
+        from anomalica_common import model_policy as mp
+
+        return mp.load().choose("assemble")
+    except Exception:
+        return None
+
+
+DEFAULT_MODEL = _policy_default_model()
 
 # Entity types surfaced in a record page's `entities` breakdown, in display
 # order. Deliberately a subset of SECTION_BY_TYPE: curator-only types (pattern)
@@ -1511,7 +1532,40 @@ def _get_usage() -> dict:
     return dict(_usage)
 
 
+def enforce_model_policy(model: str | None, stage: str = "assemble") -> str:
+    """Refuse, before any call, a model the policy bars from this stage.
+
+    Fails CLOSED. An unreadable policy is a refusal, not a pass: the one thing
+    this must never do is write reader-facing prose with a watermarking model
+    because a shared file was missing. Anthropic is state `watermarks` as of
+    2026-09-02 and this stage is read by a person, so every Claude model is
+    refused here; the permitted list is the policy's, not this file's.
+    """
+    from anomalica_common import model_policy as mp
+
+    if not model:
+        raise mp.PolicyRefusal(
+            stage,
+            None,
+            "no model resolved: the model policy could not be read, and this stage "
+            "writes prose a reader sees - refusing rather than guessing",
+        )
+    try:
+        policy = mp.load()
+    except Exception as exc:
+        raise mp.PolicyRefusal(
+            stage, model, f"model policy unreadable ({exc}); refusing to run unchecked"
+        ) from exc
+    why = policy.refusal(stage, model)
+    if why:
+        raise mp.PolicyRefusal(
+            stage, model, f"{why}. Permitted: {', '.join(policy.priority(stage))}"
+        )
+    return model
+
+
 def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    enforce_model_policy(model)
     """Generate the article. Defaults to the Claude subscription via the CLI;
     set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
     if is_openrouter_model(model):
@@ -3137,7 +3191,11 @@ def main() -> int:
         help="Hugo content section (defaults to derived from node type)",
     )
     ap.add_argument(
-        "--model", default=DEFAULT_MODEL, help="Claude model (default: sonnet)"
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Model to write with. Default: the model policy's first permitted "
+        "choice for the assemble stage; a model the policy bars is refused "
+        "before any call.",
     )
     ap.add_argument(
         "--dry-run",

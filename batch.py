@@ -982,7 +982,13 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
     # exactly this state, live node, zero claims, no brief, four dead citations,
     # until a person read it. Record pages are built from digests and never had
     # a brief; a section's index page is not an article. Everything else should.
-    have = {asm.brief_ref(briefs, bf) for bf in asm.brief_files(briefs)}
+    have = set()
+    for bf in asm.brief_files(briefs):
+        have.add(asm.brief_ref(briefs, bf))
+        pg = _brief_page_block(bf)
+        if pg.get("node_type"):  # a flat-layout brief has no section in its path
+            sec = asm.SECTION_BY_TYPE.get(pg["node_type"], f"{pg['node_type']}s")
+            have.add(f"{sec}/{bf.stem}")
     unowned = sorted(
         f"{md.parent.name}/{md.name[: -len('.en.md')]}"
         for md in root.glob("pages/*/*.en.md")
@@ -1171,7 +1177,12 @@ def main() -> int:
         help="briefs dir (brief mode)",
     )
     ap.add_argument("--content-root", default=asm.DEFAULT_CONTENT_ROOT)
-    ap.add_argument("--model", default=asm.DEFAULT_MODEL, help="sonnet | opus | haiku")
+    ap.add_argument(
+        "--model",
+        default=asm.DEFAULT_MODEL,
+        help="Model to write with (default: the model policy's first permitted "
+        "choice for assemble; a barred model is refused before any call)",
+    )
     ap.add_argument(
         "--delay",
         type=float,
@@ -1224,13 +1235,6 @@ def main() -> int:
     ap.add_argument(
         "--since",
         help="With --report-spend, limit to pages changed since this git revision.",
-    )
-    ap.add_argument(
-        "--allow-barred-model",
-        action="store_true",
-        help="Generate with a model the model policy bars from reader-facing "
-        "prose. Off by default: a watermark in a published page travels into "
-        "every quotation of it.",
     )
     ap.add_argument(
         "--allow-suspect-names",
@@ -1335,14 +1339,13 @@ def main() -> int:
             f"\nMODEL NOT PERMITTED FOR READER-FACING PROSE: {why}",
             file=sys.stderr,
         )
-        if not args.allow_barred_model:
-            print(
-                "\nRefusing to run. ADR 0047 bars watermarking models from stages a "
-                "reader reads - the mark travels into every quotation of the page. "
-                "Pass --allow-barred-model only for output nobody publishes.",
-                file=sys.stderr,
-            )
-            return 2
+        print(
+            "\nRefusing to run. ADR 0047 bars watermarking models from stages a "
+            "reader reads - the mark travels into every quotation of the page. "
+            "There is no override: the dispatch refuses the same model again.",
+            file=sys.stderr,
+        )
+        return 2
 
     refuse_pub, stale_pub = _check_publication(args, kind, resolved)
     if refuse_pub:
