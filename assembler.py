@@ -1626,7 +1626,7 @@ def _estimate_article_cost(
         in_tok, out_tok = FIXED_INPUT_TOKENS, EST_OUTPUT_TOKENS
     else:
         via_openrouter = is_openrouter_model(model)
-        chars_per_token = 3.5 if via_openrouter else CHARS_PER_TOKEN
+        chars_per_token = CHARS_PER_TOKEN  # 3.5 was inherited, unfitted, errs unsafe
         fixed = 0 if via_openrouter else FIXED_INPUT_TOKENS
         in_tok = fixed + round(prompt_chars / chars_per_token)
         # A record page is capped at 300-400 words by its own prompt and cannot

@@ -369,7 +369,11 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         from anomalica_common.llm.cost import price_for
 
         in_price, out_price = price_for(args.model)
-        chars_per_token, fixed_in = 3.5, 0
+        # 2.6, not the inherited 3.5: unfitted on this path, and a higher
+        # chars-per-token UNDER-estimates input, which is the wrong direction
+        # for a window check. Held at the Claude-fitted figure until a real
+        # OpenAI build measures it.
+        chars_per_token, fixed_in = 2.6, 0
     else:
         # One price table, the shared one. A local copy here said sonnet was
         # $3.00/$15.00 while the checked table said $2.00/$10.00, and a 106-page
