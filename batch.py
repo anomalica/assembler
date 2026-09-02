@@ -972,7 +972,22 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
             survivor = by_id.get(_merge_survivor(conn, node_id))
         stale.append((md, brief, row, claims.get(node_id, 0), survivor))
 
-    if not stale:
+    # A page nothing owns: assembled, published, and no brief at any layout.
+    # The sweep above walks BRIEFS, so a page whose brief has gone is invisible
+    # to it by construction - the Australian Department of Defence page sat in
+    # exactly this state, live node, zero claims, no brief, four dead citations,
+    # until a person read it. Record pages are built from digests and never had
+    # a brief; a section's index page is not an article. Everything else should.
+    have = {asm.brief_ref(briefs, bf) for bf in asm.brief_files(briefs)}
+    unowned = sorted(
+        f"{md.parent.name}/{md.name[: -len('.en.md')]}"
+        for md in root.glob("pages/*/*.en.md")
+        if md.parent.name != "records"
+        and md.name != "index.en.md"
+        and f"{md.parent.name}/{md.name[: -len('.en.md')]}" not in have
+    )
+
+    if not stale and not unowned:
         print(
             f"no stale pages: every published page maps to a live node ({len(rows)} nodes)"
         )
@@ -1009,6 +1024,23 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
                 file=sys.stderr,
             )
         print(f"      brief  : {brief}", file=sys.stderr)
+
+    if unowned:
+        print(
+            f"\nUNOWNED PAGE: {len(unowned)} published article(s) have no brief at all, "
+            "so nothing can rebuild them and no sweep that walks briefs can see them.",
+            file=sys.stderr,
+        )
+        for ref in unowned:
+            print(f"  /{ref}/", file=sys.stderr)
+        print(
+            "      Either the node lost its claims to a re-digest or an alias strip, or "
+            "the brief was pruned without the page. Check the node; retire the page "
+            "through the site's per-URL record if nothing can rebuild it.",
+            file=sys.stderr,
+        )
+    if not stale:
+        return 1
 
     print(
         "\nNot pruned, deliberately. Get the redirect to the survivor in place at "
