@@ -533,7 +533,14 @@ def slug_aliases(
     existing inbound link carries the language prefix, so a bare alias alone leaves
     them all 404ing while looking fixed.
     """
-    names = list(node.get("aliases") or [])  # brief-supplied, when it carries them
+    # Every covered node's own name, so a composed page forwards from each
+    # member's slug. Without this the aliases came through asymmetrically: the
+    # UAP member's canonical name happened to be recorded as an alias of itself
+    # and the UFO member's did not, so one superseded slug forwarded and the
+    # other 404'd, with nobody choosing either. Derived from the page's member
+    # list, so it cannot depend on what the alias table happens to hold.
+    names = [n["name"] for n in (node.get("covered") or []) if n.get("name")]
+    names += list(node.get("aliases") or [])  # brief-supplied, when it carries them
     # Every covered node, not just the first: a composed page carries both
     # vocabularies, and the superseded member's names are exactly the ones a
     # reader arriving from the old URL used.
@@ -776,6 +783,7 @@ def brief_node(brief: dict) -> dict:
     return {
         "id": members[0]["node_id"] if members else None,
         "node_ids": [m["node_id"] for m in members],
+        "covered": members,
         "type": pg.get("node_type"),
         "name": pg.get("title") or "",
         "metadata": {"explicit_slug": pg.get("slug")},

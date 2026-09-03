@@ -1875,3 +1875,58 @@ def test_record_pages_keep_their_shape():
     """The record shape is what the entity page now copies; it must not drift."""
     r = a.format_length_block("source")
     assert "cover the source PROPERLY" in r and "NO word limit" in r
+
+
+def test_a_composed_pages_aliases_cover_every_member_symmetrically(tmp_path):
+    """Master's ruling: on a composition the aliases WIN - a superseded slug
+    forwards to the surviving page. That must not depend on the alias table:
+    the UAP member's canonical name happened to be recorded as an alias of
+    itself and the UFO member's did not, so one forwarded and the other 404'd."""
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE aliases (alias TEXT, node_id TEXT)")
+    # only the first member has its own name recorded as an alias of itself
+    conn.execute(
+        "INSERT INTO aliases VALUES ('Unidentified Anomalous Phenomena (UAP)','n1')"
+    )
+    conn.commit()
+    conn.close()
+    node = a.brief_node(
+        {
+            "page": {
+                "title": "UFOs / UAPs",
+                "slug": "ufos-uaps",
+                "node_type": "topic",
+                "nodes": [
+                    {"node_id": "n1", "name": "Unidentified Anomalous Phenomena (UAP)"},
+                    {"node_id": "n2", "name": "Unidentified Flying Object (UFO)"},
+                ],
+            }
+        }
+    )
+    assert [m["node_id"] for m in node["covered"]] == ["n1", "n2"]
+    out = a.slug_aliases(node, "topics", str(db), None)
+    for slug in (
+        "unidentified-anomalous-phenomena-uap",
+        "unidentified-flying-object-ufo",
+    ):
+        assert f"/topics/{slug}/" in out, f"{slug} must forward to the composed page"
+        assert f"/en/topics/{slug}/" in out, "the language-prefixed form too"
+
+
+def test_a_single_node_page_does_not_alias_its_own_slug():
+    """The member rule must not make an ordinary page alias itself."""
+    node = a.brief_node(
+        {
+            "page": {
+                "title": "Telepathy",
+                "slug": "telepathy",
+                "node_type": "topic",
+                "nodes": [{"node_id": "n1", "name": "Telepathy"}],
+            }
+        }
+    )
+    out = a.slug_aliases(node, "topics", None, None)
+    assert "/topics/telepathy/" not in out
