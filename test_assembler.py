@@ -1399,3 +1399,60 @@ def test_title_collapse_does_not_reach_names_or_the_link_index():
         a.slugify("Unidentified Flying Object (UFO)")
         == "unidentified-flying-object-ufo"
     )
+
+
+def test_check_orphans_reports_a_vetoed_nodes_page(tmp_path, capsys):
+    """A veto is the workbench saying "this node should not have a page". The
+    page must come down through the retirement path, so the sweep reports it
+    with the veto's reason and id - and never prunes it here."""
+    import sqlite3
+
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE page_vetoes (veto_id TEXT, node_id TEXT, reason TEXT, "
+        "created_at TEXT, created_by TEXT, undone_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO page_vetoes VALUES ('v1','live','Too generic','2026-09-02T02:32:35Z','workbench',NULL)"
+    )
+    conn.commit()
+    conn.close()
+    (
+        content / "pages" / "topics" / "old-topic.en.md"
+    ).unlink()  # the retired case, out of the way
+    rc = batch.check_orphans(str(content), str(briefs), str(db))
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert (
+        "VETOED" in err
+        and "/topics/good-topic/" in err
+        and "Too generic" in err
+        and "v1" in err
+    )
+    assert (content / "pages" / "topics" / "good-topic.en.md").is_file(), (
+        "reported, never pruned"
+    )
+
+
+def test_check_orphans_ignores_an_undone_veto(tmp_path, capsys):
+    import sqlite3
+
+    import batch
+
+    db, briefs, content = _orphan_fixture(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE page_vetoes (veto_id TEXT, node_id TEXT, reason TEXT, "
+        "created_at TEXT, created_by TEXT, undone_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO page_vetoes VALUES ('v1','live','Too generic','2026-09-02','workbench','2026-09-03')"
+    )
+    conn.commit()
+    conn.close()
+    (content / "pages" / "topics" / "old-topic.en.md").unlink()
+    assert batch.check_orphans(str(content), str(briefs), str(db)) == 0
+    assert "VETOED" not in capsys.readouterr().err

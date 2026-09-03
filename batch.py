@@ -954,14 +954,36 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
     claims = dict(
         conn.execute("SELECT node_id, count(*) FROM claim_node_refs GROUP BY node_id")
     )
+    # A veto is a curation-ledger op the workbench records and the assimilator
+    # replays: "this node should not have a page". The page of a vetoed node has
+    # to come down - but through the retirement path, never here. Undone vetoes
+    # (undone_at set) do not count; the table is the marking, not a side effect.
+    vetoes: dict[str, tuple] = {}
+    try:
+        for veto_id, node_id, reason, created_at in conn.execute(
+            "SELECT veto_id, node_id, reason, created_at FROM page_vetoes "
+            "WHERE undone_at IS NULL"
+        ):
+            vetoes[node_id] = (veto_id, reason, created_at)
+    except sqlite3.OperationalError:
+        pass  # older graph without the table: nothing is vetoed
 
     stale: list[tuple] = []
+    vetoed_pages: list[tuple] = []
     for brief in asm.brief_files(briefs):
         page = _brief_page_block(brief)
         if not page:
             continue
         node_id = page.get("node_id")
         row = by_id.get(node_id)
+        if row is not None and not row[3] and node_id in vetoes:
+            section = asm.SECTION_BY_TYPE.get(
+                page.get("node_type"), f"{page.get('node_type')}s"
+            )
+            md = root / "pages" / section / f"{page.get('slug')}.en.md"
+            if md.is_file():
+                vetoed_pages.append((md, brief, row, vetoes[node_id]))
+            continue
         if row is not None and not row[3]:
             continue  # node is live - nothing to say
         section = asm.SECTION_BY_TYPE.get(
@@ -997,7 +1019,23 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
         and f"{md.parent.name}/{md.name[: -len('.en.md')]}" not in have
     )
 
-    if not stale and not unowned:
+    if vetoed_pages:
+        print(
+            f"VETOED: {len(vetoed_pages)} published page(s) whose node the workbench has "
+            "vetoed. Each must come down through the retirement path - site record "
+            "per URL, reversible entry in anomalica/reference - never a bare delete.",
+            file=sys.stderr,
+        )
+        for md, brief, row, (veto_id, reason, created_at) in vetoed_pages:
+            url = "/" + md.as_posix().split("pages/", 1)[1].replace(".en.md", "/")
+            print(
+                f"  {url}\n      node   : {row[2][:64]!r}\n"
+                f"      veto   : {created_at}  {reason!r}  ({veto_id})\n"
+                f"      brief  : {brief}",
+                file=sys.stderr,
+            )
+
+    if not stale and not unowned and not vetoed_pages:
         print(
             f"no stale pages: every published page maps to a live node ({len(rows)} nodes)"
         )
@@ -1050,7 +1088,7 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
             file=sys.stderr,
         )
     if not stale:
-        return 1
+        return 1  # unowned and/or vetoed pages are findings
 
     print(
         "\nNot pruned, deliberately. Get the redirect to the survivor in place at "
