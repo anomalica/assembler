@@ -1331,9 +1331,9 @@ def test_titles_write_ufo_and_uap_bare():
     """Mark, 2026-09-03: exactly two acronyms bare in a title, with no expansion
     and no bracketed gloss. Deterministic on the way out, not by prompt."""
     c = a.collapse_bare_title_acronyms
-    assert c("Unidentified Flying Object (UFO)") == "UFO"
-    assert c("Unidentified Anomalous Phenomena (UAP)") == "UAP"
-    assert c("Unidentified Aerial Phenomena (UAP)") == "UAP"
+    assert c("Unidentified Flying Object (UFO)") == "UFOs"
+    assert c("Unidentified Anomalous Phenomena (UAP)") == "UAPs"
+    assert c("Unidentified Aerial Phenomena (UAP)") == "UAPs"
     assert (
         c("Unidentified Aerial Phenomena (UAP) Disclosure Act") == "UAP Disclosure Act"
     )
@@ -1369,7 +1369,7 @@ def test_title_display_swaps_names_for_people_only():
     )
     assert a._title_display("Fravor, David", person=True) == "David Fravor"
     assert a._title_display("telepathy") == "Telepathy"
-    assert a._title_display("Unidentified Flying Object (UFO)") == "UFO"
+    assert a._title_display("Unidentified Flying Object (UFO)") == "UFOs"
 
 
 def test_link_display_swaps_names_for_people_links_only():
