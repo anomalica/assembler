@@ -247,7 +247,7 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     if kind != "briefs":
         return {}, []
     root = Path(args.briefs_root).expanduser()
-    nodes, by_node, vetoed = {}, {}, {}
+    nodes, by_node, vetoed, superseded = {}, {}, {}, {}
     pages: dict[str, dict] = {}
     pubs: dict[str, dict] = {}
     try:
@@ -264,6 +264,20 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
             }
         except sqlite3.Error:
             vetoed = {}
+        try:
+            # A composed page supersedes its members' pages, and the member
+            # briefs deliberately stand until the composed article is built - so
+            # for that window both name the same nodes. That is the transition
+            # working, not two pages for one entity, and the ledger tells them
+            # apart.
+            superseded = {
+                f"{r[0]}/{r[1]}": r[2]
+                for r in conn.execute(
+                    "SELECT section, slug, reason FROM superseded_pages"
+                )
+            }
+        except sqlite3.Error:
+            superseded = {}
         # One walk, and keep what it read. The workbench's brief index went 0.4s
         # to 4s when two passes each rebuilt it over 805 files; this loop already
         # visits every brief, so re-reading an item's brief afterwards is pure
@@ -337,9 +351,19 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
             refuse[item] = "its node is not in the graph"
         elif row is not None and row[2]:
             refuse[item] = f"its node was retired {row[2]}"
+        elif item in superseded:
+            refuse[item] = (
+                f"superseded - {superseded[item]}; build the page that replaced it"
+            )
         elif nid and len(by_node.get(nid, [])) > 1:
-            others = [s for s in by_node[nid] if s != item]
-            refuse[item] = f"stale slug - the same node is also briefed as {others[0]}"
+            # Members this brief supersedes do not count: during a composition
+            # the member briefs stand until the composed article exists, and
+            # both name the same nodes on purpose.
+            others = [o for o in by_node[nid] if o != item and o not in superseded]
+            if others:
+                refuse[item] = (
+                    f"stale slug - the same node is also briefed as {others[0]}"
+                )
         elif not status:
             stale.append(item)
     return refuse, stale
