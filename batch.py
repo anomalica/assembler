@@ -1311,6 +1311,24 @@ def retire_vetoed(
             f"{redirects} (read the veto reason first; this is the decision):\n"
         )
         for i in pending:
+            hint = veto_move_candidate(i, Path(content_root).expanduser(), db_path)
+            if hint:
+                # site's rule, and the sharper form of my own: a pasteable block
+                # IS a default, so printing one in the very case where the choice
+                # is real biases it - and `gone` is the harsher outcome. Where a
+                # move may be right, print the evidence and the question and let
+                # a person write the entry. Where no candidate exists there is no
+                # choice to bias, so the block stays and the easy case stays easy.
+                print(hint)
+                print(
+                    "  NO ENTRY EMITTED for this one, deliberately. The choice is real:\n"
+                    "    move  - if the corpus only mentions this subject and the\n"
+                    "            candidate above is what the page's claims are about\n"
+                    "    gone  - if the node itself is wrong, misattributed, or should\n"
+                    "            never have existed; then the claims want looking at too\n"
+                    "  Settle the ground with the reviewer, then hand-write the entry.\n"
+                )
+                continue
             if i["reason"] == "no reason recorded":
                 # The recorder's decision rests on the reviewer's reason; with none,
                 # there is nothing to read and the record would be a rubber stamp.
@@ -1320,9 +1338,6 @@ def retire_vetoed(
                     f"  WARNING: veto {i['veto_id']} carries NO REASON. Ask the reviewer "
                     "for one before recording; the note below says so honestly."
                 )
-            hint = veto_move_candidate(i, Path(content_root).expanduser(), db_path)
-            if hint:
-                print(hint)
             print(veto_site_entry(i, today), end="")
     if not ready:
         return 1
