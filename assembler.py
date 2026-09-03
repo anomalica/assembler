@@ -1377,7 +1377,8 @@ def format_length_block(node_type: str | None) -> str:
         "evidence thrown away. There is NO word limit and no target length - be "
         "as long as the subject needs and no longer. Do not pad, do not repeat the "
         "summary in the body, and do not dwell on whichever episode the claims "
-        "happen to describe in most detail,"
+        "happen to describe in most detail. Use SECTION HEADINGS only if the page "
+        "runs past roughly a thousand words; below that, continuous prose,"
     )
 
 

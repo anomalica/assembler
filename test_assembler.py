@@ -1865,6 +1865,10 @@ def test_entity_pages_have_no_word_ceiling():
     assert "OPEN with a short summary" in e, "summary-first, so a reader can stop there"
     assert "Do not pad" in e, "concision by instruction, not by a number"
     assert "DISTINCT claims" in e and "thirty claims once each" in e
+    # Removing "4-6 paragraphs" also removed what had been suppressing headings:
+    # the first page built without it came back with eight, where 7 of 280 entity
+    # pages carry any. Sections suit a 1,500-word survey and not a 300-word person.
+    assert "SECTION HEADINGS only if" in e and "continuous prose" in e
 
 
 def test_record_pages_keep_their_shape():
