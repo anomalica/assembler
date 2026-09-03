@@ -1823,3 +1823,32 @@ def test_veto_sweep_acts_on_a_composed_pages_second_member(tmp_path, capsys):
     (pages / "composed.en.md").write_text("---\ntitle: x\n---\n")
     items = batch.vetoed_pages(str(tmp_path), str(tmp_path / "briefs"), str(db))
     assert len(items) == 1 and items[0]["veto_id"] == "v2"
+
+
+def test_preflight_refuses_to_rebuild_a_url_the_site_records_as_retired(tmp_path):
+    """site found the mirror of the veto-resurrection gap: a page retired by
+    RULE is outside the veto gate, its brief stays on disk, and the next batch
+    would rebuild it. The record of the retirement is what prevents it."""
+    import batch
+
+    _pub_brief(tmp_path, "elon-musk", "published", node_id="n1")
+    site = tmp_path / "site" / "data"
+    site.mkdir(parents=True)
+    (site / "redirects.yaml").write_text(
+        'redirects:\n  - from: /en/topics/elon-musk/\n    gone: true\n    note: "Retired."\n'
+    )
+    args = _pub_args(tmp_path, live=("n1",))
+    args.site_root = str(tmp_path / "site")
+    refuse, _ = batch._check_publication(args, "briefs", ["elon-musk"])
+    assert "recorded as retired" in refuse["elon-musk"]
+
+
+def test_preflight_build_gate_fails_open_without_a_readable_site_file(tmp_path):
+    """An unreadable site file must not block every build - site's deploy is the
+    second gate, and two gates fail in different directions on purpose."""
+    import batch
+
+    _pub_brief(tmp_path, "fine", "published", node_id="n1")
+    args = _pub_args(tmp_path, live=("n1",))
+    args.site_root = str(tmp_path / "nonexistent")
+    assert batch._check_publication(args, "briefs", ["fine"]) == ({}, [])

@@ -196,6 +196,30 @@ def _check_model_policy(model: str) -> str | None:
     return None
 
 
+def _gone_urls(site_root: str | None) -> set[str]:
+    """URLs the site records as retired, from its data/redirects.yaml.
+
+    The record of a retirement is what should prevent its resurrection. A page
+    retired by RULE rather than by veto - the ten mention-stubs of 2026-09-03 -
+    is outside the veto gate entirely, and its brief stays on disk, so the next
+    batch would rebuild it. Read-only, and failing OPEN: an unreadable file must
+    not block every build, because site's deploy refuses to serve a resurrected
+    page as the second gate.
+    """
+    if not site_root:
+        return set()
+    f = Path(site_root).expanduser() / "data" / "redirects.yaml"
+    try:
+        data = yaml.safe_load(f.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return set()
+    return {
+        str(e.get("from", "")).strip("/")
+        for e in data.get("redirects") or []
+        if e.get("gone") is True
+    }
+
+
 def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     """Items that must not be assembled, mapped to the reason, plus a soft list.
 
@@ -244,8 +268,21 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     except sqlite3.Error:
         nodes = {}  # no graph: fall back to the publication check alone
 
+    gone = _gone_urls(getattr(args, "site_root", None))
     refuse, stale = {}, []
     for item in items:
+        page = _brief_page_block(root / f"{item}.yaml")
+        if gone and page.get("slug") and page.get("node_type"):
+            section = asm.SECTION_BY_TYPE.get(
+                page["node_type"], f"{page['node_type']}s"
+            )
+            url = f"en/{section}/{page['slug']}"
+            if url in gone:
+                refuse[item] = (
+                    f"/{url}/ is recorded as retired at the site; rebuilding it "
+                    "would resurrect a page someone decided to take down"
+                )
+                continue
         bf = root / f"{item}.yaml"
         status = _brief_page_block(bf, key="publication").get("status")
         if status == "unredacted":
