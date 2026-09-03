@@ -248,6 +248,8 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         return {}, []
     root = Path(args.briefs_root).expanduser()
     nodes, by_node, vetoed = {}, {}, {}
+    pages: dict[str, dict] = {}
+    pubs: dict[str, dict] = {}
     try:
         conn = sqlite3.connect(f"file:{Path(args.db).expanduser()}?mode=ro", uri=True)
         nodes = {
@@ -262,16 +264,25 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
             }
         except sqlite3.Error:
             vetoed = {}
+        # One walk, and keep what it read. The workbench's brief index went 0.4s
+        # to 4s when two passes each rebuilt it over 805 files; this loop already
+        # visits every brief, so re-reading an item's brief afterwards is pure
+        # waste that grows with the corpus.
         for bf in asm.brief_files(root):
-            for m in asm.covered_nodes(_brief_page_block(bf)):
-                by_node.setdefault(m["node_id"], []).append(asm.brief_ref(root, bf))
+            ref = asm.brief_ref(root, bf)
+            pages[ref] = _brief_page_block(bf)
+            pubs[ref] = _brief_page_block(bf, key="publication")
+            for m in asm.covered_nodes(pages[ref]):
+                by_node.setdefault(m["node_id"], []).append(ref)
     except sqlite3.Error:
         nodes = {}  # no graph: fall back to the publication check alone
 
     gone = _gone_urls(getattr(args, "site_root", None))
     refuse, stale = {}, []
     for item in items:
-        page = _brief_page_block(root / f"{item}.yaml")
+        page = pages.get(item)
+        if page is None:
+            page = _brief_page_block(root / f"{item}.yaml")
         if gone and page.get("slug") and page.get("node_type"):
             section = asm.SECTION_BY_TYPE.get(
                 page["node_type"], f"{page['node_type']}s"
@@ -284,13 +295,16 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
                 )
                 continue
         bf = root / f"{item}.yaml"
-        status = _brief_page_block(bf, key="publication").get("status")
+        pub = pubs.get(item)
+        if pub is None:
+            pub = _brief_page_block(bf, key="publication")
+        status = pub.get("status")
         if status == "unredacted":
             refuse[item] = "publication.status is unredacted - the internal copy"
             continue
         if status and status not in _PUBLISHED_STATUSES:
             stale.append(f"{item} (unrecognised publication.status: {status})")
-        members = asm.covered_nodes(_brief_page_block(bf))
+        members = asm.covered_nodes(page)
         # Every member gates the page: one retired or vetoed node is enough.
         nid = next((m["node_id"] for m in members if m["node_id"] in vetoed), None)
         if nid is None:
