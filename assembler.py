@@ -1342,20 +1342,42 @@ def format_length_block(node_type: str | None) -> str:
             "the summary in the body, and do not retell a document the page "
             "already displays,"
         )
-    # An ENTITY page had no length or coverage instruction at all, so each model
-    # wrote to its own inclination: 1,326 words and 55 references from one, 292
-    # and 13 from another, on the same brief. That measured the ABSENCE OF A
-    # CONSTRAINT rather than the models. Both numbers are named because a page
-    # can grow longer without citing more, and the citation count is the one that
-    # matters here - an assertion nobody can trace is worth less than no
-    # assertion.
+    # An ENTITY page carried "800-1,200 words in 4-6 paragraphs" until Mark
+    # removed it (2026-09-03): "i want that limit removed. however we want it to
+    # be concise and not full of waffle." Measured across 273 published pages
+    # matched to their briefs, the ceiling did nothing where the material was
+    # thin and everything where it was rich:
+    #
+    #   claims available   pages   median cited   share of evidence used
+    #   under 25            98         14                98%
+    #   25-100             117         31                80%
+    #   100-300             36         58                31%
+    #   300-1,000           17         46                 9%
+    #   over 1,000           5         49                 2%
+    #
+    # Pages under 100 claims come in below the cap on their own; above it the
+    # citation count flatlines near 50 however much evidence exists, so 58 pages
+    # were bound by a number rather than by their material. UFOs / UAPs cited 47
+    # of 2,068.
+    #
+    # What replaces it is NOT the absence of an instruction - that was the
+    # original failure, where one model wrote 1,326 words and 55 references and
+    # another 292 and 13 from the same brief. It is the record-page shape, which
+    # was proved when a 300-400 word cap there cost half the quoted evidence on
+    # every long page. Concision is carried by "do not pad" and by preferring
+    # breadth of citation over repetition, which is what "not full of waffle"
+    # means for a page whose job is to be traceable.
     return (
-        "800-1,200 words in 4-6 paragraphs of British English. Cover the subject "
-        "BROADLY rather than dwelling on whichever episode the claims happen to "
-        "describe in most detail: draw on as many DISTINCT claims as the evidence "
-        "supports, and prefer citing thirty claims once each over citing five "
-        "claims repeatedly. A claim in the data that no sentence uses is evidence "
-        "thrown away,"
+        "British English. OPEN with a short summary - two or three sentences "
+        "saying who or what this is and why it matters - as its own first "
+        "paragraph, so a reader wanting only the gist can stop there. Then cover "
+        "the subject PROPERLY below it, citing as many DISTINCT claims as the "
+        "material supports, and prefer citing thirty claims once each over citing "
+        "five claims repeatedly - a claim in the data that no sentence uses is "
+        "evidence thrown away. There is NO word limit and no target length - be "
+        "as long as the subject needs and no longer. Do not pad, do not repeat the "
+        "summary in the body, and do not dwell on whichever episode the claims "
+        "happen to describe in most detail,"
     )
 
 

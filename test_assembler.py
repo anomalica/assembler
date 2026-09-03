@@ -1852,3 +1852,22 @@ def test_preflight_build_gate_fails_open_without_a_readable_site_file(tmp_path):
     args = _pub_args(tmp_path, live=("n1",))
     args.site_root = str(tmp_path / "nonexistent")
     assert batch._check_publication(args, "briefs", ["fine"]) == ({}, [])
+
+
+def test_entity_pages_have_no_word_ceiling():
+    """Mark, 2026-09-03: "i want that limit removed. however we want it to be
+    concise and not full of waffle." Measured over 273 pages, the 800-1,200 cap
+    did nothing below 100 available claims and bound 58 pages above it, where
+    citations flatlined near 50 however much evidence existed."""
+    e = a.format_length_block("person")
+    assert "800-1,200" not in e and "4-6 paragraphs" not in e
+    assert "NO word limit" in e
+    assert "OPEN with a short summary" in e, "summary-first, so a reader can stop there"
+    assert "Do not pad" in e, "concision by instruction, not by a number"
+    assert "DISTINCT claims" in e and "thirty claims once each" in e
+
+
+def test_record_pages_keep_their_shape():
+    """The record shape is what the entity page now copies; it must not drift."""
+    r = a.format_length_block("source")
+    assert "cover the source PROPERLY" in r and "NO word limit" in r
