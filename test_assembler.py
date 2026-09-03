@@ -1456,3 +1456,148 @@ def test_check_orphans_ignores_an_undone_veto(tmp_path, capsys):
     (content / "pages" / "topics" / "old-topic.en.md").unlink()
     assert batch.check_orphans(str(content), str(briefs), str(db)) == 0
     assert "VETOED" not in capsys.readouterr().err
+
+
+def _veto_world(tmp_path):
+    """content repo with two pages (one vetoed node, one not), a briefs dir, a
+    graph with page_vetoes, a site redirects.yaml, and a meta-repo. Real git."""
+    import sqlite3
+    import subprocess
+
+    def git(cwd, *a):
+        subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+
+    content = tmp_path / "content"
+    (content / "pages" / "topics").mkdir(parents=True)
+    briefs = content / "briefs" / "topics"
+    briefs.mkdir(parents=True)
+    for slug, nid in (("bad-topic", "nbad"), ("fine-topic", "nfine")):
+        (content / "pages" / "topics" / f"{slug}.en.md").write_text(
+            "---\ntitle: T\n---\nsome prose<sup>1</sup> here\n"
+        )
+        (briefs / f"{slug}.yaml").write_text(
+            f"publication:\n  status: published\npage:\n  node_id: {nid}\n  node_type: topic\n  slug: {slug}\nclaims:\n- claim_id: c\n"
+        )
+    git(content, "init", "-q")
+    git(content, "config", "user.email", "t@t")
+    git(content, "config", "user.name", "t")
+    git(content, "add", ".")
+    git(content, "commit", "-q", "-m", "seed")
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    git(meta, "init", "-q")
+    git(meta, "config", "user.email", "t@t")
+    git(meta, "config", "user.name", "t")
+    (meta / "README").write_text("x\n")
+    git(meta, "add", ".")
+    git(meta, "commit", "-q", "-m", "seed")
+    site = tmp_path / "site" / "data"
+    site.mkdir(parents=True)
+    (site / "redirects.yaml").write_text("redirects: []\n")
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, name TEXT, node_type TEXT, retired_at TEXT)"
+    )
+    conn.execute("INSERT INTO nodes VALUES ('nbad','Bad Topic','topic',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('nfine','Fine Topic','topic',NULL)")
+    conn.execute(
+        "CREATE TABLE page_vetoes (veto_id TEXT, node_id TEXT, reason TEXT, created_at TEXT, created_by TEXT, undone_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO page_vetoes VALUES ('v1','nbad','Too generic','2026-09-02T02:32:35Z','workbench',NULL)"
+    )
+    conn.commit()
+    conn.close()
+    return content, briefs.parent, db, tmp_path / "site", meta
+
+
+def test_retire_vetoed_prints_the_site_entry_and_removes_nothing_unrecorded(
+    tmp_path, capsys
+):
+    """Contract (A) with site: the run emits the exact gone entry and refuses to
+    remove until a person has recorded it. The safe failure is the page staying."""
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=True
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- from: /en/topics/bad-topic/" in out and "gone: true" in out
+    assert "Too generic" in out and "(v1)" in out and '\n    note: "' in out, (
+        "one quoted line, never a folded scalar"
+    )
+    assert "to:" not in out.split("NOT REMOVED", 1)[1], "never a to: entry for a veto"
+    assert (content / "pages" / "topics" / "bad-topic.en.md").is_file()
+
+
+def test_retire_vetoed_removes_a_recorded_page_and_leaves_the_rest(tmp_path, capsys):
+    import json
+    import subprocess
+
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    (site / "data" / "redirects.yaml").write_text(
+        'redirects:\n  - from: /en/topics/bad-topic/\n    gone: true\n    note: "Retired."\n'
+    )
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=True
+    )
+    assert rc == 0, capsys.readouterr().out
+    assert not (content / "pages" / "topics" / "bad-topic.en.md").exists()
+    assert (content / "pages" / "topics" / "fine-topic.en.md").is_file(), (
+        "nothing but vetoed nodes"
+    )
+    log = subprocess.run(
+        ["git", "log", "-1", "--format=%B"], cwd=content, capture_output=True, text=True
+    ).stdout
+    assert "/en/topics/bad-topic/" in log and "v1" in log, (
+        "the commit names the URL and the veto"
+    )
+    rec = json.loads((meta / "reference" / "veto-retirements.json").read_text())
+    e = rec["entries"][0]
+    assert (
+        e["veto_id"] == "v1"
+        and e["url"] == "/en/topics/bad-topic/"
+        and e["reason"] == "Too generic"
+    )
+    assert "how_to_reverse" in e
+    mlog = subprocess.run(
+        ["git", "log", "-1", "--format=%s"], cwd=meta, capture_output=True, text=True
+    ).stdout
+    assert "veto retirement" in mlog
+    assert (site / "data" / "redirects.yaml").read_text().count("bad-topic") == 1, (
+        "site's file is never written"
+    )
+
+
+def test_retire_vetoed_does_not_count_a_move_entry_as_a_record(tmp_path):
+    """A to: entry is a move; only a gone entry lets the deploy guard accept a
+    path that stops existing. Treating a move as a record would remove the page
+    and then have the deploy refuse it, correctly and confusingly."""
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    (site / "data" / "redirects.yaml").write_text(
+        "redirects:\n  - from: /en/topics/bad-topic/\n    to: /en/topics/other/\n"
+    )
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=True
+    )
+    assert rc == 1 and (content / "pages" / "topics" / "bad-topic.en.md").is_file()
+
+
+def test_retire_vetoed_without_apply_removes_nothing_even_when_recorded(tmp_path):
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    (site / "data" / "redirects.yaml").write_text(
+        'redirects:\n  - from: /en/topics/bad-topic/\n    gone: true\n    note: "Retired."\n'
+    )
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=False
+    )
+    assert rc == 1 and (content / "pages" / "topics" / "bad-topic.en.md").is_file()

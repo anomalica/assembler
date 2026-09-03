@@ -1099,6 +1099,232 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
     return 1
 
 
+def vetoed_pages(content_root: str, briefs_root: str, db_path: str) -> list[dict]:
+    """Every published article whose node carries an active workbench veto.
+
+    The marking is a row in page_vetoes with undone_at NULL - the table the
+    curation op writes - and nothing else: a merge rejection (node_rejections) is
+    "these are not the same entity" and says nothing about pages, and an undone
+    veto makes the node eligible again without restoring an article.
+    """
+    root = Path(content_root).expanduser()
+    conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True)
+    try:
+        vetoes = {
+            r[1]: r
+            for r in conn.execute(
+                "SELECT veto_id, node_id, reason, created_at, created_by "
+                "FROM page_vetoes WHERE undone_at IS NULL"
+            )
+        }
+    except sqlite3.OperationalError:
+        return []
+    names = dict(conn.execute("SELECT id, name FROM nodes"))
+    out = []
+    for bf in asm.brief_files(Path(briefs_root).expanduser()):
+        page = _brief_page_block(bf)
+        v = vetoes.get(page.get("node_id"))
+        if v is None:
+            continue
+        section = asm.SECTION_BY_TYPE.get(
+            page.get("node_type"), f"{page.get('node_type')}s"
+        )
+        md = root / "pages" / section / f"{page.get('slug')}.en.md"
+        if not md.is_file():
+            continue
+        out.append(
+            {
+                "path": md,
+                "url": f"/en/{section}/{page.get('slug')}/",
+                "node_id": v[1],
+                "node": names.get(v[1], "?"),
+                "veto_id": v[0],
+                "reason": (v[2] or "").strip() or "no reason recorded",
+                "vetoed_at": v[3],
+                "vetoed_by": v[4] or "?",
+            }
+        )
+    return out
+
+
+def veto_site_entry(item: dict, today: str) -> str:
+    """The data/redirects.yaml block for a vetoed page, ready to paste.
+
+    Shape agreed with site: `gone: true`, never `to:` (only a gone entry lets the
+    deploy guard accept a path that stops existing); the note ONE quoted line,
+    never a folded scalar (the commit hook's yamlfmt writes its line sentinel
+    into a folded note); `from` /en/-prefixed with a trailing slash; and no entry
+    for the brief page - a vetoed node's brief goes with it silently.
+    """
+    reason = " ".join(item["reason"].split()).replace('"', "'")
+    note = (
+        f"Retired {today} on a workbench veto ({item['veto_id']}): {reason}. "
+        "Reversible: the article is in git history."
+    )
+    return f'  - from: {item["url"]}\n    gone: true\n    note: "{note}"\n'
+
+
+def site_has_gone(redirects_yaml: Path, url: str) -> bool:
+    """Whether site's per-URL record carries a GONE entry for this path. A `to:`
+    entry does not count: that is a move, and a vetoed page has nowhere to go."""
+    if not redirects_yaml.is_file():
+        return False
+    try:
+        data = yaml.safe_load(redirects_yaml.read_text()) or {}
+    except yaml.YAMLError:
+        return False
+    want = url.strip("/")
+    for e in data.get("redirects") or []:
+        if str(e.get("from", "")).strip("/") == want and e.get("gone") is True:
+            return True
+    return False
+
+
+def _git(cwd: Path, *args: str, stdin: str | None = None) -> str:
+    r = subprocess.run(
+        ["git", *args], cwd=cwd, input=stdin, capture_output=True, text=True
+    )
+    if r.returncode:
+        raise RuntimeError(
+            f"git {' '.join(args)} in {cwd}: {(r.stderr or r.stdout).strip()}"
+        )
+    return r.stdout
+
+
+def retire_vetoed(
+    content_root: str,
+    briefs_root: str,
+    db_path: str,
+    site_root: str,
+    reference_root: str,
+    apply: bool,
+) -> int:
+    """Take down the page of every vetoed node - through the retirement path.
+
+    Two independent gates, on purpose: this run will not remove a page until
+    site's data/redirects.yaml carries a gone entry for its URL, and site's
+    deploy will not delete a path without one. The site repo is READ here and
+    never written - a gate is worth nothing when the actor it gates can satisfy
+    it. For a page without an entry the run prints the exact block and skips;
+    a person reads the veto reason, records it, and the next run removes the
+    page. If nobody records it, the page stays up: the safe failure.
+
+    With the entry present and --apply: the page is removed by pathspec, a
+    reversible entry keyed by veto id is written to
+    <reference_root>/reference/veto-retirements.json, and both are committed
+    with every URL and veto id named. Nothing is pushed here and the deploy
+    stays site's, on a person's word. Nothing but vetoed nodes is ever touched.
+    """
+    from datetime import date
+
+    items = vetoed_pages(content_root, briefs_root, db_path)
+    if not items:
+        print("no vetoed node has a published page")
+        return 0
+    today = date.today().isoformat()
+    redirects = Path(site_root).expanduser() / "data" / "redirects.yaml"
+    ready = [i for i in items if site_has_gone(redirects, i["url"])]
+    pending = [i for i in items if i not in ready]
+    print(
+        f"VETOED PAGES: {len(items)}  recorded at site: {len(ready)}  "
+        f"awaiting a record: {len(pending)}"
+    )
+    for i in items:
+        print(
+            f"  {i['url']}   node {i['node'][:50]!r}   veto {i['vetoed_at']} "
+            f"by {i['vetoed_by']}: {i['reason'][:60]!r}"
+        )
+    if pending:
+        print(
+            "\nNOT REMOVED - no gone entry at site for these. Paste into "
+            f"{redirects} (read the veto reason first; this is the decision):\n"
+        )
+        for i in pending:
+            print(veto_site_entry(i, today), end="")
+    if not ready:
+        return 1
+    if not apply:
+        print(
+            f"\n{len(ready)} page(s) recorded and ready to remove. Re-run with --apply."
+        )
+        return 1
+
+    content = Path(content_root).expanduser()
+    ref_root = Path(reference_root).expanduser()
+    ref_file = ref_root / "reference" / "veto-retirements.json"
+    record = (
+        json.loads(ref_file.read_text())
+        if ref_file.is_file()
+        else {"record": "veto-retirements", "entries": []}
+    )
+    known = {e.get("veto_id") for e in record["entries"]}
+    paths = []
+    for i in ready:
+        raw = i["path"].read_text()
+        body = raw.split("\n---\n", 1)[-1]
+        rel = str(i["path"].relative_to(content))
+        if i["veto_id"] not in known:
+            record["entries"].append(
+                {
+                    "veto_id": i["veto_id"],
+                    "node_id": i["node_id"],
+                    "node": i["node"],
+                    "url": i["url"],
+                    "page": rel,
+                    "vetoed_at": i["vetoed_at"],
+                    "vetoed_by": i["vetoed_by"],
+                    "reason": i["reason"],
+                    "retired": today,
+                    "words": len(re.sub(r"<sup>.*?</sup>", "", body).split()),
+                    "citations": len(re.findall("<sup>", raw)),
+                    "how_to_reverse": "git checkout <retirement commit>^ -- <page>; "
+                    "remove the URL's entry from site/data/redirects.yaml; push both; "
+                    "site deploys.",
+                }
+            )
+        paths.append(rel)
+    ref_file.parent.mkdir(parents=True, exist_ok=True)
+    ref_file.write_text(json.dumps(record, indent=2) + "\n")
+
+    for rel in paths:
+        _git(content, "rm", "-q", "--", rel)
+    urls = "\n".join(
+        f"    {i['url']}   veto {i['veto_id']}  {i['reason'][:70]!r}" for i in ready
+    )
+    msg = (
+        f"prune: retire {len(ready)} page(s) of workbench-vetoed node(s)\n\n"
+        "A veto is a reviewer's judgement that the node should not have a page. Each\n"
+        "URL was recorded at the site as gone before this removal, and each entry is\n"
+        f"reversible from reference/veto-retirements.json in the meta-repo.\n\n{urls}\n"
+    )
+    _git(content, "commit", "-q", "-F", "-", "--", *paths, stdin=msg)
+    ref_rel = str(ref_file.relative_to(ref_root))
+    _git(ref_root, "add", "--", ref_rel)
+    r = subprocess.run(
+        [
+            "git",
+            "commit",
+            "-q",
+            "-m",
+            f"reference: record {len(ready)} veto retirement(s) of {today}",
+            "--",
+            ref_rel,
+        ],
+        cwd=ref_root,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode and "nothing to commit" not in (r.stdout + r.stderr):
+        raise RuntimeError(f"reference commit failed: {(r.stderr or r.stdout).strip()}")
+    print(
+        f"\nremoved {len(ready)} page(s); recorded in {ref_file}; committed by pathspec in both repos."
+    )
+    print(
+        "Push content and tell site to deploy - the deploy is theirs, on a person's word."
+    )
+    return 0
+
+
 def _front_matter(md: Path) -> dict:
     try:
         m = re.match(r"^---\n(.*?)\n---\n", md.read_text(encoding="utf-8"), re.S)
@@ -1265,6 +1491,18 @@ def main() -> int:
         "the page cannot be pruned until its URL redirects to the survivor.",
     )
     ap.add_argument(
+        "--retire-vetoed",
+        action="store_true",
+        help="Take down the page of every node the workbench has vetoed, through "
+        "the retirement path: prints the site record to paste for any URL not yet "
+        "recorded and removes nothing without one; with --apply, removes recorded "
+        "pages by pathspec and writes a reversible entry to the meta-repo. The "
+        "site repo (--site-root) is only ever read.",
+    )
+    ap.add_argument(
+        "--reference-root", default="../anomalica", help="meta-repo holding reference/"
+    )
+    ap.add_argument(
         "--report-spend",
         action="store_true",
         help="Report what assembly actually cost, summed from each article's "
@@ -1331,6 +1569,19 @@ def main() -> int:
 
     if args.check_orphans:
         return check_orphans(args.content_root, args.briefs_root, args.db)
+
+    if args.retire_vetoed:
+        site_root = args.site_root or str(
+            Path(args.content_root).expanduser().parent / "site"
+        )
+        return retire_vetoed(
+            args.content_root,
+            args.briefs_root,
+            args.db,
+            site_root,
+            args.reference_root,
+            args.apply,
+        )
 
     if args.retarget_links:
         return retarget_links(args.content_root, args.apply, args.db)
