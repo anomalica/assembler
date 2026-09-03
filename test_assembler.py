@@ -1663,3 +1663,41 @@ def test_retire_vetoed_names_a_move_candidate_without_presuming_it(tmp_path, cap
     assert "gone: true" in out and "to:" not in out.split("NOT REMOVED", 1)[1], (
         "named, never presumed"
     )
+
+
+def test_preflight_refuses_a_brief_whose_node_is_vetoed(tmp_path):
+    """Retiring a vetoed node's page leaves its brief on disk; without this a
+    later batch rebuilds the page, undoing a reviewer's decision and spending
+    metered money to do it."""
+    import sqlite3
+
+    import batch
+
+    _pub_brief(tmp_path, "banned", "published", node_id="n1")
+    args = _pub_args(tmp_path, live=("n1",))
+    conn = sqlite3.connect(args.db)
+    conn.execute(
+        "CREATE TABLE page_vetoes (node_id TEXT, veto_id TEXT, undone_at TEXT)"
+    )
+    conn.execute("INSERT INTO page_vetoes VALUES ('n1','v9',NULL)")
+    conn.commit()
+    conn.close()
+    refuse, _ = batch._check_publication(args, "briefs", ["banned"])
+    assert "vetoed" in refuse["banned"] and "v9" in refuse["banned"]
+
+
+def test_preflight_allows_a_brief_whose_veto_was_undone(tmp_path):
+    import sqlite3
+
+    import batch
+
+    _pub_brief(tmp_path, "ok-again", "published", node_id="n1")
+    args = _pub_args(tmp_path, live=("n1",))
+    conn = sqlite3.connect(args.db)
+    conn.execute(
+        "CREATE TABLE page_vetoes (node_id TEXT, veto_id TEXT, undone_at TEXT)"
+    )
+    conn.execute("INSERT INTO page_vetoes VALUES ('n1','v9','2026-09-03')")
+    conn.commit()
+    conn.close()
+    assert batch._check_publication(args, "briefs", ["ok-again"]) == ({}, [])

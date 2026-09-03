@@ -223,12 +223,21 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     if kind != "briefs":
         return {}, []
     root = Path(args.briefs_root).expanduser()
-    nodes, by_node = {}, {}
+    nodes, by_node, vetoed = {}, {}, {}
     try:
         conn = sqlite3.connect(f"file:{Path(args.db).expanduser()}?mode=ro", uri=True)
         nodes = {
             r[0]: r for r in conn.execute("SELECT id, name, retired_at FROM nodes")
         }
+        try:
+            vetoed = {
+                r[0]: r[1]
+                for r in conn.execute(
+                    "SELECT node_id, veto_id FROM page_vetoes WHERE undone_at IS NULL"
+                )
+            }
+        except sqlite3.Error:
+            vetoed = {}
         for bf in asm.brief_files(root):
             nid = _brief_page_block(bf).get("node_id")
             if nid:
@@ -247,7 +256,15 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
             stale.append(f"{item} (unrecognised publication.status: {status})")
         nid = _brief_page_block(bf).get("node_id")
         row = nodes.get(nid) if nodes else None
-        if nodes and nid and row is None:
+        if nid in vetoed:
+            # A veto is a reviewer's "this node should not have a page". Without
+            # this, retiring the page and then running a batch rebuilds it from
+            # the brief that is still on disk - silently undoing the decision,
+            # and spending metered money to do it.
+            refuse[item] = (
+                f"the workbench has vetoed a page for its node (veto {vetoed[nid]})"
+            )
+        elif nodes and nid and row is None:
             refuse[item] = "its node is not in the graph"
         elif row is not None and row[2]:
             refuse[item] = f"its node was retired {row[2]}"
