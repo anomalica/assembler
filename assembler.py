@@ -36,6 +36,7 @@ from pathlib import Path
 
 import yaml
 from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
+from anomalica_common.titles import capitalise_first, collapse_bare_title_acronyms
 from anomalica_common.llm import (
     PlanRateLimited,
     accumulate,
@@ -2236,34 +2237,20 @@ def _display_name(canonical: str) -> str:
     return f"{first} {last}".strip()
 
 
-# Mark, 2026-09-03 (editorial-style.md, Acronyms): exactly two acronyms are
-# written bare in a TITLE - UFO and UAP - with no expansion and no bracketed
-# gloss. They are the platform's own subject, expanding UAP would force every
-# title to settle "Anomalous" against "Aerial", and a bare UFO translates where
-# a bracketed English expansion does not. The title only: node names keep
-# "Full Name (ACRONYM)" so the matcher and the slug are untouched, and body prose
-# keeps its own safe list. The parenthetical must be exactly (UFO) or (UAP) and
-# must follow its own expansion - "Unidentified Aerial Phenomena Task Force
-# (UAPTF)" is a proper name and stays.
-_BARE_TITLE_ACRONYM_RE = re.compile(
-    r"\bUnidentified (?:"
-    r"(?P<ufo>Flying Objects?)\s*\(UFO\)"
-    r"|(?P<uap>(?:Anomalous|Aerial) Phenomen(?:a|on))\s*\(UAP\)"
-    r")"
-)
+def _title_display(title: str, person: bool = False) -> str:
+    """The headline a reader sees, for an ENTITY page.
 
-
-def collapse_bare_title_acronyms(title: str) -> str:
-    """'Unidentified Anomalous Phenomena (UAP)' -> 'UAP', anywhere in a title."""
-    return _BARE_TITLE_ACRONYM_RE.sub(
-        lambda m: "UFO" if m.group("ufo") else "UAP", title
-    )
-
-
-def _title_display(title: str) -> str:
-    """The headline a reader sees. _display_name alone also keys the link index
-    and rewrites link text, so the title-only collapse lives here, not there."""
-    return collapse_bare_title_acronyms(_display_name(title))
+    Bare UFO/UAP and a leading capital come from the shared title rules. The
+    Last-comma-First swap applies to people only: places are named largest-unit
+    first by convention ("France, Paris") and an organisation's name can end
+    ", LLC", and the swap turned both into nonsense - "Paris France", "LLC
+    Bigelow Aerospace Advanced Space Studies" - on live pages. _display_name
+    alone also keys the link index, so the title rules live here, not there.
+    Record pages do not come through here: a source document's title is
+    verbatim.
+    """
+    title = capitalise_first(collapse_bare_title_acronyms(title))
+    return _display_name(title) if person else title
 
 
 def _rewrite_link_display(body: str) -> str:
@@ -2273,8 +2260,9 @@ def _rewrite_link_display(body: str) -> str:
 
     def _sub(m: re.Match) -> str:
         display, url = m.group(1), m.group(2)
-        new_display = _display_name(display)
-        return f"[{new_display}]({url})"
+        if not url.startswith("/people/"):
+            return m.group(0)  # a place is "France, Paris" by convention; leave it
+        return f"[{_display_name(display)}]({url})"
 
     return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
 
@@ -2794,10 +2782,14 @@ def render_article(
     content_root: Path | None = None,
     built_from: dict | None = None,
     ai_usage: list | None = None,
+    person: bool = False,
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
-        frontmatter = {**frontmatter, "title": _title_display(frontmatter["title"])}
+        frontmatter = {
+            **frontmatter,
+            "title": _title_display(frontmatter["title"], person=person),
+        }
     # built_from audit field (brief-sourced entity articles): the brief's freeze
     # is authoritative, so drop any model-emitted built_from first, then slot it
     # after metadata - or after description when the model omits the optional
@@ -2952,7 +2944,7 @@ def render_record_page(
     ({workbenchUrl}/{record_hash}). The facts/entities QA breakdown is NOT emitted
     - it is consolidated in the workbench, not the public site."""
     frontmatter = {
-        "title": _title_display(article_fm.get("title", "")),
+        "title": article_fm.get("title", ""),  # a source document's title, verbatim
         "description": article_fm.get("description", ""),
         "noindex": True,
         "metadata": metadata,
@@ -3494,6 +3486,7 @@ def main() -> int:
             claims=claims,
             content_root=Path(args.content_root),
             built_from=built_from_block(brief),
+            person=(brief.get("page") or {}).get("node_type") == "person",
         )
     else:
         upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
@@ -3503,6 +3496,7 @@ def main() -> int:
             claims=claims,
             content_root=Path(args.content_root),
             ai_usage=accumulate(upstream, assemble_entry),
+            person=node.get("type") == "person",
         )
 
     # Deterministic US-proper-noun spelling correction (the prompt carve-out is a

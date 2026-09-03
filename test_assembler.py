@@ -1359,6 +1359,35 @@ def test_title_collapse_leaves_proper_names_and_other_acronyms_alone():
     )
 
 
+def test_title_display_swaps_names_for_people_only():
+    """Places are largest-unit-first by convention and an organisation can end
+    ", LLC"; the person swap made "Paris France" and "LLC Bigelow Aerospace
+    Advanced Space Studies" on live pages."""
+    assert a._title_display("France, Paris") == "France, Paris"
+    assert a._title_display("Bigelow Aerospace Advanced Space Studies, LLC") == (
+        "Bigelow Aerospace Advanced Space Studies, LLC"
+    )
+    assert a._title_display("Fravor, David", person=True) == "David Fravor"
+    assert a._title_display("telepathy") == "Telepathy"
+    assert a._title_display("Unidentified Flying Object (UFO)") == "UFO"
+
+
+def test_link_display_swaps_names_for_people_links_only():
+    body = "[France, Paris](/places/paris-france) and [Fravor, David](/people/david-fravor)"
+    out = a._rewrite_link_display(body)
+    assert "[France, Paris](/places/paris-france)" in out
+    assert "[David Fravor](/people/david-fravor)" in out
+
+
+def test_record_titles_are_verbatim():
+    """A source document's title is the source's: 'Non Human Intelligence, GATE
+    Program and ...' must be neither swapped nor collapsed."""
+    import inspect
+
+    src = inspect.getsource(a.render_record_page)
+    assert "_title_display" not in src and "_display_name(article_fm" not in src
+
+
 def test_title_collapse_does_not_reach_names_or_the_link_index():
     """Rule 3: node names, slugs and the link index keep the expanded form -
     `ufo` is a matcher stopword, so a bare name would be all-stopword."""
