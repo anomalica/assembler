@@ -1191,6 +1191,60 @@ def _git(cwd: Path, *args: str, stdin: str | None = None) -> str:
     return r.stdout
 
 
+def veto_move_candidate(item: dict, content_root: Path, db_path: str) -> str | None:
+    """A destination a MOVE might point at, named but never presumed.
+
+    A veto can warrant a move rather than a 404: the first real one, Blink-182,
+    was a page whose nine cited claims were all about Tom DeLonge, who has his
+    own page and whose page was the only one linking in. Emitting `gone: true`
+    unconditionally would have biased that case, and every future one, towards
+    the harsher outcome. So the run names the obvious candidate - the live node
+    with a published page that the page's own cited claims are most about, and
+    the sole inbound linker if there is exactly one - and leaves the choice to
+    the person recording. It never emits a `to:` entry.
+    """
+    item["path"].read_text()
+    fm = _front_matter(item["path"])
+    claim_ids = [
+        r.get("claim_id") for r in fm.get("references") or [] if r.get("claim_id")
+    ]
+    lines = []
+    if claim_ids:
+        conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True)
+        marks = ",".join("?" * len(claim_ids))
+        rows = conn.execute(
+            f"SELECT r.node_id, n.name, n.node_type, count(*) FROM claim_node_refs r "
+            f"JOIN nodes n ON n.id = r.node_id WHERE r.claim_id IN ({marks}) "
+            f"AND r.node_id != ? AND n.retired_at IS NULL GROUP BY r.node_id ORDER BY 4 DESC",
+            (*claim_ids, item["node_id"]),
+        ).fetchall()
+        for node_id, name, node_type, n in rows:
+            section = asm.SECTION_BY_TYPE.get(node_type, f"{node_type}s")
+            slug = asm.slugify(name)
+            if (content_root / "pages" / section / f"{slug}.en.md").is_file():
+                lines.append(
+                    f"candidate /en/{section}/{slug}/ - {name!r} is on {n} of "
+                    f"{len(claim_ids)} claims this page cites"
+                )
+                break
+    linkers = [
+        md
+        for md in content_root.glob("pages/*/*.en.md")
+        if re.search(
+            rf"\(/{re.escape(item['url'].strip('/').split('/', 1)[1])}[)#\" ]",
+            md.read_text(),
+        )
+    ]
+    if len(linkers) == 1:
+        md = linkers[0]
+        lines.append(
+            f"the only page linking here is /en/{md.parent.name}/{md.name[:-6]}/"
+        )
+    if not lines:
+        return None
+    return "  A MOVE may be right instead of gone: " + "; ".join(lines) + "."
+
+
 def retire_vetoed(
     content_root: str,
     briefs_root: str,
@@ -1249,6 +1303,9 @@ def retire_vetoed(
                     f"  WARNING: veto {i['veto_id']} carries NO REASON. Ask the reviewer "
                     "for one before recording; the note below says so honestly."
                 )
+            hint = veto_move_candidate(i, Path(content_root).expanduser(), db_path)
+            if hint:
+                print(hint)
             print(veto_site_entry(i, today), end="")
     if not ready:
         return 1

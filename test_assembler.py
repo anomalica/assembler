@@ -1622,3 +1622,44 @@ def test_retire_vetoed_warns_when_a_veto_has_no_reason(tmp_path, capsys):
     assert rc == 1
     assert "WARNING: veto v1 carries NO REASON" in out
     assert "no reason recorded" in out, "the emitted note stays honest about it"
+
+
+def test_retire_vetoed_names_a_move_candidate_without_presuming_it(tmp_path, capsys):
+    """Blink-182: every cited claim was about Tom DeLonge, who had his own page
+    and was the only page linking in. The run must say a move may be right and
+    name him - and still emit gone: true, never a to: entry."""
+    import sqlite3
+
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    # the vetoed page cites two claims; both are also on "Tom", who has a page
+    (content / "pages" / "topics" / "bad-topic.en.md").write_text(
+        "---\ntitle: T\nreferences:\n  - claim_id: c1\n  - claim_id: c2\n---\nabout [Tom](/people/tom) really\n"
+    )
+    (content / "pages" / "people").mkdir()
+    (content / "pages" / "people" / "tom.en.md").write_text(
+        "---\ntitle: Tom\n---\nsee [Bad Topic](/topics/bad-topic)\n"
+    )
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('ntom','Tom','person',NULL)")
+    conn.execute("CREATE TABLE claim_node_refs (claim_id TEXT, node_id TEXT)")
+    for c in ("c1", "c2"):
+        conn.execute("INSERT INTO claim_node_refs VALUES (?, 'nbad')", (c,))
+        conn.execute("INSERT INTO claim_node_refs VALUES (?, 'ntom')", (c,))
+    conn.commit()
+    conn.close()
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=False
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert (
+        "A MOVE may be right" in out
+        and "/en/people/tom/" in out
+        and "2 of 2 claims" in out
+    )
+    assert "only page linking here is /en/people/tom/" in out
+    assert "gone: true" in out and "to:" not in out.split("NOT REMOVED", 1)[1], (
+        "named, never presumed"
+    )
