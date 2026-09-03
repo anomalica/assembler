@@ -239,9 +239,8 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         except sqlite3.Error:
             vetoed = {}
         for bf in asm.brief_files(root):
-            nid = _brief_page_block(bf).get("node_id")
-            if nid:
-                by_node.setdefault(nid, []).append(asm.brief_ref(root, bf))
+            for m in asm.covered_nodes(_brief_page_block(bf)):
+                by_node.setdefault(m["node_id"], []).append(asm.brief_ref(root, bf))
     except sqlite3.Error:
         nodes = {}  # no graph: fall back to the publication check alone
 
@@ -254,7 +253,25 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
             continue
         if status and status not in _PUBLISHED_STATUSES:
             stale.append(f"{item} (unrecognised publication.status: {status})")
-        nid = _brief_page_block(bf).get("node_id")
+        members = asm.covered_nodes(_brief_page_block(bf))
+        # Every member gates the page: one retired or vetoed node is enough.
+        nid = next((m["node_id"] for m in members if m["node_id"] in vetoed), None)
+        if nid is None:
+            nid = next(
+                (
+                    m["node_id"]
+                    for m in members
+                    if nodes and nodes.get(m["node_id"]) and nodes[m["node_id"]][2]
+                ),
+                None,
+            )
+        if nid is None:
+            nid = next(
+                (m["node_id"] for m in members if nodes and m["node_id"] not in nodes),
+                None,
+            )
+        if nid is None:
+            nid = members[0]["node_id"] if members else None
         row = nodes.get(nid) if nodes else None
         if nid in vetoed:
             # A veto is a reviewer's "this node should not have a page". Without
@@ -991,7 +1008,21 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
         page = _brief_page_block(brief)
         if not page:
             continue
-        node_id = page.get("node_id")
+        members = asm.covered_nodes(page)
+        # Every member gates: a page over two nodes whose second is retired or
+        # vetoed must come down the same as a sole node would. Pick the member
+        # that is a finding, if any, in order of severity.
+        node_id = next(
+            (m["node_id"] for m in members if m["node_id"] in vetoes),
+            next(
+                (
+                    m["node_id"]
+                    for m in members
+                    if by_id.get(m["node_id"]) is None or by_id[m["node_id"]][3]
+                ),
+                members[0]["node_id"] if members else None,
+            ),
+        )
         row = by_id.get(node_id)
         if row is not None and not row[3] and node_id in vetoes:
             section = asm.SECTION_BY_TYPE.get(
@@ -1140,7 +1171,14 @@ def vetoed_pages(content_root: str, briefs_root: str, db_path: str) -> list[dict
     out = []
     for bf in asm.brief_files(Path(briefs_root).expanduser()):
         page = _brief_page_block(bf)
-        v = vetoes.get(page.get("node_id"))
+        v = next(
+            (
+                vetoes[m["node_id"]]
+                for m in asm.covered_nodes(page)
+                if m["node_id"] in vetoes
+            ),
+            None,
+        )
         if v is None:
             continue
         section = asm.SECTION_BY_TYPE.get(

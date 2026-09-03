@@ -1717,3 +1717,109 @@ def test_preflight_allows_a_brief_whose_veto_was_undone(tmp_path):
     conn.commit()
     conn.close()
     assert batch._check_publication(args, "briefs", ["ok-again"]) == ({}, [])
+
+
+def test_covered_nodes_reads_both_brief_schemas():
+    """brief/2 carries a list; the 806 briefs on disk are still /1 until the
+    synthesiser's next publish, and a sweep that saw none of them would go
+    quietly blind in the window. One helper, so the singular reading cannot be
+    copied into the next consumer."""
+    two = a.covered_nodes(
+        {
+            "nodes": [
+                {"node_id": "n1", "name": "A", "node_type": "topic"},
+                {"node_id": "n2", "name": "B", "node_type": "topic"},
+            ]
+        }
+    )
+    assert [m["node_id"] for m in two] == ["n1", "n2"]
+    one = a.covered_nodes({"node_id": "n9", "title": "T", "node_type": "topic"})
+    assert [m["node_id"] for m in one] == ["n9"]
+    assert a.covered_nodes({}) == []
+
+
+def test_brief_node_carries_every_member_for_aliases():
+    """A composed page carries both vocabularies; the superseded member's names
+    are exactly the ones a reader arriving from the old URL used."""
+    n = a.brief_node(
+        {
+            "page": {
+                "title": "UAPs",
+                "slug": "uap",
+                "node_type": "topic",
+                "nodes": [{"node_id": "n1"}, {"node_id": "n2"}],
+            }
+        }
+    )
+    assert n["id"] == "n1" and n["node_ids"] == ["n1", "n2"]
+
+
+def test_orphan_sweep_acts_on_a_composed_pages_second_member(tmp_path, capsys):
+    """The failure the list shape exists to prevent: a page over two nodes whose
+    SECOND is retired must come down, not stand while its first member is fine."""
+    import sqlite3
+
+    import batch
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, node_type TEXT, name TEXT, retired_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE node_merges (merge_id TEXT, survivor_id TEXT, victim_id TEXT, undone_at TEXT)"
+    )
+    conn.execute("CREATE TABLE claim_node_refs (node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('live','topic','Live One',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('dead','topic','Dead Two','2026-09-03')")
+    conn.commit()
+    conn.close()
+    briefs = tmp_path / "briefs" / "topics"
+    briefs.mkdir(parents=True)
+    (briefs / "composed.yaml").write_text(
+        "page:\n  node_type: topic\n  slug: composed\n  title: Composed\n"
+        "  nodes:\n    - node_id: live\n    - node_id: dead\n"
+        "claims:\n- claim_id: c\n"
+    )
+    pages = tmp_path / "pages" / "topics"
+    pages.mkdir(parents=True)
+    (pages / "composed.en.md").write_text("---\ntitle: x\n---\n")
+    rc = batch.check_orphans(str(tmp_path), str(tmp_path / "briefs"), str(db))
+    err = capsys.readouterr().err
+    assert rc == 1 and "composed" in err and "Dead Two" in err, (
+        "the second member must gate the page"
+    )
+
+
+def test_veto_sweep_acts_on_a_composed_pages_second_member(tmp_path, capsys):
+    import sqlite3
+
+    import batch
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, name TEXT, node_type TEXT, retired_at TEXT)"
+    )
+    conn.execute("INSERT INTO nodes VALUES ('a','A','topic',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('b','B','topic',NULL)")
+    conn.execute(
+        "CREATE TABLE page_vetoes (veto_id TEXT, node_id TEXT, reason TEXT, created_at TEXT, created_by TEXT, undone_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO page_vetoes VALUES ('v2','b','wrong','2026-09-03','workbench',NULL)"
+    )
+    conn.commit()
+    conn.close()
+    briefs = tmp_path / "briefs" / "topics"
+    briefs.mkdir(parents=True)
+    (briefs / "composed.yaml").write_text(
+        "page:\n  node_type: topic\n  slug: composed\n  title: Composed\n"
+        "  nodes:\n    - node_id: a\n    - node_id: b\n"
+        "claims:\n- claim_id: c\n"
+    )
+    pages = tmp_path / "pages" / "topics"
+    pages.mkdir(parents=True)
+    (pages / "composed.en.md").write_text("---\ntitle: x\n---\n")
+    items = batch.vetoed_pages(str(tmp_path), str(tmp_path / "briefs"), str(db))
+    assert len(items) == 1 and items[0]["veto_id"] == "v2"

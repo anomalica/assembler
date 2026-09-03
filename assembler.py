@@ -534,13 +534,18 @@ def slug_aliases(
     them all 404ing while looking fixed.
     """
     names = list(node.get("aliases") or [])  # brief-supplied, when it carries them
-    if not names and db_path and Path(db_path).is_file() and node.get("id"):
+    # Every covered node, not just the first: a composed page carries both
+    # vocabularies, and the superseded member's names are exactly the ones a
+    # reader arriving from the old URL used.
+    ids = node.get("node_ids") or ([node["id"]] if node.get("id") else [])
+    if not names and db_path and Path(db_path).is_file() and ids:
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            marks = ",".join("?" * len(ids))
             names = [
                 r[0]
                 for r in conn.execute(
-                    "SELECT alias FROM aliases WHERE node_id = ?", (node["id"],)
+                    f"SELECT alias FROM aliases WHERE node_id IN ({marks})", tuple(ids)
                 )
             ]
             conn.close()
@@ -726,13 +731,51 @@ def load_brief(briefs_root: Path, ref: str) -> tuple[dict, str] | None:
     return None
 
 
+def covered_nodes(page: dict) -> list[dict]:
+    """The graph nodes a page covers, as [{node_id, name, node_type}].
+
+    anomalica/brief/2: `page.nodes` is a list, always present, one entry for an
+    ordinary page and several for a composed one - the first is the pair of
+    topics for unidentified objects, which hold 961 and 1,133 claims but share
+    only 26. A consumer that acts on a covered node must act on EVERY member: a
+    pass reading only the first leaves a page standing whose second member has
+    been retired or vetoed, and reports nothing.
+
+    Reads brief/1's singular `page.node_id` too, because the 806 briefs on disk
+    are still /1 until the synthesiser's next publish and a sweep that saw none
+    of them would go quietly blind in the window. This is the ONLY place either
+    shape is read - the point of one helper is that the singular reading cannot
+    be copied into the next consumer - and the fallback dies with the last /1.
+    """
+    nodes = page.get("nodes")
+    if isinstance(nodes, list):
+        return [n for n in nodes if isinstance(n, dict) and n.get("node_id")]
+    nid = page.get("node_id")
+    if nid:
+        return [
+            {
+                "node_id": nid,
+                "name": page.get("title"),
+                "node_type": page.get("node_type"),
+            }
+        ]
+    return []
+
+
 def brief_node(brief: dict) -> dict:
     """Synthetic node from the brief's page block. page.slug is the FINAL,
     disambiguated URL slug - carried as explicit_slug so node_slug returns it
-    verbatim (never re-slugified from the title)."""
+    verbatim (never re-slugified from the title).
+
+    `id` is the first covered node, for the single-node case that is every page
+    today; `node_ids` carries all of them, so a composed page's aliases union
+    across its members and the superseded vocabulary keeps a route in.
+    """
     pg = brief.get("page") or {}
+    members = covered_nodes(pg)
     return {
-        "id": pg.get("node_id"),
+        "id": members[0]["node_id"] if members else None,
+        "node_ids": [m["node_id"] for m in members],
         "type": pg.get("node_type"),
         "name": pg.get("title") or "",
         "metadata": {"explicit_slug": pg.get("slug")},
