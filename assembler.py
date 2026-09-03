@@ -3089,8 +3089,32 @@ def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> 
     return block
 
 
-def stamp_tags(article: str, node_type: str | None) -> str:
+def existing_tags(page_path: Path | None) -> list[str]:
+    """The tags the published page already carries, or none."""
+    if not page_path or not Path(page_path).is_file():
+        return []
+    parsed = _split_article(Path(page_path).read_text())
+    if parsed is None:
+        return []
+    raw = parsed[0].get("tags")
+    return [str(t) for t in raw] if isinstance(raw, list) else []
+
+
+def stamp_tags(
+    article: str, node_type: str | None, carried: list[str] | None = None
+) -> str:
     """Reduce the model's tags to the closed vocabulary, or drop the field.
+
+    `carried` is what the published page already had. A rebuild may ADD a tag
+    and may never silently drop one: tags are model-owned, so every rebuild
+    re-rolls them, and a tag vanishing is noise rather than a judgement that it
+    stopped applying. The asymmetry decides it - a tag that lingers costs a
+    browse page one stale member, while a tag lost to a re-roll can kill a
+    browse URL outright and shows nowhere on the page. Measured when this was
+    written: 7 of 380 pages carry tags at all and four tags sit on exactly one
+    page each - crash retrieval, ufologist, historical episode, secrecy and
+    disclosure - so four browse URLs were each one unattended rebuild from
+    disappearing. Removing a tag stays possible; it just has to be deliberate.
 
     Enforced here rather than trusted from the prompt for the same reason the
     citation range is: an instruction is a request, and the only thing that makes
@@ -3102,9 +3126,16 @@ def stamp_tags(article: str, node_type: str | None) -> str:
     if parsed is None:
         return article
     frontmatter, body = parsed
-    if "tags" not in frontmatter:
+    if "tags" not in frontmatter and not carried:
         return article
+    if "tags" not in frontmatter:
+        frontmatter = {**frontmatter, "tags": []}
     kept = filter_tags(frontmatter.get("tags"), node_type)
+    if carried:
+        have = {t.strip().lower() for t in kept}
+        kept = kept + [
+            t for t in filter_tags(carried, node_type) if t.strip().lower() not in have
+        ]
     rebuilt: dict = {}
     for key, value in frontmatter.items():
         if key == "tags":
@@ -3587,7 +3618,7 @@ def main() -> int:
     # Last, so body_sha256 covers the final body - after the canonical-text fix
     # and after any preserved human field is folded back in.
     # Before built_by, which hashes the final bytes.
-    article = stamp_tags(article, node.get("type"))
+    article = stamp_tags(article, node.get("type"), existing_tags(out))
     article = stamp_aliases(
         article, slug_aliases(node, section, args.db, Path(args.content_root))
     )

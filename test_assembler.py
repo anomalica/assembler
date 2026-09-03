@@ -1930,3 +1930,40 @@ def test_a_single_node_page_does_not_alias_its_own_slug():
     )
     out = a.slug_aliases(node, "topics", None, None)
     assert "/topics/telepathy/" not in out
+
+
+def _art(tags):
+    t = "\n".join(f"  - {x}" for x in tags)
+    return f"---\ntitle: T\ntags:\n{t}\n---\n\nbody\n"
+
+
+def test_a_rebuild_may_add_a_tag_but_never_silently_drop_one():
+    """Tags are model-owned, so every rebuild re-rolls them; a tag vanishing is
+    noise, not a judgement. Measured when this was written: 7 of 380 pages carry
+    tags and four sit on exactly one page each, so four browse URLs were each one
+    unattended rebuild from disappearing."""
+    out = a.stamp_tags(
+        _art(["phenomenon"]), "topic", carried=["phenomenon", "hypothesis"]
+    )
+    kept = a._split_article(out)[0]["tags"]
+    assert set(kept) == {"phenomenon", "hypothesis"}, kept
+    assert kept[0] == "phenomenon", "the model's own tags lead"
+
+
+def test_carried_tags_survive_a_rebuild_that_emits_none():
+    out = a.stamp_tags("---\ntitle: T\n---\n\nbody\n", "topic", carried=["hypothesis"])
+    assert a._split_article(out)[0].get("tags") == ["hypothesis"]
+
+
+def test_carried_tags_are_still_filtered_to_the_vocabulary():
+    """Carrying forward must not smuggle an invalid tag back in."""
+    out = a.stamp_tags(_art(["phenomenon"]), "topic", carried=["not-a-real-tag"])
+    assert a._split_article(out)[0]["tags"] == ["phenomenon"]
+
+
+def test_existing_tags_reads_the_published_page(tmp_path):
+    p = tmp_path / "x.en.md"
+    p.write_text(_art(["encounter", "sighting"]))
+    assert a.existing_tags(p) == ["encounter", "sighting"]
+    assert a.existing_tags(tmp_path / "absent.en.md") == []
+    assert a.existing_tags(None) == []
