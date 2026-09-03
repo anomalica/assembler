@@ -270,8 +270,9 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         # waste that grows with the corpus.
         for bf in asm.brief_files(root):
             ref = asm.brief_ref(root, bf)
-            pages[ref] = _brief_page_block(bf)
-            pubs[ref] = _brief_page_block(bf, key="publication")
+            blocks = _brief_blocks(bf, ("page", "publication"))
+            pages[ref] = blocks["page"]
+            pubs[ref] = blocks["publication"]
             for m in asm.covered_nodes(pages[ref]):
                 by_node.setdefault(m["node_id"], []).append(ref)
     except sqlite3.Error:
@@ -950,6 +951,42 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
     if not apply:
         print("Dry run - pass --apply to write.", file=sys.stderr)
     return 0
+
+
+def _brief_blocks(brief: Path, keys: tuple[str, ...]) -> dict[str, dict]:
+    """Several top-level mappings from a brief in ONE pass over the file.
+
+    Reading the page block and the publication block separately is two opens and
+    two parses of the same head; a corpus walk does it 806 times each.
+    """
+    want, out, cur, lines = set(keys), {}, None, []
+    try:
+        with brief.open() as fh:
+            for line in fh:
+                if cur is not None:
+                    if line[:1] not in (" ", "\t", "\n", "#"):
+                        out[cur] = "".join(lines)
+                        cur, lines = None, []
+                    else:
+                        lines.append(line)
+                if cur is None:
+                    for k in want:
+                        if line.startswith(f"{k}:"):
+                            cur, lines = k, [line]
+                            break
+                    if cur is None and len(out) == len(want):
+                        break
+            if cur is not None:
+                out[cur] = "".join(lines)
+    except OSError:
+        return {k: {} for k in keys}
+    parsed = {}
+    for k in keys:
+        try:
+            parsed[k] = (yaml.safe_load(out.get(k, "")) or {}).get(k) or {}
+        except yaml.YAMLError:
+            parsed[k] = {}
+    return parsed
 
 
 def _brief_page_block(brief: Path, key: str = "page") -> dict:
