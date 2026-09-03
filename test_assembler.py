@@ -1601,3 +1601,24 @@ def test_retire_vetoed_without_apply_removes_nothing_even_when_recorded(tmp_path
         str(content), str(briefs), str(db), str(site), str(meta), apply=False
     )
     assert rc == 1 and (content / "pages" / "topics" / "bad-topic.en.md").is_file()
+
+
+def test_retire_vetoed_warns_when_a_veto_has_no_reason(tmp_path, capsys):
+    """The recorder's decision rests on the reviewer's reason. The first real
+    veto arrived without one; the run must say so, not bury it in the note."""
+    import sqlite3
+
+    import batch
+
+    content, briefs, db, site, meta = _veto_world(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE page_vetoes SET reason=NULL WHERE veto_id='v1'")
+    conn.commit()
+    conn.close()
+    rc = batch.retire_vetoed(
+        str(content), str(briefs), str(db), str(site), str(meta), apply=False
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "WARNING: veto v1 carries NO REASON" in out
+    assert "no reason recorded" in out, "the emitted note stays honest about it"

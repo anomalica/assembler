@@ -1240,6 +1240,15 @@ def retire_vetoed(
             f"{redirects} (read the veto reason first; this is the decision):\n"
         )
         for i in pending:
+            if i["reason"] == "no reason recorded":
+                # The recorder's decision rests on the reviewer's reason; with none,
+                # there is nothing to read and the record would be a rubber stamp.
+                # Said loudly rather than hidden in the note - the first real veto
+                # (Blink-182, 2026-09-03) arrived without one.
+                print(
+                    f"  WARNING: veto {i['veto_id']} carries NO REASON. Ask the reviewer "
+                    "for one before recording; the note below says so honestly."
+                )
             print(veto_site_entry(i, today), end="")
     if not ready:
         return 1
