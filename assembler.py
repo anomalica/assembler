@@ -3089,6 +3089,60 @@ def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> 
     return block
 
 
+def existing_metadata(page_path: Path | None) -> dict:
+    """The metadata block the published page already carries, or empty."""
+    if not page_path or not Path(page_path).is_file():
+        return {}
+    parsed = _split_article(Path(page_path).read_text())
+    if parsed is None:
+        return {}
+    md = parsed[0].get("metadata")
+    return dict(md) if isinstance(md, dict) else {}
+
+
+def carry_metadata(article: str, carried: dict | None) -> str:
+    """Keep a metadata field the page had when the rebuild does not re-emit it.
+
+    Same failure as tags, on a far larger surface: 332 of 369 published pages
+    carry a metadata block against 7 carrying tags, and 97 fields exist on
+    exactly ONE page - participants, began, cost, channel, first_public_statement,
+    missions. The model re-derives the block every rebuild and the prompt tells it
+    to omit the block entirely when it has nothing to say, so a re-roll can drop
+    role, affiliation, date, location, founded - structured facts with nothing in
+    the prose to show they went.
+
+    The model still WINS on any field it emits, because that is a correction. It
+    only cannot delete by silence.
+    """
+    if not carried:
+        return article
+    parsed = _split_article(article)
+    if parsed is None:
+        return article
+    frontmatter, body = parsed
+    current = frontmatter.get("metadata")
+    current = dict(current) if isinstance(current, dict) else {}
+    merged = {**carried, **current}
+    if merged == current and "metadata" in frontmatter:
+        return article
+    rebuilt: dict = {}
+    placed = False
+    for key, value in frontmatter.items():
+        if key == "metadata":
+            rebuilt["metadata"] = merged
+            placed = True
+            continue
+        rebuilt[key] = value
+    if not placed:
+        rebuilt["metadata"] = merged
+    return (
+        "---\n"
+        + yaml.safe_dump(rebuilt, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n"
+        + body
+    )
+
+
 def existing_tags(page_path: Path | None) -> list[str]:
     """The tags the published page already carries, or none."""
     if not page_path or not Path(page_path).is_file():
@@ -3619,6 +3673,7 @@ def main() -> int:
     # and after any preserved human field is folded back in.
     # Before built_by, which hashes the final bytes.
     article = stamp_tags(article, node.get("type"), existing_tags(out))
+    article = carry_metadata(article, existing_metadata(out))
     article = stamp_aliases(
         article, slug_aliases(node, section, args.db, Path(args.content_root))
     )

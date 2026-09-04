@@ -1967,3 +1967,43 @@ def test_existing_tags_reads_the_published_page(tmp_path):
     assert a.existing_tags(p) == ["encounter", "sighting"]
     assert a.existing_tags(tmp_path / "absent.en.md") == []
     assert a.existing_tags(None) == []
+
+
+def _art_md(md_lines, extra=""):
+    return f"---\ntitle: T\n{md_lines}{extra}---\n\nbody\n"
+
+
+def test_a_rebuild_keeps_a_metadata_field_it_did_not_re_emit():
+    """332 of 369 pages carry metadata against 7 carrying tags, and 97 fields
+    exist on exactly one page. The prompt tells the model to omit the block when
+    it has nothing to say, so a re-roll can drop a structured fact with nothing
+    in the prose to show it went."""
+    art = _art_md("metadata:\n  role: pilot\n")
+    out = a.carry_metadata(art, {"role": "pilot", "affiliation": "US Navy"})
+    md = a._split_article(out)[0]["metadata"]
+    assert md == {"role": "pilot", "affiliation": "US Navy"}, md
+
+
+def test_the_model_still_wins_on_a_field_it_does_emit():
+    """A changed value is a correction, not a deletion."""
+    art = _art_md("metadata:\n  role: commander\n")
+    out = a.carry_metadata(art, {"role": "pilot"})
+    assert a._split_article(out)[0]["metadata"]["role"] == "commander"
+
+
+def test_metadata_survives_a_rebuild_that_omits_the_block_entirely():
+    out = a.carry_metadata("---\ntitle: T\n---\n\nbody\n", {"founded": "1947"})
+    assert a._split_article(out)[0]["metadata"] == {"founded": "1947"}
+
+
+def test_carry_metadata_is_a_no_op_without_a_previous_block():
+    art = _art_md("metadata:\n  role: pilot\n")
+    assert a.carry_metadata(art, {}) == art
+    assert a.carry_metadata(art, None) == art
+
+
+def test_existing_metadata_reads_the_published_page(tmp_path):
+    p = tmp_path / "x.en.md"
+    p.write_text(_art_md("metadata:\n  role: pilot\n  date: '2004-11-14'\n"))
+    assert a.existing_metadata(p) == {"role": "pilot", "date": "2004-11-14"}
+    assert a.existing_metadata(tmp_path / "nope.en.md") == {}
