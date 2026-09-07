@@ -25,6 +25,7 @@ carrying the CLI / the `anthropic` library:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -517,6 +518,54 @@ def _prior_paths(content_root: Path | None, slug: str, section: str) -> list[str
     return seen
 
 
+class AliasConflict(Exception):
+    """An alias would redirect a slug that names a different live entity."""
+
+    def __init__(self, slug: str, path: str, owners: list[tuple[str, str]]):
+        self.slug, self.path, self.owners = slug, path, owners
+        named = ", ".join(f"{name} [{node_id}]" for node_id, name in owners)
+        super().__init__(
+            f"alias {path} names a live node this page does not cover ({named}); "
+            f"redirecting it would send the reader to the wrong subject. If that "
+            f"node is the same subject under another name, merge it - a merge "
+            f"retires the victim and the alias then stands."
+        )
+
+
+@functools.lru_cache(maxsize=8)
+def _live_slug_owners(
+    db_path: str, mtime: float
+) -> dict[str, frozenset[tuple[str, str]]]:
+    """Slug -> the live nodes that answer to it, by name or by recorded alias.
+
+    Retired nodes are excluded deliberately, and they are the whole reason this
+    can be a flat lookup rather than a walk of the merge chain: all 836 recorded
+    merges leave the victim retired, so a slug owned only by a retired node IS
+    the merge history an alias exists to serve. A slug owned by a LIVE node the
+    page does not cover is the opposite - a redirect to a different subject.
+    """
+    owners: dict[str, set[tuple[str, str]]] = {}
+    names: dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        retired = set()
+        for node_id, name, retired_at in conn.execute(
+            "SELECT id, name, retired_at FROM nodes"
+        ):
+            if retired_at:
+                retired.add(node_id)
+                continue
+            owners.setdefault(slugify(name), set()).add((node_id, name))
+            names[node_id] = name
+        for alias, node_id in conn.execute("SELECT alias, node_id FROM aliases"):
+            if node_id not in retired and node_id in names:
+                owners.setdefault(slugify(alias), set()).add((node_id, names[node_id]))
+        conn.close()
+    except sqlite3.Error:
+        return {}
+    return {slug: frozenset(ids) for slug, ids in owners.items()}
+
+
 def slug_aliases(
     node: dict, section: str, db_path: str | None, content_root: Path | None
 ) -> list[str]:
@@ -545,11 +594,16 @@ def slug_aliases(
     # vocabularies, and the superseded member's names are exactly the ones a
     # reader arriving from the old URL used.
     ids = node.get("node_ids") or ([node["id"]] if node.get("id") else [])
-    if not names and db_path and Path(db_path).is_file() and ids:
+    # The graph's alias table is read WHENEVER it is available, never only as a
+    # fallback for a brief that supplied nothing. brief/2 always supplies at least
+    # the covered node's own name, so a `not names` guard here silently stopped the
+    # table from ever being consulted, and a rebuilt page shipped with none of the
+    # redirects a rename or a merge had earned it.
+    if db_path and Path(db_path).is_file() and ids:
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             marks = ",".join("?" * len(ids))
-            names = [
+            names += [
                 r[0]
                 for r in conn.execute(
                     f"SELECT alias FROM aliases WHERE node_id IN ({marks})", tuple(ids)
@@ -557,7 +611,11 @@ def slug_aliases(
             ]
             conn.close()
         except sqlite3.Error:
-            names = []
+            pass
+    covered_ids = frozenset(ids)
+    owners: dict[str, frozenset[tuple[str, str]]] = {}
+    if db_path and Path(db_path).is_file():
+        owners = _live_slug_owners(db_path, Path(db_path).stat().st_mtime)
     current = node_slug(node)
     live = set()
     if content_root:
@@ -588,6 +646,24 @@ def slug_aliases(
                 f"  alias SKIPPED (would shadow a live page): {path}", file=sys.stderr
             )
             continue
+        # The build fails rather than publishes a redirect to the wrong subject.
+        # One run wrote 123 aliases onto a page whose brief covers a single node,
+        # 106 of them other incidents entirely, and a reader following a link to
+        # the 1964 Socorro landing arrived at a 2004 carrier encounter. Nothing in
+        # the emission path could notice, because each alias was a row the graph
+        # genuinely held against this node at the time.
+        # ANY live node outside this page's cover is a conflict, even when a
+        # covered node claims the slug too. The first form of this check asked
+        # whether a covered node claimed it and was defeated by the exact row it
+        # existed to catch: the bad alias sat on the covered node, so the slug
+        # looked owned and the check passed.
+        answers_to = {
+            owner
+            for owner in owners.get(alias, frozenset())
+            if owner[0] not in covered_ids
+        }
+        if answers_to:
+            raise AliasConflict(alias, path, sorted(answers_to))
         for form in (f"{path}/", f"/en{path}/"):
             if form not in out:
                 out.append(form)

@@ -1916,6 +1916,102 @@ def test_a_composed_pages_aliases_cover_every_member_symmetrically(tmp_path):
         assert f"/en/topics/{slug}/" in out, "the language-prefixed form too"
 
 
+def _graph(tmp_path, nodes, aliases):
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id TEXT, name TEXT, retired_at TEXT)")
+    conn.execute("CREATE TABLE aliases (alias TEXT, node_id TEXT)")
+    conn.executemany("INSERT INTO nodes VALUES (?,?,?)", nodes)
+    conn.executemany("INSERT INTO aliases VALUES (?,?)", aliases)
+    conn.commit()
+    conn.close()
+    a._live_slug_owners.cache_clear()
+    return str(db)
+
+
+def _nimitz_node():
+    return a.brief_node(
+        {
+            "page": {
+                "title": "2004 USS Nimitz UAP encounter",
+                "slug": "2004-uss-nimitz-uap-encounter",
+                "node_type": "event",
+                "nodes": [{"node_id": "n1", "name": "2004 USS Nimitz UAP encounter"}],
+            }
+        }
+    )
+
+
+def test_an_alias_naming_a_live_node_the_page_does_not_cover_fails_the_build(tmp_path):
+    """One run wrote 123 aliases onto a page covering a single node, 106 of them
+    other incidents, and every one was a row the graph held against this node at
+    the time - so nothing downstream of the table could notice. A reader
+    following a link to the 1964 Socorro landing arrived at a 2004 carrier
+    encounter, which is worse than the 404 it was fixing."""
+    import pytest
+
+    db = _graph(
+        tmp_path,
+        [
+            ("n1", "2004 USS Nimitz UAP encounter", None),
+            ("n2", "1964 Socorro UFO incident", None),
+        ],
+        [("1964 Socorro UFO incident", "n1")],
+    )
+    with pytest.raises(a.AliasConflict) as exc:
+        a.slug_aliases(_nimitz_node(), "events", db, None)
+    assert "1964-socorro-ufo-incident" in exc.value.path
+    assert exc.value.owners == [("n2", "1964 Socorro UFO incident")]
+    assert "1964 Socorro UFO incident" in str(exc.value)
+
+
+def test_an_alias_naming_a_retired_node_is_the_merge_history_and_is_kept(tmp_path):
+    """The discriminator is retirement, not name similarity: all 836 recorded
+    merges leave the victim retired, so a slug owned only by a retired node is
+    exactly the history an alias exists to serve. Refusing those would fail every
+    legitimate merge redirect."""
+    db = _graph(
+        tmp_path,
+        [
+            ("n1", "2004 USS Nimitz UAP encounter", None),
+            ("n2", "Tic Tac Sighting", "2026-06-28T14:37:53Z"),
+        ],
+        [("Tic Tac Sighting", "n1")],
+    )
+    out = a.slug_aliases(_nimitz_node(), "events", db, None)
+    assert "/events/tic-tac-sighting/" in out
+    assert "/en/events/tic-tac-sighting/" in out
+
+
+def test_the_graph_alias_table_is_read_even_when_the_brief_names_the_node(tmp_path):
+    """brief/2 always supplies the covered node's own name, so a `not names`
+    fallback guard stopped the alias table from ever being consulted and a
+    rebuilt page shipped without the redirects a rename or merge earned it."""
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE aliases (alias TEXT, node_id TEXT)")
+    conn.execute("INSERT INTO aliases VALUES ('Tic Tac Sighting','n1')")
+    conn.commit()
+    conn.close()
+    node = a.brief_node(
+        {
+            "page": {
+                "title": "2004 USS Nimitz UAP encounter",
+                "slug": "2004-uss-nimitz-uap-encounter",
+                "node_type": "event",
+                "nodes": [{"node_id": "n1", "name": "2004 USS Nimitz UAP encounter"}],
+            }
+        }
+    )
+    out = a.slug_aliases(node, "events", str(db), None)
+    assert "/events/tic-tac-sighting/" in out
+    assert "/en/events/tic-tac-sighting/" in out
+
+
 def test_a_single_node_page_does_not_alias_its_own_slug():
     """The member rule must not make an ordinary page alias itself."""
     node = a.brief_node(
