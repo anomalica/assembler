@@ -848,6 +848,83 @@ def _orphan_fixture(tmp_path):
     return db, briefs, tmp_path
 
 
+def _refresh_fixture(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id TEXT, name TEXT, retired_at TEXT)")
+    conn.execute("CREATE TABLE aliases (alias TEXT, node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('n1','Roswell incident (1947)',NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('n2','Roswell UAP Crash','2026-06-28')")
+    conn.executemany(
+        "INSERT INTO aliases VALUES (?,?)",
+        [("Roswell UAP Crash", "n1"), ("Roswell crash", "n1")],
+    )
+    conn.commit()
+    conn.close()
+    a._live_slug_owners.cache_clear()
+
+    briefs = tmp_path / "briefs" / "events"
+    briefs.mkdir(parents=True)
+    (briefs / "roswell-incident-1947.yaml").write_text(
+        "schema: anomalica/brief/2\n"
+        "page:\n"
+        "  slug: roswell-incident-1947\n"
+        "  node_type: event\n"
+        "  title: Roswell incident (1947)\n"
+        "  nodes:\n"
+        "  - node_id: n1\n"
+        "    name: Roswell incident (1947)\n"
+    )
+    pages = tmp_path / "pages" / "events"
+    pages.mkdir(parents=True)
+    page = pages / "roswell-incident-1947.en.md"
+    page.write_text(
+        "---\n"
+        "title: Roswell incident (1947)\n"
+        "aliases:\n"
+        "- /events/1964-socorro-uap-encounter/\n"
+        "- /en/events/1964-socorro-uap-encounter/\n"
+        "description: D\n"
+        "---\n\n"
+        "The body must survive verbatim.\n"
+    )
+    return db, tmp_path / "briefs", tmp_path, page
+
+
+def test_refresh_aliases_replaces_a_stale_list_without_touching_the_body(tmp_path):
+    """Aliases are derived, so a page can carry a set that was right when it was
+    built and wrong now. One page carried 123, 106 of them other incidents. The
+    correction must not wait on a paid rebuild, and must not go through a YAML
+    round trip - re-dumping front matter reflows a thousand lines of built_from
+    and has rewritten body text before."""
+    import batch
+
+    db, briefs, content, page = _refresh_fixture(tmp_path)
+    before = page.read_text()
+    rc = batch.refresh_aliases(str(content), str(briefs), str(db), apply=True)
+    after = page.read_text()
+    assert rc == 0
+    assert "socorro" not in after, "the wrong redirect must be gone"
+    assert "/events/roswell-crash/" in after
+    assert "/en/events/roswell-crash/" in after
+    assert "/events/roswell-uap-crash/" in after, "the retired node's name is history"
+    assert after.split("---\n\n")[1] == before.split("---\n\n")[1]
+    assert "description: D" in after, "the rest of the front matter is untouched"
+
+
+def test_refresh_aliases_writes_nothing_without_apply(tmp_path, capsys):
+    """Dry by default, like every other corpus pass here."""
+    import batch
+
+    db, briefs, content, page = _refresh_fixture(tmp_path)
+    before = page.read_text()
+    batch.refresh_aliases(str(content), str(briefs), str(db), apply=False)
+    assert page.read_text() == before
+    assert "roswell-incident-1947" in capsys.readouterr().out
+
+
 def test_check_orphans_names_the_merge_survivor(tmp_path, capsys):
     """A merge leaves the losing page published. The report must name the live
     node to redirect to, read from node_merges - a name heuristic scored an

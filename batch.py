@@ -810,6 +810,89 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def refresh_aliases(
+    content_root: str, briefs_root: str, db_path: str, apply: bool
+) -> int:
+    """Re-derive every published page's redirect list from the graph, no model.
+
+    Aliases are DERIVED data - the brief's covered nodes plus the graph's alias
+    rows - so a page can carry a set that was correct when it was built and wrong
+    now, and only a rebuild would notice. One page carried 123, of which 106
+    named other incidents entirely; a reader following a link to the 1964 Socorro
+    landing arrived at a 2004 carrier encounter. Waiting for a paid rebuild to
+    correct derived data leaves the wrong redirect serving in the meantime.
+
+    Only the alias block is rewritten, by line, never through a YAML round trip:
+    re-dumping a page's front matter reflows a thousand lines of built_from and
+    references, and has silently rewritten body text before. A page whose brief
+    is missing is left alone, and one whose aliases cannot be derived without a
+    conflict is reported and left alone - the conflict is the graph's to settle.
+    """
+    root = Path(content_root).expanduser()
+    briefs = Path(briefs_root).expanduser()
+    changed, blocked, skipped = [], [], 0
+
+    for md in sorted(root.glob("pages/*/*.en.md")):
+        section, slug = md.parent.name, md.name[: -len(".en.md")]
+        # A brief is addressed "<section>/<slug>" in the sectioned layout, because
+        # a slug is unique only within a node type; the bare slug is the older flat
+        # layout and both are still on disk.
+        loaded = asm.load_brief(briefs, f"{section}/{slug}") or asm.load_brief(
+            briefs, slug
+        )
+        if not loaded:
+            skipped += 1
+            continue
+        brief, _ = loaded
+        try:
+            wanted = asm.slug_aliases(asm.brief_node(brief), section, db_path, root)
+        except asm.AliasConflict as exc:
+            blocked.append((f"{section}/{slug}", str(exc)))
+            continue
+        lines = md.read_text().split("\n")
+        try:
+            start = lines.index("aliases:")
+        except ValueError:
+            start = None
+        if start is None:
+            if not wanted:
+                continue
+            end = start = (
+                next(i for i, line in enumerate(lines) if line.startswith("title:")) + 1
+            )
+            current: list[str] = []
+        else:
+            end = next(
+                i for i in range(start + 1, len(lines)) if not lines[i].startswith("- ")
+            )
+            if not all(line.startswith("- /") for line in lines[start + 1 : end]):
+                blocked.append((f"{section}/{slug}", "alias block is not a plain list"))
+                continue
+            current = [line[2:] for line in lines[start + 1 : end]]
+        if current == wanted:
+            continue
+        changed.append((f"{section}/{slug}", len(current), len(wanted)))
+        if not apply:
+            continue
+        block = (["aliases:"] + [f"- {a}" for a in wanted]) if wanted else []
+        rewritten = lines[:start] + block + lines[end:]
+        if rewritten[start + len(block) :] != lines[end:]:
+            blocked.append((f"{section}/{slug}", "rewrite would move body content"))
+            continue
+        md.write_text("\n".join(rewritten))
+
+    for name, was, now in changed:
+        print(f"  {name}: {was} -> {now} aliases")
+    for name, why in blocked:
+        print(f"  BLOCKED {name}: {why}", file=sys.stderr)
+    verb = "rewritten" if apply else "would change (use --apply)"
+    print(
+        f"\n{len(changed)} pages {verb}; {len(blocked)} blocked; "
+        f"{skipped} pages have no brief"
+    )
+    return 1 if blocked else 0
+
+
 def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -> int:
     """Keep inspection_url only where the record page actually carries the claim.
 
@@ -1806,6 +1889,12 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--refresh-aliases",
+        action="store_true",
+        help="Re-derive every page's redirect list from the graph and rewrite the "
+        "alias block. Costs nothing - aliases are derived, not written by a model.",
+    )
+    ap.add_argument(
         "--confirm",
         action="store_true",
         help="Spend money: generate the batch. Without this, only the estimate prints.",
@@ -1830,6 +1919,9 @@ def main() -> int:
             args.reference_root,
             args.apply,
         )
+
+    if args.refresh_aliases:
+        return refresh_aliases(args.content_root, args.briefs_root, args.db, args.apply)
 
     if args.retarget_links:
         return retarget_links(args.content_root, args.apply, args.db)
