@@ -850,6 +850,61 @@ def commit_refreshed(
     return 1
 
 
+def report_unbuilt(content_root: str, briefs_root: str, as_json: bool) -> int:
+    """Briefs with no published page, ranked by what a page would be worth.
+
+    Replaces three hand-made target lists that were generated once in August and
+    then quietly went stale: of 393 entries in the largest, 80 had since been
+    built and 21 no longer had a brief at all. A queue derived on demand cannot
+    drift from the corpus, and a file listing work to do is exactly the kind of
+    thing nobody remembers to regenerate.
+
+    Ranked by claim count, which says how much there is to write from, with the
+    independent-source count beside it - the corpus is single-source almost
+    everywhere, so a brief with corroborated claims is rare and worth seeing.
+    """
+    content = Path(content_root).expanduser()
+    live = {md.name[: -len(".en.md")] for md in content.glob("pages/*/*.en.md")}
+    rows = []
+    for b in sorted(Path(briefs_root).expanduser().glob("*/*.yaml")):
+        if b.stem in live:
+            continue
+        try:
+            brief = yaml.safe_load(b.read_text())
+        except (OSError, yaml.YAMLError):
+            continue
+        if not brief:
+            continue
+        page = brief.get("page") or {}
+        claims = brief.get("claims") or []
+        corroborated = sum(
+            1
+            for c in claims
+            if isinstance((c.get("evidence") or {}).get("independent_sources"), int)
+            and c["evidence"]["independent_sources"] >= 2
+        )
+        rows.append(
+            {
+                "section": b.parent.name,
+                "slug": b.stem,
+                "title": page.get("title"),
+                "claims": page.get("claim_count") or len(claims),
+                "corroborated": corroborated,
+            }
+        )
+    rows.sort(key=lambda r: (-(r["claims"] or 0), r["slug"]))
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"  {len(rows)} brief(s) with no published page\n")
+    print(f"  {'claims':>7}{'corrob':>8}   page")
+    for r in rows[:40]:
+        print(f"  {r['claims']:>7}{r['corroborated']:>8}   {r['section']}/{r['slug']}")
+    if len(rows) > 40:
+        print(f"  ... and {len(rows) - 40} more (--json for all)")
+    return 0
+
+
 def report_corroboration(briefs_root: str, as_json: bool) -> int:
     """How much of the corpus rests on more than one independent source.
 
@@ -2309,6 +2364,12 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--report-unbuilt",
+        action="store_true",
+        help="Briefs with no published page, ranked by claim count. Derived live, "
+        "so it cannot go stale the way a written-out target list does.",
+    )
+    ap.add_argument(
         "--report-corroboration",
         action="store_true",
         help="How much of the corpus rests on more than one independent source. "
@@ -2419,6 +2480,9 @@ def main() -> int:
             args.reference_root,
             args.apply,
         )
+
+    if args.report_unbuilt:
+        return report_unbuilt(args.content_root, args.briefs_root, args.json)
 
     if args.report_corroboration:
         return report_corroboration(args.briefs_root, args.json)

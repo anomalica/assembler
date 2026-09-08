@@ -1068,6 +1068,37 @@ def test_a_scheduled_refresh_commits_only_what_it_wrote(tmp_path):
     assert "theirs.en.md" in dirty, "the other session's work must be left alone"
 
 
+def test_report_unbuilt_lists_only_briefs_with_no_page(tmp_path, capsys):
+    """Replaces three hand-written target lists that went stale: of 393 entries in
+    the largest, 80 had since been built and 21 no longer had a brief. A queue
+    derived on demand cannot drift; a file listing work to do always does."""
+    import batch
+
+    briefs = tmp_path / "briefs" / "people"
+    briefs.mkdir(parents=True)
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    for slug, claims in (("built", 5), ("unbuilt-big", 40), ("unbuilt-small", 2)):
+        (briefs / f"{slug}.yaml").write_text(
+            "schema: anomalica/brief/2\n"
+            "page:\n"
+            f"  slug: {slug}\n"
+            "  node_type: person\n"
+            f"  title: {slug}\n"
+            f"  claim_count: {claims}\n"
+            "  nodes:\n"
+            f"  - node_id: n-{slug}\n"
+            f"    name: {slug}\n"
+        )
+    (pages / "built.en.md").write_text("---\ntitle: built\n---\n\nbody\n")
+
+    batch.report_unbuilt(str(tmp_path), str(tmp_path / "briefs"), as_json=False)
+    out = capsys.readouterr().out
+    assert "2 brief(s) with no published page" in out
+    assert "built" not in out.split("\n")[0]
+    assert out.index("unbuilt-big") < out.index("unbuilt-small"), "ranked by claims"
+
+
 def test_refresh_display_title_adds_replaces_and_removes(tmp_path):
     """Derived from the title, so it must not be able to drift from it: a stale
     one is replaced and one that has become redundant is removed, not just
