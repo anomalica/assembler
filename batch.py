@@ -44,6 +44,7 @@ running every time rather than only when something looks wrong.
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import json
 import os
@@ -976,6 +977,96 @@ def report_corroboration(briefs_root: str, as_json: bool) -> int:
         f"  briefs containing at least one       "
         f"{totals['briefs_with_single_source_bare']:>8,}"
     )
+    return 0
+
+
+def refresh_titles(
+    content_root: str, db_path: str, apply: bool, written: list | None = None
+) -> int:
+    """Re-derive the title of any page whose node has since been RENAMED.
+
+    A title is a rendering of the node's name, so when the name changes the
+    published title is stale rather than wrong-by-choice, and re-deriving it is
+    regeneration rather than editing. Without this a rename can only reach the
+    page through a paid rebuild: /people/james-macdonald/ carried "James
+    MacDonald" for a real person the corpus spells McDonald 146 times, its brief
+    had moved to the corrected slug, and nothing could rebuild it.
+
+    Keyed on the rename ledger, not on the alias table, and the difference
+    decides three pages. Resolving a title through aliases finds any page whose
+    title merely DIFFERS from its node's name - which would also have retitled
+    "Artificial intelligence" to "Artificial intelligence (AI)" and recapitalised
+    "Extrasensory Perception (ESP)", neither of which anyone decided. An applied
+    rename is a decision with an author and a reason; a difference is not.
+
+    The SLUG is untouched, so a renamed page keeps its old URL until a rebuild
+    moves it. That is deliberate: moving a URL is a removal plus a redirect and
+    belongs to the retirement path, not to a derived pass.
+    """
+    root = Path(content_root).expanduser()
+    try:
+        conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True)
+        renames = collections.defaultdict(list)
+        for was, now, node_id in conn.execute(
+            "SELECT r.node_name_at_proposal, n.name, n.id FROM rename_proposals r "
+            "JOIN nodes n ON n.id = r.node_id "
+            "WHERE r.status = 'applied' AND n.retired_at IS NULL"
+        ):
+            renames[was].append((now, node_id))
+        types = dict(conn.execute("SELECT id, node_type FROM nodes"))
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"cannot read the rename ledger: {exc}", file=sys.stderr)
+        return 2
+
+    changed, ambiguous, residue = [], [], []
+    for md in sorted(root.glob("pages/*/*.en.md")):
+        if md.parent.name == "records":
+            continue
+        lines = md.read_text().split("\n")
+        try:
+            at = next(i for i, ln in enumerate(lines) if ln.startswith("title: "))
+        except StopIteration:
+            continue
+        title = lines[at][len("title: ") :].strip().strip('"')
+        hits = renames.get(title) or []
+        if not hits:
+            continue
+        name = f"{md.parent.name}/{md.name[: -len('.en.md')]}"
+        if len({h[0] for h in hits}) > 1:
+            ambiguous.append((name, title))
+            continue
+        now, node_id = hits[0]
+        wanted = asm._title_display(now, person=types.get(node_id) == "person")
+        if wanted == title:
+            continue
+        changed.append((name, title, wanted))
+        body = md.read_text().split("\n---\n", 1)[-1]
+        if title.split()[-1] in body:
+            residue.append((name, title.split()[-1]))
+        if not apply:
+            continue
+        lines[at] = f"title: {wanted}"
+        md.write_text("\n".join(lines))
+        if written is not None:
+            written.append(md)
+
+    for name, was, now in changed:
+        print(f"  {name}: {was!r} -> {now!r}")
+    for name, title in ambiguous:
+        print(
+            f"  SKIPPED {name}: {title!r} was renamed to two different names; "
+            "a person has to say which",
+            file=sys.stderr,
+        )
+    for name, word in residue:
+        print(
+            f"  NOTE {name}: the body still contains {word!r}. A title is derived "
+            "and this pass corrects it; prose is written and only a rebuild does.",
+            file=sys.stderr,
+        )
+    verb = "retitled" if apply else "would change (use --apply)"
+    print(f"\n{len(changed)} page(s) {verb}; {len(ambiguous)} skipped")
     return 0
 
 
@@ -2396,6 +2487,12 @@ def main() -> int:
         "display text, place display titles. Costs nothing; what the scheduler runs.",
     )
     ap.add_argument(
+        "--refresh-titles",
+        action="store_true",
+        help="Re-derive the title of any page whose node has since been renamed. "
+        "Keyed on the rename ledger, so a mere difference is never touched.",
+    )
+    ap.add_argument(
         "--refresh-display-title",
         action="store_true",
         help="Stamp each place page's reading title beside its canonical one.",
@@ -2506,6 +2603,10 @@ def main() -> int:
                 lambda: refresh_link_display(args.content_root, args.apply, written),
             ),
             (
+                "titles after a rename",
+                lambda: refresh_titles(args.content_root, args.db, args.apply, written),
+            ),
+            (
                 "display titles",
                 lambda: refresh_display_title(args.content_root, args.apply, written),
             ),
@@ -2524,6 +2625,9 @@ def main() -> int:
                 "gets swept into whoever commits next. Pass --commit when unattended."
             )
         return rc
+
+    if args.refresh_titles:
+        return refresh_titles(args.content_root, args.db, args.apply)
 
     if args.refresh_display_title:
         return refresh_display_title(args.content_root, args.apply)

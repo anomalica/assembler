@@ -1099,6 +1099,85 @@ def test_report_unbuilt_lists_only_briefs_with_no_page(tmp_path, capsys):
     assert out.index("unbuilt-big") < out.index("unbuilt-small"), "ranked by claims"
 
 
+def _rename_db(tmp_path, rows):
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, name TEXT, node_type TEXT, retired_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE rename_proposals (node_id TEXT, node_name_at_proposal TEXT, status TEXT)"
+    )
+    for node_id, name, ntype, was, status in rows:
+        conn.execute("INSERT INTO nodes VALUES (?,?,?,NULL)", (node_id, name, ntype))
+        conn.execute(
+            "INSERT INTO rename_proposals VALUES (?,?,?)", (node_id, was, status)
+        )
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+def test_a_renamed_node_retitles_its_page_without_a_rebuild(tmp_path):
+    """The title is a rendering of the node's name, so a rename makes it stale
+    rather than wrong-by-choice. Without this a rename reaches the page only
+    through a paid rebuild - and that page's brief had moved to the corrected
+    slug, so nothing could rebuild it at all."""
+    import batch
+
+    db = _rename_db(
+        tmp_path,
+        [("n1", "James E. McDonald", "person", "James MacDonald", "applied")],
+    )
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    page = pages / "james-macdonald.en.md"
+    page.write_text(
+        "---\ntitle: James MacDonald\ndescription: d\n---\n\nMcDonald said so.\n"
+    )
+    batch.refresh_titles(str(tmp_path), db, apply=True)
+    out = page.read_text()
+    assert "title: James E. McDonald" in out
+    assert "description: d" in out and out.endswith("McDonald said so.\n")
+    assert page.name == "james-macdonald.en.md", "the slug is a move, not a retitle"
+
+
+def test_a_title_that_merely_differs_is_never_touched(tmp_path):
+    """Keyed on the rename ledger, not on the alias table. Resolving through
+    aliases would also have retitled "Artificial intelligence" to add "(AI)" and
+    recapitalised "Extrasensory Perception (ESP)" - neither decided by anyone.
+    An applied rename has an author and a reason; a difference does not."""
+    import batch
+
+    db = _rename_db(
+        tmp_path,
+        [("n1", "Artificial intelligence (AI)", "topic", "Something else", "applied")],
+    )
+    pages = tmp_path / "pages" / "topics"
+    pages.mkdir(parents=True)
+    page = pages / "ai.en.md"
+    before = "---\ntitle: Artificial intelligence\n---\n\nbody\n"
+    page.write_text(before)
+    batch.refresh_titles(str(tmp_path), db, apply=True)
+    assert page.read_text() == before
+
+
+def test_a_rejected_rename_does_not_retitle(tmp_path):
+    """Only 'applied' is a decision. 'rejected' and 'pending' are not."""
+    import batch
+
+    db = _rename_db(tmp_path, [("n1", "The Greys", "topic", "Greys", "rejected")])
+    pages = tmp_path / "pages" / "topics"
+    pages.mkdir(parents=True)
+    page = pages / "greys.en.md"
+    before = "---\ntitle: Greys\n---\n\nbody\n"
+    page.write_text(before)
+    batch.refresh_titles(str(tmp_path), db, apply=True)
+    assert page.read_text() == before
+
+
 def test_refresh_display_title_adds_replaces_and_removes(tmp_path):
     """Derived from the title, so it must not be able to drift from it: a stale
     one is replaced and one that has become redundant is removed, not just
