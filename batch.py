@@ -1681,6 +1681,43 @@ def check_orphans(content_root: str, briefs_root: str, db_path: str) -> int:
             )
         print(f"      brief  : {brief}", file=sys.stderr)
 
+    # A page whose brief has MOVED is not unowned, and telling someone to retire
+    # it is the wrong instruction: its node is alive, its brief exists, and what
+    # it needs is a slug move. The two look identical from the page's own slug -
+    # no brief there either way - so the sweep resolves the page's title through
+    # the graph before it advises anything. Without this it told a reader to
+    # retire the page for James E. McDonald on the day his node was renamed.
+    moved = {}
+    for ref in list(unowned):
+        title = _front_matter(root / f"pages/{ref}.en.md").get("title")
+        if not title:
+            continue
+        for bf in asm.brief_files(briefs):
+            try:
+                page = (yaml.safe_load(bf.read_text()) or {}).get("page") or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            if page.get("title") == title and bf.stem != ref.split("/")[-1]:
+                moved[ref] = f"{bf.parent.name}/{bf.stem}"
+                unowned.remove(ref)
+                break
+
+    if moved:
+        print(
+            f"\nMOVED BRIEF: {len(moved)} published article(s) have no brief at their "
+            "own slug, but their node is live and its brief sits at a NEW slug. These "
+            "want a move, not a retirement.",
+            file=sys.stderr,
+        )
+        for ref, dest in moved.items():
+            print(f"  /{ref}/  ->  brief now at {dest}", file=sys.stderr)
+        print(
+            "      A build writes the page at the new slug; the old URL then wants a "
+            "redirect recorded at the site, in that order. Retiring it would take down "
+            "a live article whose subject is still current.",
+            file=sys.stderr,
+        )
+
     if unowned:
         print(
             f"\nUNOWNED PAGE: {len(unowned)} published article(s) have no brief at all, "

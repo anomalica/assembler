@@ -1272,6 +1272,52 @@ def test_refresh_aliases_writes_nothing_without_apply(tmp_path, capsys):
     assert "roswell-incident-1947" in capsys.readouterr().out
 
 
+def test_a_moved_brief_is_not_reported_as_an_unowned_page(tmp_path, capsys):
+    """From the page's own slug the two are identical - no brief there either
+    way - but one wants a MOVE and the other a retirement, and the sweep was
+    advising retirement for both. It told a reader to take down the page for
+    James E. McDonald on the day his node was renamed and his brief moved to
+    the corrected slug."""
+    import batch
+    import sqlite3
+
+    db = tmp_path / "g.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT, node_type TEXT, name TEXT, retired_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE node_merges (merge_id TEXT, survivor_id TEXT, victim_id TEXT, undone_at TEXT)"
+    )
+    conn.execute("CREATE TABLE claim_node_refs (node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('n1','person','James E. McDonald',NULL)")
+    conn.commit()
+    conn.close()
+
+    briefs = tmp_path / "briefs" / "people"
+    briefs.mkdir(parents=True)
+    (briefs / "james-e-mcdonald.yaml").write_text(
+        "schema: anomalica/brief/2\npage:\n  slug: james-e-mcdonald\n"
+        "  node_type: person\n  title: James E. McDonald\n  nodes:\n"
+        "  - node_id: n1\n    name: James E. McDonald\nclaims:\n- claim_id: c1\n"
+    )
+    pages = tmp_path / "pages" / "people"
+    pages.mkdir(parents=True)
+    (pages / "james-macdonald.en.md").write_text(
+        "---\ntitle: James E. McDonald\n---\n\nbody\n"
+    )
+
+    batch.check_orphans(str(tmp_path), str(tmp_path / "briefs"), str(db))
+    err = capsys.readouterr().err
+    assert "MOVED BRIEF" in err
+    assert "people/james-e-mcdonald" in err, "the destination must be named"
+    assert "UNOWNED" not in err, "a moved brief is not an unowned page"
+    assert "want a move, not a retirement" in err
+    assert "retire the page through the site" not in err, (
+        "the unowned advice must not reach a page that only needs moving"
+    )
+
+
 def test_check_orphans_names_the_merge_survivor(tmp_path, capsys):
     """A merge leaves the losing page published. The report must name the live
     node to redirect to, read from node_merges - a name heuristic scored an
