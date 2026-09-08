@@ -2977,6 +2977,7 @@ def render_article(
     built_from: dict | None = None,
     ai_usage: list | None = None,
     person: bool = False,
+    place: bool = False,
 ) -> str:
     # Title and any other surface-level name fields use display form.
     if isinstance(frontmatter.get("title"), str):
@@ -2984,6 +2985,23 @@ def render_article(
             **frontmatter,
             "title": _title_display(frontmatter["title"], person=person),
         }
+        # A place keeps its canonical, disambiguated title AND gains the reading
+        # form beside it, because the two are wanted on different surfaces:
+        # the page's own heading has the page for context, while a browser tab
+        # or a search result has nothing around it. Settled with the site
+        # workspace 2026-09-08 after they measured the alternative - 7 of 10
+        # place pages file under "U" in the A-Z index because their title starts
+        # with "USA", so a reader looking for Roswell is told it is not there.
+        #
+        # Written ONLY when it differs. Absent means identical, so a consumer
+        # that has never heard of the field keeps today's behaviour, and a field
+        # that is usually equal to another field cannot drift from it unnoticed.
+        if place:
+            display = place_display_name(frontmatter["title"])
+            if display != frontmatter["title"]:
+                frontmatter = _insert_after(
+                    frontmatter, "title", "display_title", display
+                )
     # built_from audit field (brief-sourced entity articles): the brief's freeze
     # is authoritative, so drop any model-emitted built_from first, then slot it
     # after metadata - or after description when the model omits the optional
@@ -3766,6 +3784,7 @@ def main() -> int:
             content_root=Path(args.content_root),
             built_from=built_from_block(brief),
             person=(brief.get("page") or {}).get("node_type") == "person",
+            place=(brief.get("page") or {}).get("node_type") == "place",
         )
     else:
         upstream = gather_upstream_ai_usage(claims, Path(args.digests_root))
@@ -3776,6 +3795,7 @@ def main() -> int:
             content_root=Path(args.content_root),
             ai_usage=accumulate(upstream, assemble_entry),
             person=node.get("type") == "person",
+            place=node.get("type") == "place",
         )
 
     # Deterministic US-proper-noun spelling correction (the prompt carve-out is a

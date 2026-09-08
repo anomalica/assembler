@@ -999,6 +999,33 @@ def test_a_retirement_without_a_reviewable_reason_is_refused(tmp_path):
         assert page.is_file(), "the failure leaves the page up"
 
 
+def test_refresh_display_title_adds_replaces_and_removes(tmp_path):
+    """Derived from the title, so it must not be able to drift from it: a stale
+    one is replaced and one that has become redundant is removed, not just
+    added where missing."""
+    import batch
+
+    pages = tmp_path / "pages" / "places"
+    pages.mkdir(parents=True)
+    add = pages / "a.en.md"
+    add.write_text("---\ntitle: USA, Nevada, Area 51\ndescription: d\n---\n\nbody\n")
+    stale = pages / "b.en.md"
+    stale.write_text(
+        "---\ntitle: France, Paris\ndisplay_title: Marseille\ndescription: d\n---\n\nbody\n"
+    )
+    redundant = pages / "c.en.md"
+    redundant.write_text(
+        "---\ntitle: France\ndisplay_title: France\ndescription: d\n---\n\nbody\n"
+    )
+    batch.refresh_display_title(str(tmp_path), apply=True)
+    assert "display_title: Area 51" in add.read_text()
+    assert "display_title: Paris" in stale.read_text()
+    assert "Marseille" not in stale.read_text()
+    assert "display_title" not in redundant.read_text()
+    for f in (add, stale, redundant):
+        assert "description: d" in f.read_text() and f.read_text().endswith("body\n")
+
+
 def test_refresh_link_display_rewrites_prose_without_moving_a_link(tmp_path):
     """The display text is derived from the node name, so it re-derives without
     a model. The URL must not move with it - the slug is matched elsewhere."""
@@ -1588,6 +1615,37 @@ def test_title_display_swaps_names_for_people_only():
     assert a._title_display("Fravor, David", person=True) == "David Fravor"
     assert a._title_display("telepathy") == "Telepathy"
     assert a._title_display("Unidentified Flying Object (UFO)") == "UFOs"
+
+
+def test_a_place_page_carries_both_the_canonical_and_the_reading_title():
+    """Two surfaces want different things: the h1 has the page for context, a
+    browser tab and a search result have nothing around them. Site measured the
+    alternative - 7 of 10 place pages file under "U" for USA in the A-Z index."""
+    out = a.render_article(
+        {"title": "USA, Ohio, Wright-Patterson Air Force Base", "description": "d"},
+        "body",
+        place=True,
+    )
+    assert "title: USA, Ohio, Wright-Patterson Air Force Base" in out
+    assert "display_title: Wright-Patterson Air Force Base" in out
+
+
+def test_display_title_is_absent_when_it_would_equal_the_title():
+    """Sparse by agreement: absent means identical, so a consumer that has never
+    heard of the field keeps today's behaviour, and a field usually equal to
+    another field cannot drift from it unnoticed."""
+    assert "display_title" not in a.render_article(
+        {"title": "France", "description": "d"}, "body", place=True
+    )
+    assert "display_title" not in a.render_article(
+        {"title": "Los Alamos, New Mexico, USA", "description": "d"}, "body", place=True
+    ), "a name written the other way round is not trimmed, so nothing is added"
+
+
+def test_only_a_place_gets_a_display_title():
+    assert "display_title" not in a.render_article(
+        {"title": "Fravor, David", "description": "d"}, "body", person=True
+    )
 
 
 def test_link_display_reads_a_place_name_as_a_sentence_does():

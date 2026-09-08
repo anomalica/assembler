@@ -810,6 +810,51 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def refresh_display_title(content_root: str, apply: bool) -> int:
+    """Stamp each place page's reading title beside its canonical one.
+
+    Derived from the title by a pure function, so like the alias block it does
+    not need a rebuild to be corrected. Written only where it differs; an
+    existing one that no longer matches is replaced, and one that has become
+    redundant is removed, so the field cannot drift from the title it derives
+    from.
+    """
+    root = Path(content_root).expanduser()
+    changed = []
+    for md in sorted(root.glob("pages/places/*.en.md")):
+        text = md.read_text()
+        if "\n---\n" not in text:
+            continue
+        lines = text.split("\n")
+        try:
+            at = next(i for i, ln in enumerate(lines) if ln.startswith("title: "))
+        except StopIteration:
+            continue
+        title = lines[at][len("title: ") :].strip().strip('"')
+        wanted = asm.place_display_name(title)
+        wanted = "" if wanted == title else wanted
+        nxt = lines[at + 1] if at + 1 < len(lines) else ""
+        current = (
+            nxt[len("display_title: ") :].strip().strip('"')
+            if nxt.startswith("display_title: ")
+            else ""
+        )
+        if current == wanted:
+            continue
+        changed.append((md.name[: -len(".en.md")], current or "-", wanted or "-"))
+        if not apply:
+            continue
+        rest = lines[at + 2 :] if current else lines[at + 1 :]
+        stamp = [f"display_title: {wanted}"] if wanted else []
+        md.write_text("\n".join(lines[: at + 1] + stamp + rest))
+
+    for slug, was, now in changed:
+        print(f"  places/{slug}: {was} -> {now}")
+    verb = "rewritten" if apply else "would change (use --apply)"
+    print(f"\n{len(changed)} place page(s) {verb}")
+    return 0
+
+
 def refresh_link_display(content_root: str, apply: bool) -> int:
     """Re-read every published page's entity links as a sentence, not an index.
 
@@ -2050,6 +2095,17 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--refresh-derived",
+        action="store_true",
+        help="Re-emit every DERIVED field on published pages - aliases, link "
+        "display text, place display titles. Costs nothing; what the scheduler runs.",
+    )
+    ap.add_argument(
+        "--refresh-display-title",
+        action="store_true",
+        help="Stamp each place page's reading title beside its canonical one.",
+    )
+    ap.add_argument(
         "--retire-page",
         metavar="URL",
         help="Take one page down through the recorded retirement path. Refuses "
@@ -2114,6 +2170,35 @@ def main() -> int:
             args.reference_root,
             args.apply,
         )
+
+    if args.refresh_derived:
+        # Everything a published page carries that is DERIVED rather than
+        # written by a model: it can be re-emitted at any time for nothing, so a
+        # rebuild is not what should be required to correct it. One command
+        # because this is what the scheduler runs on a timer.
+        rc = 0
+        for name, run in (
+            (
+                "aliases",
+                lambda: refresh_aliases(
+                    args.content_root, args.briefs_root, args.db, args.apply
+                ),
+            ),
+            (
+                "link display",
+                lambda: refresh_link_display(args.content_root, args.apply),
+            ),
+            (
+                "display titles",
+                lambda: refresh_display_title(args.content_root, args.apply),
+            ),
+        ):
+            print(f"\n=== {name} ===")
+            rc = max(rc, run())
+        return rc
+
+    if args.refresh_display_title:
+        return refresh_display_title(args.content_root, args.apply)
 
     if args.refresh_link_display:
         return refresh_link_display(args.content_root, args.apply)
