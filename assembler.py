@@ -442,6 +442,9 @@ def claims_from_digest(digest: dict) -> list[dict]:
                 "attestation": c.get("attestation") or "",
                 # ADR 0044 - see claims_from_brief. Absent -> "unknown" (fail safe).
                 "attribution_mode": c.get("attribution_mode") or "unknown",
+                "independent_sources": (
+                    (c.get("evidence") or {}).get("independent_sources")
+                ),
                 "provenance_chain": c.get("provenance_chain"),
                 "location": c.get("location"),
                 "date": c.get("date"),
@@ -907,6 +910,9 @@ def claims_from_brief(brief: dict) -> list[dict]:
                 # three consumers cannot drift; we branch on it, never re-derive.
                 # Absent -> "unknown", which FAILS SAFE (hedge), never bare-assert.
                 "attribution_mode": c.get("attribution_mode") or "unknown",
+                "independent_sources": (
+                    (c.get("evidence") or {}).get("independent_sources")
+                ),
                 "provenance_chain": c.get("provenance_chain"),
                 "location": c.get("location_in_record"),
                 "date": c.get("date"),
@@ -920,11 +926,13 @@ def claims_from_brief(brief: dict) -> list[dict]:
                 "link_kind": "ref",
             }
         )
-    # Deliberately NOT consumed in v1 (entity-article shape doesn't surface them):
+    # Deliberately NOT consumed in v1 (entity-article shape doesn't surface it):
     # claim.node_refs (per-claim entity chips are a record-page feature) and
-    # claim.evidence.independent_sources (forward-provisioned, neutral until
-    # evidence-scoring pins). Both remain in the brief if a future version wants
     # them; node_refs carries node_id so links could resolve to canonical slugs.
+    # evidence.independent_sources IS consumed now - see format_claim. It is the
+    # real measurement (distinct provenance-chain roots across the corroboration
+    # group, so ten outlets on one press release count as one); evidence.score is
+    # the neutral placeholder, and the two must not be confused.
     return out
 
 
@@ -1326,6 +1334,20 @@ def format_claim(c: dict, idx: int) -> str:
     """
     mode = c.get("attribution_mode") or "unknown"
     speaker = c.get("speaker") or ""
+    # A claim standing on ONE source is never asserted in Anomalica's own voice,
+    # whatever attribution_mode says. bare_ok describes the shape of the claim's
+    # text, not the weight of evidence behind it, and it was never a judgement
+    # about corroboration: 20,605 claims carry bare_ok on a single source against
+    # 138 in the whole corpus with two or more. The cost of the default was a
+    # devotional book's factual errors published as our own - "In March 1938,
+    # Germany annexed the Sudetenland from Czechoslovakia, effectively beginning
+    # World War II", which is false, one sentence before the page correctly dated
+    # the Anschluss to the same month. A single-source corpus should read like one.
+    # An ABSENT count is unmeasured, never "corroborated": bare_ok has to earn
+    # itself with a measurement of two or more, rather than survive the lack of one.
+    sources = c.get("independent_sources")
+    if mode == "bare_ok" and not (isinstance(sources, int) and sources >= 2):
+        mode = "unknown"
 
     bits = [f"[{idx}] {c['claim_type']}, {c['attestation']}"]
     if mode != "in_text" and speaker:

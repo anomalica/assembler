@@ -2129,6 +2129,39 @@ def test_an_alias_naming_a_retired_node_is_the_merge_history_and_is_kept(tmp_pat
     assert "/en/events/tic-tac-sighting/" in out
 
 
+def _claim(mode, sources):
+    return {
+        "claim_type": "observation",
+        "attestation": "first_hand",
+        "content": "Germany annexed the Sudetenland in March 1938.",
+        "attribution_mode": mode,
+        "independent_sources": sources,
+        "speaker": "",
+        "record_title": "The Fatima Secret",
+    }
+
+
+def test_one_source_is_never_asserted_in_our_own_voice():
+    """bare_ok describes the shape of the claim's TEXT, not the weight of
+    evidence behind it. A devotional book's false history shipped as ours:
+    "In March 1938, Germany annexed the Sudetenland ... effectively beginning
+    World War II" - the Sudetenland was October 1938."""
+    out = a.format_claim(_claim("bare_ok", 1), 1)
+    assert "ATTRIBUTION" in out, "a single source must be attributed in the prose"
+    assert "plain fact" in out or "own voice" in out
+
+
+def test_two_independent_sources_may_still_be_stated_plainly():
+    """The rule is about corroboration, not about silencing every claim."""
+    assert "ATTRIBUTION" not in a.format_claim(_claim("bare_ok", 2), 1)
+
+
+def test_an_unmeasured_source_count_does_not_silently_permit_a_bare_claim():
+    """A brief that carries no count must not read as "corroborated" - absence
+    of the measurement is not a measurement of two."""
+    assert "ATTRIBUTION" in a.format_claim(_claim("bare_ok", None), 1)
+
+
 def test_the_graph_alias_table_is_read_even_when_the_brief_names_the_node(tmp_path):
     """brief/2 always supplies the covered node's own name, so a `not names`
     fallback guard stopped the alias table from ever being consulted and a
