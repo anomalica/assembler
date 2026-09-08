@@ -893,6 +893,112 @@ def _refresh_fixture(tmp_path):
     return db, tmp_path / "briefs", tmp_path, page
 
 
+def _retire_fixture(tmp_path, gone=False):
+    import subprocess
+
+    content = tmp_path / "content"
+    (content / "pages" / "events").mkdir(parents=True)
+    page = content / "pages" / "events" / "world-war-ii.en.md"
+    page.write_text(
+        "---\ntitle: World War II\n---\n\nWrong on two dates.<sup>1</sup>\n"
+    )
+    site = tmp_path / "site"
+    (site / "data").mkdir(parents=True)
+    (site / "data" / "redirects.yaml").write_text(
+        "redirects:\n- from: /events/world-war-ii/\n  gone: true\n"
+        if gone
+        else "redirects: []\n"
+    )
+    ref = tmp_path / "meta"
+    (ref / "reference").mkdir(parents=True)
+    (ref / "reference" / ".keep").write_text("")  # git will not commit an empty dir
+    for repo in (content, ref):
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "init", "--no-verify"], cwd=repo, check=True
+        )
+    return content, site, ref, page
+
+
+def test_a_page_is_not_retired_until_the_site_records_it(tmp_path):
+    """Two gates in different hands. Deciding a removal and executing it must not
+    be the same actor, so this refuses while the site's record is absent and it
+    never writes that record itself - a gate is worth nothing when the actor it
+    gates can satisfy it."""
+    import batch
+
+    content, site, ref, page = _retire_fixture(tmp_path, gone=False)
+    before = (site / "data" / "redirects.yaml").read_text()
+    rc = batch.retire_page(
+        "/en/events/world-war-ii/",
+        "no subject the corpus can support, and two false dates",
+        "anomalica/master",
+        str(content),
+        str(site),
+        str(ref),
+        apply=True,
+    )
+    assert rc == 1
+    assert page.is_file(), "the safe failure is that the page stays up"
+    assert (site / "data" / "redirects.yaml").read_text() == before, (
+        "the site repo must never be written by the actor it gates"
+    )
+
+
+def test_a_recorded_retirement_removes_the_page_and_stays_reversible(tmp_path):
+    import batch
+    import json
+
+    content, site, ref, page = _retire_fixture(tmp_path, gone=True)
+    rc = batch.retire_page(
+        "/en/events/world-war-ii/",
+        "no subject the corpus can support, and two false dates",
+        "anomalica/master",
+        str(content),
+        str(site),
+        str(ref),
+        apply=True,
+    )
+    assert rc == 0
+    assert not page.exists()
+    entry = json.loads((ref / "reference" / "retirements.json").read_text())["entries"][
+        0
+    ]
+    assert entry["url"] == "/events/world-war-ii/"
+    assert entry["reason"] == "no subject the corpus can support, and two false dates"
+    assert entry["decided_by"] == "anomalica/master"
+    assert entry["title"] == "World War II"
+    assert "how_to_reverse" in entry
+
+
+def test_a_retirement_without_a_reviewable_reason_is_refused(tmp_path):
+    """The record exists to say why. An empty reason is a rubber stamp and so is
+    "cleanup", which would pass every other gate and tell a future reader
+    nothing - site's point, from the reason-less vetoes."""
+    import batch
+
+    for bad in ("   ", "cleanup", "wrong"):
+        content, site, ref, page = _retire_fixture(
+            tmp_path / bad.strip("  ") or "x", gone=True
+        )
+        assert (
+            batch.retire_page(
+                "/en/events/world-war-ii/",
+                bad,
+                "x",
+                str(content),
+                str(site),
+                str(ref),
+                True,
+            )
+            == 2
+        ), f"{bad!r} must not pass"
+        assert page.is_file(), "the failure leaves the page up"
+
+
 def test_refresh_link_display_rewrites_prose_without_moving_a_link(tmp_path):
     """The display text is derived from the node name, so it re-derives without
     a model. The URL must not move with it - the slug is matched elsewhere."""

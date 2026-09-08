@@ -1541,6 +1541,121 @@ def veto_move_candidate(item: dict, content_root: Path, db_path: str) -> str | N
     return "  A MOVE may be right instead of gone: " + "; ".join(lines) + "."
 
 
+def retire_page(
+    url: str,
+    reason: str,
+    decided_by: str,
+    content_root: str,
+    site_root: str,
+    reference_root: str,
+    apply: bool,
+) -> int:
+    """Take down ONE named page through the same two gates as a vetoed one.
+
+    --retire-vetoed can only reach a page whose node a reviewer has vetoed, so a
+    page that is wrong for any other reason had no recorded path off the site at
+    all - the first one that needed it was an article asserting, in our own
+    voice, that the Sudetenland was annexed in March 1938, one sentence before
+    correctly dating the Anschluss to the same month.
+
+    The gates are unchanged and they are the point. This refuses to remove
+    anything until site's data/redirects.yaml records the URL as gone, and it
+    never writes that file: a gate is worth nothing when the actor it gates can
+    satisfy it. Deciding a page should go and executing the removal stay in
+    different hands, and if nobody records it the page stays up.
+    """
+    from datetime import date
+
+    content = Path(content_root).expanduser()
+    path = content / "pages" / url.strip("/").replace("en/", "", 1)
+    path = path.with_name(path.name + ".en.md") if path.suffix != ".md" else path
+    if not path.is_file():
+        print(f"no page at {path}", file=sys.stderr)
+        return 2
+    # A floor, not a judgement: "cleanup" passes every other gate we have and
+    # tells a future reader nothing, and the veto path already taught us that a
+    # removal nobody can review later is the failure. It cannot tell a good
+    # reason from a long bad one - it only refuses the one-word placeholder, and
+    # it fails toward the page staying up.
+    if len(reason.split()) < 5:
+        print(
+            "a retirement needs a reason a stranger could review later, not a "
+            f"placeholder; got {reason.strip()!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    canonical = "/" + "/".join(url.strip("/").split("/")[-2:]) + "/"
+    redirects = Path(site_root).expanduser() / "data" / "redirects.yaml"
+    if not (site_has_gone(redirects, canonical) or site_has_gone(redirects, url)):
+        print(
+            f"NOT REMOVED - the site does not record {canonical} as gone.\n"
+            f"The removal is decided by whoever writes that entry in {redirects},\n"
+            "and this run will not write it. Ask the site workspace, with the reason."
+        )
+        return 1
+    if not apply:
+        print(f"{canonical} is recorded gone and ready to remove. Re-run with --apply.")
+        return 1
+
+    today = date.today().isoformat()
+    raw = path.read_text()
+    body = raw.split("\n---\n", 1)[-1]
+    rel = str(path.relative_to(content))
+    ref_root = Path(reference_root).expanduser()
+    ref_file = ref_root / "reference" / "retirements.json"
+    record = (
+        json.loads(ref_file.read_text())
+        if ref_file.is_file()
+        else {"record": "page-retirements", "entries": []}
+    )
+    record["entries"].append(
+        {
+            "url": canonical,
+            "page": rel,
+            "title": (_front_matter(path) or {}).get("title"),
+            "reason": reason,
+            "decided_by": decided_by,
+            "retired": today,
+            "words": len(re.sub(r"<sup>.*?</sup>", "", body).split()),
+            "citations": len(re.findall("<sup>", raw)),
+            "how_to_reverse": "git checkout <retirement commit>^ -- <page>; remove the "
+            "URL's entry from site/data/redirects.yaml; push both; site deploys.",
+        }
+    )
+    ref_file.parent.mkdir(parents=True, exist_ok=True)
+    ref_file.write_text(json.dumps(record, indent=2) + "\n")
+
+    _git(content, "rm", "-q", "--", rel)
+    msg = (
+        f"prune: retire {canonical}\n\n{reason}\n\n"
+        f"Decided by {decided_by}. The URL was recorded as gone at the site before\n"
+        "this removal, and the entry in reference/retirements.json reverses it.\n"
+    )
+    _git(content, "commit", "-q", "-F", "-", "--", rel, stdin=msg)
+    ref_rel = str(ref_file.relative_to(ref_root))
+    _git(ref_root, "add", "--", ref_rel)
+    r = subprocess.run(
+        [
+            "git",
+            "commit",
+            "-q",
+            "-m",
+            f"reference: record the retirement of {canonical}",
+            "--",
+            ref_rel,
+        ],
+        cwd=ref_root,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode and "nothing to commit" not in (r.stdout + r.stderr):
+        raise RuntimeError(f"reference commit failed: {(r.stderr or r.stdout).strip()}")
+    print(f"removed {canonical}; recorded in {ref_file}; committed in both repos.")
+    print("Push content and tell site to deploy - the deploy is theirs.")
+    return 0
+
+
 def retire_vetoed(
     content_root: str,
     briefs_root: str,
@@ -1935,6 +2050,20 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--retire-page",
+        metavar="URL",
+        help="Take one page down through the recorded retirement path. Refuses "
+        "until the site records the URL as gone; never writes that record itself.",
+    )
+    ap.add_argument(
+        "--reason", help="Why the page is being retired. Required with --retire-page."
+    )
+    ap.add_argument(
+        "--decided-by",
+        default="anomalica/assembler",
+        help="Who took the decision, for the retirement record.",
+    )
+    ap.add_argument(
         "--refresh-link-display",
         action="store_true",
         help="Re-derive the display text of every entity link in published prose "
@@ -1958,6 +2087,20 @@ def main() -> int:
 
     if args.check_orphans:
         return check_orphans(args.content_root, args.briefs_root, args.db)
+
+    if args.retire_page:
+        site_root = args.site_root or str(
+            Path(args.content_root).expanduser().parent / "site"
+        )
+        return retire_page(
+            args.retire_page,
+            args.reason or "",
+            args.decided_by,
+            args.content_root,
+            site_root,
+            args.reference_root,
+            args.apply,
+        )
 
     if args.retire_vetoed:
         site_root = args.site_root or str(
