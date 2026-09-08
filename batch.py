@@ -810,6 +810,36 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def commit_refreshed(content_root: str, written: list) -> int:
+    """Commit exactly the files a refresh pass wrote, by pathspec.
+
+    content/ is ONE working tree shared by every session on this machine, and its
+    git index is shared too - 633 of another session's files have sat staged
+    while I was mid-commit. A pass that writes and does not commit leaves its work
+    to be swept into whoever commits next, attributed to them, with nothing
+    recording that a scheduled task did it. So an unattended run commits its own
+    output, by explicit pathspec, and never with `git add -A` or a bare commit.
+    """
+    root = Path(content_root).expanduser()
+    paths = sorted(
+        {str(Path(p).resolve().relative_to(root.resolve())) for p in written}
+    )
+    if not paths:
+        return 0
+    msg = (
+        f"chore(derived): re-emit derived fields on {len(paths)} page(s)\n\n"
+        "Scheduled run of assembler --refresh-derived. No model and no rebuild:\n"
+        "alias lists, entity-link display text and place display titles are all\n"
+        "derived from the graph and from node names, so they are re-emitted\n"
+        "rather than regenerated.\n"
+    )
+    _git(root, "commit", "-q", "-F", "-", "--", *paths, stdin=msg)
+    print(
+        f"\ncommitted {len(paths)} file(s) by pathspec; nothing else in the tree touched."
+    )
+    return 0
+
+
 def report_corroboration(briefs_root: str, as_json: bool) -> int:
     """How much of the corpus rests on more than one independent source.
 
@@ -884,7 +914,9 @@ def report_corroboration(briefs_root: str, as_json: bool) -> int:
     return 0
 
 
-def refresh_display_title(content_root: str, apply: bool) -> int:
+def refresh_display_title(
+    content_root: str, apply: bool, written: list | None = None
+) -> int:
     """Stamp each place page's reading title beside its canonical one.
 
     Derived from the title by a pure function, so like the alias block it does
@@ -921,6 +953,8 @@ def refresh_display_title(content_root: str, apply: bool) -> int:
         rest = lines[at + 2 :] if current else lines[at + 1 :]
         stamp = [f"display_title: {wanted}"] if wanted else []
         md.write_text("\n".join(lines[: at + 1] + stamp + rest))
+        if written is not None:
+            written.append(md)
 
     for slug, was, now in changed:
         print(f"  places/{slug}: {was} -> {now}")
@@ -929,7 +963,9 @@ def refresh_display_title(content_root: str, apply: bool) -> int:
     return 0
 
 
-def refresh_link_display(content_root: str, apply: bool) -> int:
+def refresh_link_display(
+    content_root: str, apply: bool, written: list | None = None
+) -> int:
     """Re-read every published page's entity links as a sentence, not an index.
 
     A person node is named "Fravor, David" and a place node "USA, Nevada, Area
@@ -965,6 +1001,8 @@ def refresh_link_display(content_root: str, apply: bool) -> int:
         changed.append((name, sorted(was - now)))
         if apply:
             md.write_text(head + "\n---\n" + rewritten)
+            if written is not None:
+                written.append(md)
 
     for name, gone in changed:
         print(f"  {name}: {', '.join(gone)}")
@@ -976,7 +1014,11 @@ def refresh_link_display(content_root: str, apply: bool) -> int:
 
 
 def refresh_aliases(
-    content_root: str, briefs_root: str, db_path: str, apply: bool
+    content_root: str,
+    briefs_root: str,
+    db_path: str,
+    apply: bool,
+    written: list | None = None,
 ) -> int:
     """Re-derive every published page's redirect list from the graph, no model.
 
@@ -1045,6 +1087,8 @@ def refresh_aliases(
             blocked.append((f"{section}/{slug}", "rewrite would move body content"))
             continue
         md.write_text("\n".join(rewritten))
+        if written is not None:
+            written.append(md)
 
     for name, was, now in changed:
         print(f"  {name}: {was} -> {now} aliases")
@@ -2264,6 +2308,12 @@ def main() -> int:
         "--json", action="store_true", help="Machine-readable report output."
     )
     ap.add_argument(
+        "--commit",
+        action="store_true",
+        help="With --refresh-derived --apply: commit exactly what was written, by "
+        "pathspec. Required for an unattended run - content/ is a shared tree.",
+    )
+    ap.add_argument(
         "--refresh-derived",
         action="store_true",
         help="Re-emit every DERIVED field on published pages - aliases, link "
@@ -2364,24 +2414,33 @@ def main() -> int:
         # rebuild is not what should be required to correct it. One command
         # because this is what the scheduler runs on a timer.
         rc = 0
+        written: list = []
         for name, run in (
             (
                 "aliases",
                 lambda: refresh_aliases(
-                    args.content_root, args.briefs_root, args.db, args.apply
+                    args.content_root, args.briefs_root, args.db, args.apply, written
                 ),
             ),
             (
                 "link display",
-                lambda: refresh_link_display(args.content_root, args.apply),
+                lambda: refresh_link_display(args.content_root, args.apply, written),
             ),
             (
                 "display titles",
-                lambda: refresh_display_title(args.content_root, args.apply),
+                lambda: refresh_display_title(args.content_root, args.apply, written),
             ),
         ):
             print(f"\n=== {name} ===")
             rc = max(rc, run())
+        if args.commit and written:
+            rc = max(rc, commit_refreshed(args.content_root, written))
+        elif written:
+            print(
+                f"\n{len(set(written))} file(s) written and NOT committed. content/ is "
+                "one working tree shared by every session here, so uncommitted work "
+                "gets swept into whoever commits next. Pass --commit when unattended."
+            )
         return rc
 
     if args.refresh_display_title:

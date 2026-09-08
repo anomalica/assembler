@@ -999,6 +999,45 @@ def test_a_retirement_without_a_reviewable_reason_is_refused(tmp_path):
         assert page.is_file(), "the failure leaves the page up"
 
 
+def test_a_scheduled_refresh_commits_only_what_it_wrote(tmp_path):
+    """content/ is one working tree shared by every session here, and its git
+    INDEX is shared too - 633 of another session's files have sat staged while
+    this one was mid-commit. An unattended pass must commit its own output by
+    pathspec and sweep up nothing else."""
+    import batch
+    import subprocess
+
+    content = tmp_path / "content"
+    (content / "pages" / "places").mkdir(parents=True)
+    mine = content / "pages" / "places" / "mine.en.md"
+    theirs = content / "pages" / "places" / "theirs.en.md"
+    mine.write_text("---\ntitle: A\n---\n\nbody\n")
+    theirs.write_text("---\ntitle: B\n---\n\nbody\n")
+    subprocess.run(["git", "init", "-q"], cwd=content, check=True)
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "config", k, v], cwd=content, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=content, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init", "--no-verify"], cwd=content, check=True
+    )
+
+    mine.write_text("---\ntitle: A\ndisplay_title: A\n---\n\nbody\n")
+    theirs.write_text("---\ntitle: B\n---\n\nanother session was here\n")
+
+    assert batch.commit_refreshed(str(content), [mine]) == 0
+    changed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=content,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert changed == ["pages/places/mine.en.md"], changed
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=content, capture_output=True, text=True
+    ).stdout
+    assert "theirs.en.md" in dirty, "the other session's work must be left alone"
+
+
 def test_refresh_display_title_adds_replaces_and_removes(tmp_path):
     """Derived from the title, so it must not be able to drift from it: a stale
     one is replaced and one that has become redundant is removed, not just
