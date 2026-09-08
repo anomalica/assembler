@@ -810,6 +810,52 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def refresh_link_display(content_root: str, apply: bool) -> int:
+    """Re-read every published page's entity links as a sentence, not an index.
+
+    A person node is named "Fravor, David" and a place node "USA, Nevada, Area
+    51" so that both sort and disambiguate. Dropped into prose they read as index
+    entries - "the facility at USA, Nevada, Area 51" was live 47 times - and the
+    rule that fixes it was fenced to people only.
+
+    Display text is derived from the node name, so it can be re-derived without
+    a model exactly like the alias block. URLs are never rewritten and the pass
+    proves it: the ordered list of link targets must be identical before and
+    after, or the page is left alone and reported.
+    """
+    root = Path(content_root).expanduser()
+    link = asm._ENTITY_LINK
+    changed, blocked = [], []
+
+    for md in sorted(root.glob("pages/*/*.en.md")):
+        text = md.read_text()
+        if "\n---\n" not in text:
+            continue
+        head, body = text.split("\n---\n", 1)
+        rewritten = asm._rewrite_link_display(body)
+        if rewritten == body:
+            continue
+        name = f"{md.parent.name}/{md.name[: -len('.en.md')]}"
+        if link.findall(body) and [u for _, u in link.findall(body)] != [
+            u for _, u in link.findall(rewritten)
+        ]:
+            blocked.append((name, "a link target moved"))
+            continue
+        was = {d for d, _ in link.findall(body)}
+        now = {d for d, _ in link.findall(rewritten)}
+        changed.append((name, sorted(was - now)))
+        if apply:
+            md.write_text(head + "\n---\n" + rewritten)
+
+    for name, gone in changed:
+        print(f"  {name}: {', '.join(gone)}")
+    for name, why in blocked:
+        print(f"  BLOCKED {name}: {why}", file=sys.stderr)
+    verb = "rewritten" if apply else "would change (use --apply)"
+    print(f"\n{len(changed)} pages {verb}; {len(blocked)} blocked")
+    return 1 if blocked else 0
+
+
 def refresh_aliases(
     content_root: str, briefs_root: str, db_path: str, apply: bool
 ) -> int:
@@ -1889,6 +1935,12 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--refresh-link-display",
+        action="store_true",
+        help="Re-derive the display text of every entity link in published prose "
+        "so an index-form node name does not read as one. Costs nothing.",
+    )
+    ap.add_argument(
         "--refresh-aliases",
         action="store_true",
         help="Re-derive every page's redirect list from the graph and rewrite the "
@@ -1919,6 +1971,9 @@ def main() -> int:
             args.reference_root,
             args.apply,
         )
+
+    if args.refresh_link_display:
+        return refresh_link_display(args.content_root, args.apply)
 
     if args.refresh_aliases:
         return refresh_aliases(args.content_root, args.briefs_root, args.db, args.apply)

@@ -893,6 +893,41 @@ def _refresh_fixture(tmp_path):
     return db, tmp_path / "briefs", tmp_path, page
 
 
+def test_refresh_link_display_rewrites_prose_without_moving_a_link(tmp_path):
+    """The display text is derived from the node name, so it re-derives without
+    a model. The URL must not move with it - the slug is matched elsewhere."""
+    import batch
+
+    pages = tmp_path / "pages" / "records"
+    pages.mkdir(parents=True)
+    page = pages / "r.en.md"
+    page.write_text(
+        "---\ntitle: R\n---\n\n"
+        "The base at [USA, Nevada, Area 51](/places/area-51-nevada-usa) was "
+        "described by [Fravor, David](/people/david-fravor).\n"
+    )
+    rc = batch.refresh_link_display(str(tmp_path), apply=True)
+    out = page.read_text()
+    assert rc == 0
+    assert "[Area 51](/places/area-51-nevada-usa)" in out
+    assert "[David Fravor](/people/david-fravor)" in out
+    assert "title: R" in out, "front matter is untouched"
+
+
+def test_refresh_link_display_writes_nothing_without_apply(tmp_path):
+    import batch
+
+    pages = tmp_path / "pages" / "records"
+    pages.mkdir(parents=True)
+    page = pages / "r.en.md"
+    page.write_text(
+        "---\ntitle: R\n---\n\n[USA, Nevada, Area 51](/places/area-51-nevada-usa)\n"
+    )
+    before = page.read_text()
+    batch.refresh_link_display(str(tmp_path), apply=False)
+    assert page.read_text() == before
+
+
 def test_refresh_aliases_replaces_a_stale_list_without_touching_the_body(tmp_path):
     """Aliases are derived, so a page can carry a set that was right when it was
     built and wrong now. One page carried 123, 106 of them other incidents. The
@@ -1449,11 +1484,43 @@ def test_title_display_swaps_names_for_people_only():
     assert a._title_display("Unidentified Flying Object (UFO)") == "UFOs"
 
 
-def test_link_display_swaps_names_for_people_links_only():
-    body = "[France, Paris](/places/paris-france) and [Fravor, David](/people/david-fravor)"
+def test_link_display_reads_a_place_name_as_a_sentence_does():
+    """Was scoped to people only, and 47 place links shipped reading "the
+    facility at USA, Nevada, Area 51". The URL must not move with the display."""
+    body = (
+        "[USA, Nevada, Area 51](/places/area-51-nevada-usa) and "
+        "[Fravor, David](/people/david-fravor) and "
+        "[France, Paris](/places/paris-france)"
+    )
     out = a._rewrite_link_display(body)
-    assert "[France, Paris](/places/paris-france)" in out
+    assert "[Area 51](/places/area-51-nevada-usa)" in out
     assert "[David Fravor](/people/david-fravor)" in out
+    assert "[Paris](/places/paris-france)" in out
+
+
+def test_a_link_whose_display_text_contains_an_escaped_bracket_is_seen(tmp_path):
+    """A node named "USA, [N/A], Phobos" reaches prose with escaped brackets, and
+    a character class that only excludes "]" cannot span one - so the link was
+    invisible to display rewriting, link resolution and the retarget pass alike.
+    It shipped as "an unusual structure on USA, [N/A], Phobos"."""
+    body = r"a structure on [USA, \[N/A\], Phobos](/places/na-phobos-usa)."
+    out = a._rewrite_link_display(body)
+    assert "[Phobos](/places/na-phobos-usa)" in out
+    assert len(a._ENTITY_LINK.findall(body)) == 1, "the pattern must match it at all"
+
+
+def test_a_place_name_written_the_other_way_round_is_left_alone():
+    """12 of 1,088 comma-separated place names are specific-first. Taking the
+    last segment there yields "USA", which is worse than the index form."""
+    body = "[Los Alamos, New Mexico, USA](/places/los-alamos-new-mexico-usa)"
+    assert a._rewrite_link_display(body) == body
+
+
+def test_an_organisation_link_is_never_trimmed():
+    """Only people and places name themselves for an index; ", LLC" is part of
+    an organisation's actual name."""
+    body = "[Bigelow Aerospace, LLC](/organisations/bigelow-aerospace)"
+    assert a._rewrite_link_display(body) == body
 
 
 def test_record_titles_are_verbatim():

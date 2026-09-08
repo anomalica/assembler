@@ -37,7 +37,11 @@ from pathlib import Path
 
 import yaml
 from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
-from anomalica_common.titles import capitalise_first, collapse_bare_title_acronyms
+from anomalica_common.titles import (
+    capitalise_first,
+    collapse_bare_title_acronyms,
+    place_display_name,
+)
 from anomalica_common.llm import (
     PlanRateLimited,
     accumulate,
@@ -2094,7 +2098,15 @@ def _retry_note(fail_msg: str) -> str:
     )
 
 
-_BODY_LINK = re.compile(r"\[([^\]\n]+?)\]\(/([a-z-]+)/([a-z0-9-]+)\)")
+# A link's display text may contain an ESCAPED bracket - a node named
+# "USA, [N/A], Phobos" reaches prose as "[USA, \\[N/A\\], Phobos](...)" - and a
+# class that merely excludes "]" cannot span one. Every link regex here shared
+# that blind spot, so such a link was invisible to display rewriting, to link
+# resolution and to the retarget pass alike: not fixed, not validated, not
+# reported. Escapes are matched explicitly rather than excluded.
+_LINK_TEXT = r"(?:[^\]\n\\]|\\.)+?"
+_ENTITY_LINK = re.compile(r"\[(" + _LINK_TEXT + r")\]\((/[^)\n]+)\)")
+_BODY_LINK = re.compile(r"\[(" + _LINK_TEXT + r")\]\(/([a-z-]+)/([a-z0-9-]+)\)")
 
 
 def _link_words(text: str) -> set[str]:
@@ -2404,17 +2416,27 @@ def _title_display(title: str, person: bool = False) -> str:
 
 
 def _rewrite_link_display(body: str) -> str:
-    """Rewrite markdown links whose display text is a Last-comma-First person
-    name. URL stays untouched (the slug is derived from the natural-order
-    form already)."""
+    """Rewrite a link's display text where the node's name is an index form.
+
+    The URL is never touched: the slug is derived from the canonical name and
+    must keep matching it. Two node types name themselves for sorting rather
+    than for reading - a person as "Fravor, David" and a place as "USA, Nevada,
+    Area 51" - and both reach the reader inside a sentence."""
 
     def _sub(m: re.Match) -> str:
         display, url = m.group(1), m.group(2)
-        if not url.startswith("/people/"):
-            return m.group(0)  # a place is "France, Paris" by convention; leave it
-        return f"[{_display_name(display)}]({url})"
+        if url.startswith("/people/"):
+            return f"[{_display_name(display)}]({url})"
+        if url.startswith("/places/"):
+            # A place name is an index entry - "Country, Region, Specific" - and
+            # reads as one mid-sentence: "the facility at USA, Nevada, Area 51",
+            # 47 times across the corpus. The URL and the canonical name are
+            # untouched; only the sentence changes. A name whose orientation
+            # cannot be established is left exactly as it is.
+            return f"[{place_display_name(display)}]({url})"
+        return m.group(0)
 
-    return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
+    return _ENTITY_LINK.sub(_sub, body)
 
 
 # Body links are invented by the model from an entity's surface name, so they
@@ -2668,7 +2690,7 @@ def _fix_body_links(body: str, index: dict | None = None) -> str:
         target = _resolve_link(url, display, index)
         return f"[{display}]({target})" if target else display
 
-    return re.sub(r"\[([^\]\n]+?)\]\((/[^)\n]+)\)", _sub, body)
+    return _ENTITY_LINK.sub(_sub, body)
 
 
 def renumber_citations(body: str, references: list) -> tuple[str, list]:
