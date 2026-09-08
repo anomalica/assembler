@@ -810,6 +810,80 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
+def report_corroboration(briefs_root: str, as_json: bool) -> int:
+    """How much of the corpus rests on more than one independent source.
+
+    The number that says whether evidence quality is improving. A claim may be
+    stated in Anomalica's own voice only on a measured two or more independent
+    sources - distinct provenance-chain roots, so ten outlets carrying one press
+    release count as one - and when this ratio does not move, nothing we do about
+    evidence quality is working.
+
+    Reads only the published briefs: no model, no database, no build. Reported
+    rather than gated on purpose. The alias assertion fails a build because 19 of
+    806 briefs trip it and each is a fixable defect; this condition holds for 757
+    of 805, so a gate here would be a stop-work order rather than a check.
+    """
+    totals = {
+        "claims": 0,
+        "bare_eligible": 0,
+        "corroborated": 0,
+        "bare_and_corroborated": 0,
+        "briefs": 0,
+        "briefs_with_single_source_bare": 0,
+    }
+    for b in sorted(Path(briefs_root).expanduser().glob("*/*.yaml")):
+        try:
+            brief = yaml.safe_load(b.read_text())
+        except (OSError, yaml.YAMLError):
+            continue
+        if not brief:
+            continue
+        totals["briefs"] += 1
+        flagged = False
+        for c in brief.get("claims") or []:
+            totals["claims"] += 1
+            sources = (c.get("evidence") or {}).get("independent_sources")
+            corroborated = isinstance(sources, int) and sources >= 2
+            totals["corroborated"] += 1 if corroborated else 0
+            if (c.get("attribution_mode") or "unknown") == "bare_ok":
+                totals["bare_eligible"] += 1
+                # Counted separately from `corroborated`, which spans every
+                # claim: subtracting the corpus-wide figure from the bare-eligible
+                # one silently credits bare_ok with the 28 corroborated claims
+                # that were never marked bare_ok in the first place.
+                totals["bare_and_corroborated"] += 1 if corroborated else 0
+                if not corroborated:
+                    flagged = True
+        totals["briefs_with_single_source_bare"] += 1 if flagged else 0
+
+    claims = totals["claims"] or 1
+    totals["corroborated_pct"] = round(100 * totals["corroborated"] / claims, 3)
+    if as_json:
+        print(json.dumps(totals, indent=2))
+        return 0
+    print(f"  briefs read                          {totals['briefs']:>8,}")
+    print(f"  claims                               {totals['claims']:>8,}")
+    print(
+        f"  on 2+ independent sources            {totals['corroborated']:>8,}"
+        f"   ({totals['corroborated_pct']}%)"
+    )
+    print(f"  marked bare_ok in the brief          {totals['bare_eligible']:>8,}")
+    print(
+        f"  of those, still stated bare          {totals['bare_and_corroborated']:>8,}"
+    )
+    print(
+        f"  of those, standing on ONE source     "
+        f"{totals['bare_eligible'] - totals['bare_and_corroborated']:>8,}"
+        f"   attributed by the build"
+    )
+    print(
+        f"  briefs containing at least one       "
+        f"{totals['briefs_with_single_source_bare']:>8,}"
+    )
+    return 0
+
+
 def refresh_display_title(content_root: str, apply: bool) -> int:
     """Stamp each place page's reading title beside its canonical one.
 
@@ -1586,6 +1660,92 @@ def veto_move_candidate(item: dict, content_root: Path, db_path: str) -> str | N
     return "  A MOVE may be right instead of gone: " + "; ".join(lines) + "."
 
 
+def record_retirement(
+    reason: str,
+    decided_by: str,
+    urls_file: str,
+    reference_root: str,
+    apply: bool,
+) -> int:
+    """Record ONE decision that stopped many URLs existing, without removing files.
+
+    A page retirement and a mass URL retirement are different acts and want
+    different records. When a page's alias list was wrong, 118 event URLs stopped
+    resolving in a single bug fix - they were never files, and writing 118
+    separate entries would misrepresent one decision as 118 retirements and bury
+    the real ones. Site's deploy guard is right to refuse an unrecorded removal
+    at that scale, and this is the record that answers it.
+
+    Writes only; removes nothing. The URLs are already gone by the time this runs.
+    """
+    from datetime import date
+
+    urls = [
+        ln.strip()
+        for ln in Path(urls_file).expanduser().read_text().splitlines()
+        if ln.strip()
+    ]
+    if not urls:
+        print(f"no urls in {urls_file}", file=sys.stderr)
+        return 2
+    if len(reason.split()) < 5:
+        print("a retirement record needs a reviewable reason", file=sys.stderr)
+        return 2
+    canonical = sorted(
+        {u.replace("/en/", "/", 1) if u.startswith("/en/") else u for u in urls}
+    )
+    if not apply:
+        print(f"would record {len(canonical)} URL(s) as one decision by {decided_by}")
+        for u in canonical[:5]:
+            print(f"    {u}")
+        return 1
+
+    today = date.today().isoformat()
+    ref_root = Path(reference_root).expanduser()
+    ref_file = ref_root / "reference" / "retirements.json"
+    record = (
+        json.loads(ref_file.read_text())
+        if ref_file.is_file()
+        else {"record": "page-retirements", "entries": []}
+    )
+    record["entries"].append(
+        {
+            "kind": "urls",
+            "url_count": len(canonical),
+            "path_forms": len(urls),
+            "sample": canonical[:8],
+            "urls": canonical,
+            "reason": reason,
+            "decided_by": decided_by,
+            "retired": today,
+            "how_to_reverse": "git revert the commit that removed them; the URLs "
+            "resolve again on the next deploy.",
+        }
+    )
+    ref_file.parent.mkdir(parents=True, exist_ok=True)
+    ref_file.write_text(json.dumps(record, indent=2) + "\n")
+    ref_rel = str(ref_file.relative_to(ref_root))
+    _git(ref_root, "add", "--", ref_rel)
+    r = subprocess.run(
+        [
+            "git",
+            "commit",
+            "-q",
+            "-m",
+            f"reference: record {len(canonical)} URL(s) retired as one decision",
+            "--",
+            ref_rel,
+        ],
+        cwd=ref_root,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode and "nothing to commit" not in (r.stdout + r.stderr):
+        raise RuntimeError(f"reference commit failed: {(r.stderr or r.stdout).strip()}")
+    print(f"recorded {len(canonical)} URL(s) as one decision in {ref_file}")
+    return 0
+
+
 def retire_page(
     url: str,
     reason: str,
@@ -2095,6 +2255,15 @@ def main() -> int:
         help="Skip the end-of-run Hugo build",
     )
     ap.add_argument(
+        "--report-corroboration",
+        action="store_true",
+        help="How much of the corpus rests on more than one independent source. "
+        "Reads the briefs only - no model, no build. For the scheduler.",
+    )
+    ap.add_argument(
+        "--json", action="store_true", help="Machine-readable report output."
+    )
+    ap.add_argument(
         "--refresh-derived",
         action="store_true",
         help="Re-emit every DERIVED field on published pages - aliases, link "
@@ -2104,6 +2273,12 @@ def main() -> int:
         "--refresh-display-title",
         action="store_true",
         help="Stamp each place page's reading title beside its canonical one.",
+    )
+    ap.add_argument(
+        "--record-retirement",
+        metavar="URLS_FILE",
+        help="Record one decision that stopped many URLs existing, from a file of "
+        "paths. Writes the record only; removes nothing.",
     )
     ap.add_argument(
         "--retire-page",
@@ -2144,6 +2319,15 @@ def main() -> int:
     if args.check_orphans:
         return check_orphans(args.content_root, args.briefs_root, args.db)
 
+    if args.record_retirement:
+        return record_retirement(
+            args.reason or "",
+            args.decided_by,
+            args.record_retirement,
+            args.reference_root,
+            args.apply,
+        )
+
     if args.retire_page:
         site_root = args.site_root or str(
             Path(args.content_root).expanduser().parent / "site"
@@ -2170,6 +2354,9 @@ def main() -> int:
             args.reference_root,
             args.apply,
         )
+
+    if args.report_corroboration:
+        return report_corroboration(args.briefs_root, args.json)
 
     if args.refresh_derived:
         # Everything a published page carries that is DERIVED rather than
