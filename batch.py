@@ -810,17 +810,44 @@ def generate(args, kind: str, items: list[str]) -> int:
     return 0 if not failed and built else 1
 
 
-def commit_refreshed(content_root: str, written: list) -> int:
+def commit_refreshed(
+    content_root: str, written: list, expect_branch: str | None = None
+) -> int:
     """Commit exactly the files a refresh pass wrote, by pathspec.
 
     content/ is ONE working tree shared by every session on this machine, and its
     git index is shared too - 633 of another session's files have sat staged
-    while I was mid-commit. A pass that writes and does not commit leaves its work
-    to be swept into whoever commits next, attributed to them, with nothing
-    recording that a scheduled task did it. So an unattended run commits its own
-    output, by explicit pathspec, and never with `git add -A` or a bare commit.
+    while this one was mid-commit. A pass that writes and does not commit leaves
+    its work to be swept into whoever commits next, attributed to them, with
+    nothing recording that a scheduled task did it. So an unattended run commits
+    its own output, by explicit pathspec, never with `git add -A` and never with
+    a bare commit.
+
+    Two further gates, the scheduler's, and both rest on the passes being
+    idempotent: a spurious re-run costs nothing, so every failure here can be
+    answered with "leave it and come back".
+
+    The BRANCH is asserted rather than accepted. Without that this commits to
+    whatever happens to be checked out, so the moment a person checks out another
+    branch to look at something, a scheduled pass writes onto it silently. A job
+    writing to a shared tree must not also be choosing which history it writes to.
+
+    A LOCKED INDEX is "not now", not a failure. Two sessions committing at the
+    same instant means one loses .git/index.lock; for a person that is a retry,
+    but for a scheduled job it would leave files written and uncommitted - the
+    exact state this function exists to prevent. The files stay, the pass is not
+    marked done, and the next run picks it up.
     """
     root = Path(content_root).expanduser()
+    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    if expect_branch and branch != expect_branch:
+        print(
+            f"NOT COMMITTED - content/ is on {branch!r}, expected {expect_branch!r}. "
+            "The files are written and left alone; re-run when the expected branch "
+            "is checked out.",
+            file=sys.stderr,
+        )
+        return 1
     paths = sorted(
         {str(Path(p).resolve().relative_to(root.resolve())) for p in written}
     )
@@ -833,10 +860,20 @@ def commit_refreshed(content_root: str, written: list) -> int:
         "derived from the graph and from node names, so they are re-emitted\n"
         "rather than regenerated.\n"
     )
-    _git(root, "commit", "-q", "-F", "-", "--", *paths, stdin=msg)
-    print(
-        f"\ncommitted {len(paths)} file(s) by pathspec; nothing else in the tree touched."
-    )
+    try:
+        _git(root, "commit", "-q", "-F", "-", "--", *paths, stdin=msg)
+    except RuntimeError as exc:
+        if "index.lock" in str(exc) or "Unable to create" in str(exc):
+            print(
+                "NOT COMMITTED - another session holds the git index. The files are "
+                "written and left in place; this pass is not done and the next run "
+                "will finish it.",
+                file=sys.stderr,
+            )
+            return 1
+        raise
+    sha = _git(root, "rev-parse", "--short", "HEAD").strip()
+    print(f"\ncommitted {len(paths)} file(s) as {sha} on {branch}, by pathspec.")
     return 0
 
 
@@ -2308,6 +2345,11 @@ def main() -> int:
         "--json", action="store_true", help="Machine-readable report output."
     )
     ap.add_argument(
+        "--expect-branch",
+        help="With --commit: the branch content/ must be on. Refuses rather than "
+        "committing onto whatever happens to be checked out.",
+    )
+    ap.add_argument(
         "--commit",
         action="store_true",
         help="With --refresh-derived --apply: commit exactly what was written, by "
@@ -2434,7 +2476,10 @@ def main() -> int:
             print(f"\n=== {name} ===")
             rc = max(rc, run())
         if args.commit and written:
-            rc = max(rc, commit_refreshed(args.content_root, written))
+            rc = max(
+                rc,
+                commit_refreshed(args.content_root, written, args.expect_branch),
+            )
         elif written:
             print(
                 f"\n{len(set(written))} file(s) written and NOT committed. content/ is "

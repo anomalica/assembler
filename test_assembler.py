@@ -999,6 +999,36 @@ def test_a_retirement_without_a_reviewable_reason_is_refused(tmp_path):
         assert page.is_file(), "the failure leaves the page up"
 
 
+def test_a_scheduled_refresh_refuses_an_unexpected_branch(tmp_path):
+    """Without this it commits to whatever happens to be checked out, so the
+    moment a person checks out another branch to look at something, a scheduled
+    pass writes onto it silently. The files stay put and the pass comes back."""
+    import batch
+    import subprocess
+
+    content = tmp_path / "content"
+    (content / "pages" / "places").mkdir(parents=True)
+    page = content / "pages" / "places" / "a.en.md"
+    page.write_text("---\ntitle: A\n---\n\nbody\n")
+    subprocess.run(
+        ["git", "init", "-q", "-b", "somewhere-else"], cwd=content, check=True
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "config", k, v], cwd=content, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=content, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init", "--no-verify"], cwd=content, check=True
+    )
+    page.write_text("---\ntitle: A\ndisplay_title: A\n---\n\nbody\n")
+
+    rc = batch.commit_refreshed(str(content), [page], expect_branch="batch-2026-07-30")
+    assert rc == 1
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=content, capture_output=True, text=True
+    ).stdout
+    assert "a.en.md" in dirty, "the write must survive the refusal, not be reverted"
+
+
 def test_a_scheduled_refresh_commits_only_what_it_wrote(tmp_path):
     """content/ is one working tree shared by every session here, and its git
     INDEX is shared too - 633 of another session's files have sat staged while
