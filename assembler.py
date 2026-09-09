@@ -1772,6 +1772,16 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
         model,
         "--disable-slash-commands",
         "--no-session-persistence",
+        # Strip the interactive session the CLI would otherwise load before
+        # reading a word of the brief. Measured 2026-09-09 against this exact
+        # command with a six-word prompt: 69,379 tokens without these two flags,
+        # 5,140 with them. --strict-mcp-config drops the connected MCP servers;
+        # --restricted drops user/project/local settings (the CLAUDE.md files
+        # among them) and the built-in code-running tools. Neither touches
+        # --append-system-prompt, and --tools is already empty so there is no
+        # tool to lose. Verified end to end on this command.
+        "--strict-mcp-config",
+        "--restricted",
         "--output-format",
         "json",
         "--append-system-prompt",
