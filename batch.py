@@ -299,6 +299,12 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         page = pages.get(item)
         if page is None:
             page = _brief_page_block(root / f"{item}.yaml")
+        if page.get("node_type") == "document":
+            refuse[item] = (
+                "document nodes no longer emit public articles; publish the fully "
+                "reviewed source work through record mode"
+            )
+            continue
         if gone and page.get("slug") and page.get("node_type"):
             section = asm.SECTION_BY_TYPE.get(
                 page["node_type"], f"{page['node_type']}s"
@@ -730,6 +736,17 @@ def generate(args, kind: str, items: list[str]) -> int:
         common += ["--digests-root", args.digests_root]
     else:
         common += ["--digests-root", args.digests_root]
+    if kind == "records":
+        # Reconcile the complete existing Records section, not only this work
+        # list. A record can lose review eligibility between scheduled batches;
+        # leaving its old page up until somebody happens to request that digest
+        # again would make publication state depend on queue membership.
+        reconcile_public_records(
+            args.content_root,
+            args.digests_root,
+            args.ingests_root,
+            apply=True,
+        )
     # One worker per lane. Each page is its own process for isolation, so the
     # pool just decides how many run at once; the per-item semantics below are
     # identical to the sequential path and --workers 1 reproduces it exactly.
@@ -870,8 +887,8 @@ def commit_refreshed(
         list(written),
         f"chore(derived): re-emit derived fields on {len(set(written))} page(s)\n\n"
         "Scheduled run of assembler --refresh-derived. No model and no rebuild:\n"
-        "alias lists, entity-link display text and place display titles are all\n"
-        "derived from the graph and from node names, so they are re-emitted\n"
+        "public-record eligibility/projection, alias lists, entity-link display\n"
+        "text and place display titles are derived, so they are re-emitted\n"
         "rather than regenerated.\n",
         expect_branch,
     )
@@ -889,6 +906,75 @@ def commit_refreshed(
         file=sys.stderr,
     )
     return 1
+
+
+def reconcile_public_records(
+    content_root: str,
+    digests_root: str,
+    ingests_root: str,
+    apply: bool,
+    written: list | None = None,
+) -> int:
+    """Reproject eligible generated records and remove every stale public page."""
+    content = Path(content_root).expanduser()
+    digests = Path(digests_root).expanduser()
+    ingests = Path(ingests_root).expanduser()
+    changed: list[tuple[Path, str, str | None]] = []
+    records = content / "pages" / "records"
+    for page in sorted(records.glob("*.*.md")) if records.is_dir() else []:
+        slug = page.name.rsplit(".", 2)[0]
+        digest_path = digests / f"{slug}.yaml"
+        projection = None
+        reason = "selected digest is absent"
+        if digest_path.is_file():
+            try:
+                digest = yaml.safe_load(digest_path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                digest = None
+            if isinstance(digest, dict):
+                projection, reason = asm.public_record_projection(digest, ingests)
+            else:
+                reason = "selected digest is malformed"
+        if projection is None:
+            changed.append((page, "remove", reason))
+            continue
+        try:
+            current = page.read_text(encoding="utf-8")
+        except OSError:
+            changed.append((page, "remove", "generated page is unreadable"))
+            continue
+        projected = asm.reproject_record_page(current, projection)
+        if projected is None:
+            changed.append((page, "remove", "page lacks generated summary/provenance"))
+        elif projected != current:
+            changed.append((page, "write", projected))
+
+    # Document nodes remain graph entities but no longer earn public pages. Only
+    # remove assembler-generated files; a hand-authored static document is not
+    # ours to reconcile merely because it shares the old section.
+    documents = content / "pages" / "documents"
+    for page in sorted(documents.glob("*.*.md")) if documents.is_dir() else []:
+        try:
+            parsed = asm._split_article(page.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if parsed and ("built_by" in parsed[0] or "built_from" in parsed[0]):
+            changed.append((page, "remove", "document-node publication is retired"))
+
+    for page, action, payload in changed:
+        print(
+            f"  {action}: {page} ({payload if action == 'remove' else 'public-record/1'})"
+        )
+        if not apply:
+            continue
+        if action == "remove":
+            page.unlink(missing_ok=True)
+        else:
+            page.write_text(payload, encoding="utf-8")
+        if written is not None:
+            written.append(page)
+    print(f"  {len(changed)} public page change(s){'' if apply else ' (dry run)'}")
+    return 0
 
 
 def report_unbuilt(content_root: str, briefs_root: str, as_json: bool) -> int:
@@ -1383,10 +1469,16 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
         refs = fm.get("references")
         if not isinstance(refs, list):
             continue
+        public_record = fm.get("schema") == "anomalica/public-record/1"
         touched = False
         for r in refs:
             if not isinstance(r, dict):
                 continue
+            if public_record:
+                if r.pop("workbench_url", None) is not None:
+                    touched = True
+                if r.pop("copyright_status", None) is not None:
+                    touched = True
             claim_id = str(r.get("claim_id") or "")
             # Before declaring a claim gone, try to re-find it by fingerprint: a
             # re-digest re-mints the id but not the sentence, so the citation is
@@ -1397,7 +1489,10 @@ def retarget_links(content_root: str, apply: bool, db_path: str | None = None) -
                 current = by_fingerprint.get((ph, fp))
                 if current:
                     r["claim_id"] = current
-                    r["workbench_url"] = f"{asm.WORKBENCH_ORIGIN}/{ph}#claim-{current}"
+                    if not public_record:
+                        r["workbench_url"] = (
+                            f"{asm.WORKBENCH_ORIGIN}/{ph}#claim-{current}"
+                        )
                     r.pop("inspection_url", None)
                     claim_id = current
                     repaired += 1
@@ -2455,7 +2550,7 @@ def main() -> int:
     ap.add_argument(
         "--apply",
         action="store_true",
-        help="With --retarget-links, write the changes (default is a dry run).",
+        help="Write deterministic refresh/reconciliation changes (default is a dry run).",
     )
     ap.add_argument(
         "--check-orphans",
@@ -2561,7 +2656,14 @@ def main() -> int:
         "--refresh-derived",
         action="store_true",
         help="Re-emit every DERIVED field on published pages - aliases, link "
-        "display text, place display titles. Costs nothing; what the scheduler runs.",
+        "display text, place display titles and public-record state. Costs nothing; "
+        "what the scheduler runs.",
+    )
+    ap.add_argument(
+        "--refresh-public-records",
+        action="store_true",
+        help="Reproject eligible public records and remove stale/ineligible record "
+        "and generated document-node pages without calling a model.",
     )
     ap.add_argument(
         "--refresh-titles",
@@ -2661,6 +2763,14 @@ def main() -> int:
     if args.report_corroboration:
         return report_corroboration(args.briefs_root, args.json)
 
+    if args.refresh_public_records:
+        return reconcile_public_records(
+            args.content_root,
+            args.digests_root,
+            args.ingests_root,
+            args.apply,
+        )
+
     if args.refresh_derived:
         # Everything a published page carries that is DERIVED rather than
         # written by a model: it can be re-emitted at any time for nothing, so a
@@ -2669,6 +2779,16 @@ def main() -> int:
         rc = 0
         written: list = []
         for name, run in (
+            (
+                "public records",
+                lambda: reconcile_public_records(
+                    args.content_root,
+                    args.digests_root,
+                    args.ingests_root,
+                    args.apply,
+                    written,
+                ),
+            ),
             (
                 "aliases",
                 lambda: refresh_aliases(

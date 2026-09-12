@@ -569,14 +569,67 @@ def test_score_article_never_rewrites_its_input():
     assert GOOD_ARTICLE == before, "scoring must measure, never repair"
 
 
-def test_source_display_is_driven_by_copyright_and_fails_closed():
-    assert a.source_display_mode("public_domain", "pdf") == "text"
-    assert a.source_display_mode("public_domain", "video") == "embed"
-    assert a.source_display_mode("publicly_accessible", "video") == "embed"
-    # Publicly reachable is NOT redistributable - link, never reproduce.
-    assert a.source_display_mode("publicly_accessible", "pdf") == "link"
-    assert a.source_display_mode("restricted", "video") == "none"
-    assert a.source_display_mode(None, "video") == "none", "unknown fails closed"
+def test_public_source_capabilities_are_independent_and_fail_closed():
+    source = a._source_capabilities(
+        {
+            "source_type": "video",
+            "source_url": "https://youtu.be/abcdefghi?t=4",
+            "copyright": {"status": "publicly_accessible"},
+        }
+    )
+    assert set(source) == {
+        "source_body",
+        "archived_original",
+        "media",
+        "provider_embed",
+        "external_link",
+    }
+    assert source["source_body"] == {"mode": "none", "reason": "unavailable"}
+    assert source["archived_original"] == {
+        "mode": "none",
+        "reason": "copyright",
+    }
+    assert source["media"] == {"mode": "none", "reason": "copyright"}
+    assert source["provider_embed"] == {
+        "mode": "embed",
+        "reason": "allowed",
+        "url": "https://www.youtube.com/watch?v=abcdefghi",
+    }
+    assert source["external_link"]["mode"] == "link"
+
+
+def test_restricted_source_keeps_a_lawful_external_link_only():
+    source = a._source_capabilities(
+        {
+            "source_type": "pdf",
+            "source_url": "https://example.org/report.pdf",
+            "copyright": {"status": "restricted"},
+        }
+    )
+    assert source["external_link"] == {
+        "mode": "link",
+        "reason": "allowed",
+        "url": "https://example.org/report.pdf",
+    }
+    for key in ("source_body", "archived_original", "media", "provider_embed"):
+        assert source[key]["mode"] == "none"
+        assert set(source[key]) == {"mode", "reason"}, "denied payload must be absent"
+
+
+def test_signed_and_private_source_urls_never_enter_the_projection():
+    for url in (
+        "https://cdn.example.org/x?X-Amz-Signature=secret",
+        "http://127.0.0.1/private",
+        "https://user:password@example.org/x",
+    ):
+        source = a._source_capabilities(
+            {
+                "source_type": "pdf",
+                "source_url": url,
+                "copyright": {"status": "public_domain"},
+            }
+        )
+        assert source["external_link"] == {"mode": "none", "reason": "unsupported"}
 
 
 def test_a_record_page_opens_with_a_summary_and_has_no_word_ceiling():
@@ -952,10 +1005,15 @@ def test_a_restricted_source_still_carries_its_quote():
 
 def test_quote_is_not_body():
     """Nothing about quotes un-gates a full body or transcript. The
-    source-display rule is separate and still fails closed."""
-    assert a.source_display_mode("restricted", "pdf") == "none"
-    assert a.source_display_mode(None, "video") == "none"
-    assert a.source_display_mode("public_domain", "pdf") == "text"
+    source-capability rule is separate and still fails closed."""
+    restricted = a._source_capabilities(
+        {"source_type": "pdf", "copyright": {"status": "restricted"}}
+    )
+    assert restricted["source_body"] == {"mode": "none", "reason": "copyright"}
+    public = a._source_capabilities(
+        {"source_type": "pdf", "copyright": {"status": "public_domain"}}
+    )
+    assert public["source_body"] == {"mode": "none", "reason": "unavailable"}
 
 
 def test_licensed_without_evidence_is_treated_as_restricted():
@@ -990,6 +1048,300 @@ def test_the_ingest_lookup_searches_both_store_roots(tmp_path):
     assert top.get("status") == "public_domain"
     assert old.get("status") == "licensed", "store/v1 must resolve"
     assert old.get("effective_status") == "restricted", "no licence evidence"
+    assert "display" not in top, "legacy scalar display is not projected"
+
+
+def _public_record_fixture(tmp_path, *, status="restricted", carryover=None):
+    import json
+    import yaml
+    from anomalica_common.pre_digest import materialise, pre_digest_hash
+
+    full = "a" * 64
+    store = tmp_path / "ingests" / "store"
+    store.mkdir(parents=True)
+    frontmatter = {
+        "schema": "anomalica/record/1",
+        "title": "The source title",
+        "content_hash": f"sha256:{full}",
+        "source_type": "video",
+        "document_type": "interview",
+        "source_url": "https://youtu.be/abcdefgh",
+        "publisher": "Publisher",
+        "creators": ["A. Person"],
+        "date_published": "2026-01-02",
+        "duration": 60.5,
+        "copyright": {"status": status},
+        "fetched_url": "https://private.invalid/copy",
+    }
+    if carryover is not None:
+        frontmatter["review_carryover"] = {"at": carryover, "from": full}
+    body = "The reviewed body."
+    record = (
+        "---\n" + yaml.safe_dump(frontmatter, sort_keys=False) + "---\n" + body + "\n"
+    )
+    (store / f"{full}.md").write_text(record)
+    sidecar = {
+        "schema": "anomalica/review-coverage/1",
+        "reviews": [{"by": "private", "at": "2026-01-03T00:00:00Z", "spans": []}],
+        "observed_coverage": 1.0,
+        "digestible": True,
+        "total_units": 3,
+    }
+    (store / f"{full}.review.json").write_text(json.dumps(sidecar))
+    digest = {
+        "record": {"content_hash": f"sha256:{full}", "title": "snapshot title"},
+        "pre_digest": {"sha256": pre_digest_hash(materialise(body))},
+    }
+    return digest, store, sidecar
+
+
+def test_public_record_gate_emits_only_the_pinned_safe_projection(tmp_path):
+    digest, _, _ = _public_record_fixture(tmp_path)
+    projection, reason = a.public_record_projection(digest, tmp_path / "ingests")
+    assert reason == "eligible"
+    assert projection == {
+        "title": "The source title",
+        "record_hash": "a" * 56,
+        "metadata": {
+            "source_type": "video",
+            "document_type": "interview",
+            "publisher": "Publisher",
+            "creators": ["A. Person"],
+            "published_date": "2026-01-02",
+            "duration": 60.5,
+        },
+        "source": {
+            "source_type": "video",
+            "document_type": "interview",
+            "publisher": "Publisher",
+            "creators": ["A. Person"],
+            "published_date": "2026-01-02",
+            "duration": 60.5,
+            "capabilities": {
+                "source_body": {"mode": "none", "reason": "copyright"},
+                "archived_original": {"mode": "none", "reason": "copyright"},
+                "media": {"mode": "none", "reason": "copyright"},
+                "provider_embed": {"mode": "none", "reason": "copyright"},
+                "external_link": {
+                    "mode": "link",
+                    "reason": "allowed",
+                    "url": "https://youtu.be/abcdefgh",
+                },
+            },
+        },
+    }
+    serialised = repr(projection)
+    assert "private" not in serialised and "fetched" not in serialised
+    assert "a" * 57 not in serialised
+
+
+def test_public_record_gate_rejects_every_non_current_review_shape(tmp_path):
+    import json
+
+    digest, store, sidecar = _public_record_fixture(tmp_path)
+    review = store / ("a" * 64 + ".review.json")
+    bad_values = [
+        {**sidecar, "schema": "anomalica/review-coverage/0"},
+        {**sidecar, "reviews": "private-invalid-shape"},
+        {**sidecar, "observed_coverage": 0.9999},
+        {**sidecar, "observed_coverage": float("nan")},
+        {**sidecar, "digestible": False},
+        {**sidecar, "total_units": 0},
+    ]
+    for bad in bad_values:
+        review.write_text(json.dumps(bad))
+        projection, _ = a.public_record_projection(digest, tmp_path / "ingests")
+        assert projection is None
+
+
+def test_public_record_metadata_omits_non_finite_duration():
+    metadata = a._safe_record_metadata(
+        {"source_type": "audio", "duration": float("nan"), "pages": True}
+    )
+    assert metadata == {"source_type": "audio"}
+
+
+def test_public_record_gate_rejects_stale_digest_and_unresolved_carryover(tmp_path):
+    digest, store, sidecar = _public_record_fixture(
+        tmp_path, carryover="2026-01-04T00:00:00Z"
+    )
+    projection, reason = a.public_record_projection(digest, tmp_path / "ingests")
+    assert projection is None and "carryover" in reason
+
+    sidecar["reviews"][0]["at"] = "2026-01-04T00:00:00Z"
+    import json
+
+    (store / ("a" * 64 + ".review.json")).write_text(json.dumps(sidecar))
+    digest["pre_digest"]["sha256"] = "b" * 64
+    projection, reason = a.public_record_projection(digest, tmp_path / "ingests")
+    assert projection is None and "stale" in reason
+
+
+def test_public_record_gate_rejects_a_malformed_carryover_marker(tmp_path):
+    import yaml
+
+    digest, store, _ = _public_record_fixture(tmp_path)
+    record = store / ("a" * 64 + ".md")
+    parsed = a._record_parts(record.read_text())
+    frontmatter, body = parsed
+    frontmatter["review_carryover"] = {}
+    record.write_text(
+        "---\n" + yaml.safe_dump(frontmatter, sort_keys=False) + "---\n" + body + "\n"
+    )
+    projection, reason = a.public_record_projection(digest, tmp_path / "ingests")
+    assert projection is None and "carryover" in reason
+
+
+def test_public_record_render_and_reprojection_remove_private_legacy_fields(tmp_path):
+    digest, _, _ = _public_record_fixture(tmp_path)
+    projection, _ = a.public_record_projection(digest, tmp_path / "ingests")
+    old = (
+        "---\ntitle: Old\ndescription: Generated summary\nnoindex: true\n"
+        "facts: [private]\nreferences:\n- text: Fact\n  workbench_url: https://private\n"
+        "  copyright_status: restricted\nbuilt_by:\n  model: test\n---\n\nBody\n"
+    )
+    out = a.reproject_record_page(old, projection)
+    fm, body = a._split_article(out)
+    assert fm["schema"] == "anomalica/public-record/1"
+    assert fm["content_kind"] == "record" and "kind" not in fm
+    assert fm["record_hash"] == "a" * 56
+    assert "noindex" not in fm and "facts" not in fm
+    assert "workbench_url" not in fm["references"][0]
+    assert "copyright_status" not in fm["references"][0]
+    assert body == "Body"
+
+
+def test_record_reconciliation_reprojects_eligible_and_removes_ineligible(tmp_path):
+    import batch
+    import json
+    import yaml
+
+    digest, store, _ = _public_record_fixture(tmp_path)
+    digests = tmp_path / "digests"
+    records = tmp_path / "content" / "pages" / "records"
+    digests.mkdir()
+    records.mkdir(parents=True)
+    (digests / "eligible.yaml").write_text(yaml.safe_dump(digest))
+    (digests / "stale.yaml").write_text(
+        yaml.safe_dump({**digest, "pre_digest": {"sha256": "b" * 64}})
+    )
+    legacy = (
+        "---\ntitle: Old\ndescription: Generated summary\nnoindex: true\n"
+        "references: []\nbuilt_by:\n  model: test\n---\n\nBody\n"
+    )
+    eligible = records / "eligible.en.md"
+    stale = records / "stale.en.md"
+    eligible.write_text(legacy)
+    stale.write_text(legacy)
+
+    assert (
+        batch.reconcile_public_records(
+            str(tmp_path / "content"), str(digests), str(tmp_path / "ingests"), False
+        )
+        == 0
+    )
+    assert eligible.read_text() == legacy and stale.exists(), "dry run writes nothing"
+
+    batch.reconcile_public_records(
+        str(tmp_path / "content"), str(digests), str(tmp_path / "ingests"), True
+    )
+    assert not stale.exists()
+    fm, body = a._split_article(eligible.read_text())
+    assert fm["schema"] == "anomalica/public-record/1"
+    assert "noindex" not in fm and body == "Body"
+
+    sidecar = store / ("a" * 64 + ".review.json")
+    review = json.loads(sidecar.read_text())
+    review["digestible"] = False
+    sidecar.write_text(json.dumps(review))
+    batch.reconcile_public_records(
+        str(tmp_path / "content"), str(digests), str(tmp_path / "ingests"), True
+    )
+    assert not eligible.exists(), "lost eligibility removes prior generated output"
+
+
+def test_record_reconciliation_retires_only_generated_document_pages(tmp_path):
+    import batch
+
+    documents = tmp_path / "content" / "pages" / "documents"
+    documents.mkdir(parents=True)
+    generated = documents / "generated.en.md"
+    authored = documents / "authored.en.md"
+    generated.write_text("---\ntitle: G\nbuilt_from: {}\n---\n\nGenerated\n")
+    authored.write_text("---\ntitle: A\n---\n\nAuthored\n")
+    batch.reconcile_public_records(
+        str(tmp_path / "content"),
+        str(tmp_path / "digests"),
+        str(tmp_path / "ingests"),
+        True,
+    )
+    assert not generated.exists()
+    assert authored.exists(), "the assembler must not delete human-owned content"
+
+
+def test_retarget_links_never_restores_a_record_page_reviewer_link(tmp_path):
+    import batch
+
+    records = tmp_path / "pages" / "records"
+    records.mkdir(parents=True)
+    page = records / "source.en.md"
+    page.write_text(
+        "---\nschema: anomalica/public-record/1\ncontent_kind: record\n"
+        "title: Source\ndescription: Summary\nreferences:\n- claim_id: c1\n"
+        "  record_hash: abc\n  workbench_url: https://workbench.invalid/abc#claim-c1\n"
+        "  copyright_status: restricted\n---\n\nBody\n"
+    )
+    assert batch.retarget_links(str(tmp_path), apply=True) == 0
+    fm, _ = a._split_article(page.read_text())
+    assert "workbench_url" not in fm["references"][0]
+    assert "copyright_status" not in fm["references"][0]
+
+
+def test_single_record_gate_removes_stale_output_before_any_model_call(
+    monkeypatch, tmp_path
+):
+    import sys
+
+    digest = {
+        "record": {
+            "id": "record-id",
+            "title": "Source",
+            "content_hash": "sha256:" + "a" * 64,
+        }
+    }
+    output = tmp_path / "pages" / "records" / "source.en.md"
+    output.parent.mkdir(parents=True)
+    output.write_text("old public page")
+    monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
+    monkeypatch.setattr(a, "load_digest", lambda *args: (digest, "source"))
+    monkeypatch.setattr(
+        a, "public_record_projection", lambda *args: (None, "not reviewed")
+    )
+    monkeypatch.setattr(
+        a,
+        "call_claude",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ineligible record reached the model")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "assembler.py",
+            "--record",
+            "source",
+            "--model",
+            "test-model",
+            "--content-root",
+            str(tmp_path),
+            "--ingests-root",
+            str(tmp_path / "ingests"),
+        ],
+    )
+    assert a.main() == 0
+    assert not output.exists()
 
 
 def test_dry_run_returns_before_the_spend_gate():

@@ -25,15 +25,19 @@ carrying the CLI / the `anthropic` library:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import functools
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
 from anomalica_common.llm import API_MODEL_MAP as _COMMON_API_MODEL_MAP
@@ -2969,6 +2973,7 @@ def _augment_references(
     claims: list[dict],
     content_root: Path | None = None,
     ingests_root: Path | None = None,
+    public_record: bool = False,
 ) -> dict:
     """For each reference the model produced, find the originating claim and
     augment the reference with deterministic provenance fields:
@@ -2977,7 +2982,8 @@ def _augment_references(
       where the source's copyright status permits reproduction (fails closed)
     - claim_id: the claim's UUID, for workbench scroll-to-claim
     - record_hash: the source record's public_hash (first 56 of sha256)
-    - workbench_url: deep-link to the CLAIM in the workbench. A claim is a fact
+    - workbench_url: deep-link to the CLAIM in the workbench for entity articles.
+      Public record pages omit reviewer links entirely. A claim is a fact
       and is not copyrightable, so it may be surfaced publicly; the record and
       ingest views, which show the source text, are the copyrighted half and
       stay gated. (Mark, 2026-08-27.)
@@ -3034,7 +3040,7 @@ def _augment_references(
             # our own evidence, at scale.
             #
             # Quote is not body. Nothing here un-gates a full body or transcript;
-            # that gating lives in source_display_mode and is unchanged.
+            # the independent public-record capabilities own that decision.
             if c.get("original_excerpt"):
                 out.setdefault("quote", c["original_excerpt"])
             cid = c.get("id")
@@ -3063,15 +3069,17 @@ def _augment_references(
                 # consumer and a rule change does not require rewriting pages.
                 # A SNAPSHOT, never the authority: filter on this, decide on a
                 # live read of the store.
-                raw = (
-                    load_ingest_meta(
-                        ingests_root or _INGESTS_ROOT, c.get("record_content_hash")
-                    )
-                    or {}
-                ).get("status")
-                if raw:
-                    out["copyright_status"] = raw
-                out["workbench_url"] = f"{WORKBENCH_ORIGIN}/{ph}#claim-{cid}"
+                if not public_record:
+                    raw = (
+                        load_ingest_meta(
+                            ingests_root or _INGESTS_ROOT,
+                            c.get("record_content_hash"),
+                        )
+                        or {}
+                    ).get("status")
+                    if raw:
+                        out["copyright_status"] = raw
+                    out["workbench_url"] = f"{WORKBENCH_ORIGIN}/{ph}#claim-{cid}"
             rec_slug = c.get("record_friendly_name")
             if (
                 cid
@@ -3193,33 +3201,24 @@ def render_article(
     )
 
 
-# How a record page may present its own source, decided by the copyright status
-# the access gate already runs on. The statuses are not synonyms and the
-# distinction is the whole point:
-#
-#   public_domain        no rights to respect - the text itself can be shown.
-#   publicly_accessible  freely reachable AT ITS SOURCE. That permits pointing at
-#                        it, and permits the publisher's own embed (a YouTube
-#                        player is the publisher serving their video, not us
-#                        redistributing it). It does NOT permit reproducing the
-#                        document text here - that would widen the access model,
-#                        which needs Mark's sign-off and is not mine to take.
-#   restricted           summary and claims only.
-#
-# Emitted as data rather than markup: the assembler owns the copyright decision
-# because it is the only component reading the trustworthy field, and the site
-# owns how an embed looks.
 _EMBEDDABLE_MEDIA = ("video", "audio")
-
-
-def source_display_mode(status: str | None, source_type: str | None) -> str:
-    """'embed' | 'text' | 'link' | 'none' - what this page may show of its source."""
-    st = (source_type or "").lower()
-    if status == "public_domain":
-        return "embed" if st in _EMBEDDABLE_MEDIA else "text"
-    if status in ("publicly_accessible", "open_licence"):
-        return "embed" if st in _EMBEDDABLE_MEDIA else "link"
-    return "none"
+_REPRODUCIBLE = frozenset(("public_domain", "open_licence"))
+_BODY_PUBLIC = _REPRODUCIBLE | {"publicly_accessible"}
+_SIGNED_QUERY_KEYS = frozenset(
+    (
+        "expires",
+        "key-pair-id",
+        "policy",
+        "signature",
+        "token",
+        "x-amz-credential",
+        "x-amz-expires",
+        "x-amz-signature",
+        "x-goog-credential",
+        "x-goog-expires",
+        "x-goog-signature",
+    )
+)
 
 
 # A `licensed` record must carry evidence of the licence. Per
@@ -3247,6 +3246,330 @@ def effective_copyright_status(copyright_block: dict | None) -> str:
     ):
         return "restricted"
     return str(status)
+
+
+def _record_parts(text: str) -> tuple[dict, str] | None:
+    """Parse ingest frontmatter and body as the digester's record parser does."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return None
+    try:
+        frontmatter = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(frontmatter, dict):
+        return None
+
+    annotation_keys = {"file_page", "printed_page", "chapter", "speaker", "image"}
+    body_lines = lines[end + 1 :]
+    content: list[str] = []
+    i = 0
+    while i < len(body_lines):
+        if body_lines[i].strip() == "---":
+            close = next(
+                (
+                    j
+                    for j in range(i + 1, len(body_lines))
+                    if body_lines[j].strip() == "---"
+                ),
+                None,
+            )
+            block = body_lines[i + 1 : close] if close is not None else []
+            parsed = None
+            if block and len(block) <= 40:
+                try:
+                    parsed = yaml.safe_load("\n".join(block).strip())
+                except yaml.YAMLError:
+                    pass
+            if isinstance(parsed, dict) and annotation_keys.intersection(parsed):
+                i = close + 1
+                continue
+        content.append(body_lines[i])
+        i += 1
+    return frontmatter, "\n".join(content).strip()
+
+
+def _full_content_hash(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"sha256:([0-9a-f]{64})", value)
+    return match.group(1) if match else None
+
+
+def _iso_time(value) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _safe_public_url(value) -> str | None:
+    """A stable public HTTP(S) URL, never a private or signed location."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not host or parsed.username:
+        return None
+    if parsed.password or host.lower() == "localhost":
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        return None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(k.lower() in _SIGNED_QUERY_KEYS for k, _ in query):
+        return None
+    netloc = host.lower()
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"
+    if port is not None:
+        netloc += f":{port}"
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            netloc,
+            parsed.path or "/",
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
+def _provider_embed_url(source_url: str | None, source_type: str | None) -> str | None:
+    if source_type not in _EMBEDDABLE_MEDIA or not source_url:
+        return None
+    parsed = urlsplit(source_url)
+    host = (parsed.hostname or "").lower()
+    video_id = None
+    if (
+        host in ("youtube.com", "www.youtube.com", "m.youtube.com")
+        and parsed.path == "/watch"
+    ):
+        video_id = dict(parse_qsl(parsed.query)).get("v")
+    elif host in ("youtu.be", "www.youtu.be"):
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+    if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{6,}", video_id):
+        return None
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _denied(reason: str) -> dict:
+    return {"mode": "none", "reason": reason}
+
+
+def _rights_denial(status: str) -> str:
+    return "unavailable" if status == "unresolved" else "copyright"
+
+
+def _safe_record_metadata(frontmatter: dict) -> dict:
+    metadata = {}
+    keys = {
+        "source_type": "source_type",
+        "document_type": "document_type",
+        "publisher": "publisher",
+        "creators": "creators",
+        "date_published": "published_date",
+        "duration": "duration",
+        "pages": "pages",
+    }
+    for source, public in keys.items():
+        value = frontmatter.get(source)
+        if value is None or value == "" or value == []:
+            continue
+        if source == "creators":
+            if not isinstance(value, list) or not all(
+                isinstance(v, str) for v in value
+            ):
+                continue
+        elif source == "pages":
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                continue
+        elif source == "duration":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                continue
+        elif not isinstance(value, (str, dt.date, dt.datetime)):
+            continue
+        metadata[public] = (
+            value.isoformat() if isinstance(value, (dt.date, dt.datetime)) else value
+        )
+    return metadata
+
+
+def _source_capabilities(frontmatter: dict) -> dict:
+    copyright_block = frontmatter.get("copyright")
+    copyright_block = copyright_block if isinstance(copyright_block, dict) else {}
+    status = effective_copyright_status(copyright_block)
+    media_value = copyright_block.get("media")
+    if media_value is None:
+        media_status = status
+    elif isinstance(media_value, dict):
+        media_status = effective_copyright_status(media_value)
+    elif isinstance(media_value, str):
+        media_status = media_value
+    else:
+        media_status = "unresolved"
+
+    source_url_value = frontmatter.get("source_url")
+    source_url = _safe_public_url(source_url_value)
+    embed_url = _provider_embed_url(source_url, frontmatter.get("source_type"))
+    capabilities = {
+        # No public resource producer/root exists yet. Rights alone must not
+        # manufacture a URL from a private path or possession hash.
+        "source_body": _denied(
+            "unavailable" if status in _BODY_PUBLIC else _rights_denial(status)
+        ),
+        "archived_original": _denied(
+            "unavailable" if status in _REPRODUCIBLE else _rights_denial(status)
+        ),
+        "media": _denied(
+            "unavailable"
+            if media_status in _REPRODUCIBLE
+            else _rights_denial(media_status)
+        ),
+        "provider_embed": _denied(
+            _rights_denial(status)
+            if status not in _BODY_PUBLIC
+            else "unavailable"
+            if not source_url_value
+            else "unsupported"
+        ),
+        "external_link": _denied(
+            "unavailable" if not source_url_value else "unsupported"
+        ),
+    }
+    if embed_url and status in _BODY_PUBLIC:
+        capabilities["provider_embed"] = {
+            "mode": "embed",
+            "reason": "allowed",
+            "url": embed_url,
+        }
+    if source_url:
+        capabilities["external_link"] = {
+            "mode": "link",
+            "reason": "allowed",
+            "url": source_url,
+        }
+    return capabilities
+
+
+def public_record_projection(
+    digest: dict, ingests_root: Path | None
+) -> tuple[dict | None, str]:
+    """Strict live publication gate and safe public projection for one digest."""
+    rec = digest.get("record")
+    if not isinstance(rec, dict):
+        return None, "digest has no record block"
+    full = _full_content_hash(rec.get("content_hash"))
+    if not full or ingests_root is None:
+        return None, "digest has no canonical content hash or ingests root"
+    store = Path(ingests_root) / "store"
+    candidates = (
+        [
+            path
+            for path in sorted(store.glob(f"{full}*.md"))
+            if re.fullmatch(rf"{full}(?:\.v[0-9]+)?\.md", path.name)
+        ]
+        if store.is_dir()
+        else []
+    )
+    if len(candidates) != 1:
+        return None, "matching live record is absent or ambiguous"
+    path = candidates[0]
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, "live record is unreadable"
+    parsed = _record_parts(raw)
+    if parsed is None:
+        return None, "live record is malformed"
+    frontmatter, body = parsed
+    if _full_content_hash(frontmatter.get("content_hash")) != full:
+        return None, "live record identity does not match selected digest"
+    if frontmatter.get("superseded_by") or frontmatter.get("archived"):
+        return None, "live record is archived or superseded"
+
+    sidecar_path = store / f"{full}.review.json"
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "current review sidecar is absent or malformed"
+    coverage = sidecar.get("observed_coverage") if isinstance(sidecar, dict) else None
+    total = sidecar.get("total_units") if isinstance(sidecar, dict) else None
+    reviews = sidecar.get("reviews") if isinstance(sidecar, dict) else None
+    if (
+        not isinstance(sidecar, dict)
+        or sidecar.get("schema") != "anomalica/review-coverage/1"
+        or not isinstance(reviews, list)
+        or any(
+            not isinstance(review, dict)
+            or not isinstance(review.get("by"), str)
+            or _iso_time(review.get("at")) is None
+            or not isinstance(review.get("spans"), list)
+            for review in reviews
+        )
+        or isinstance(coverage, bool)
+        or not isinstance(coverage, (int, float))
+        or not math.isfinite(coverage)
+        or coverage != 1.0
+        or sidecar.get("digestible") is not True
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total <= 0
+    ):
+        return None, "record is not currently fully human-reviewed"
+    if "review_carryover" in frontmatter:
+        carryover = frontmatter.get("review_carryover")
+        carried_at = (
+            _iso_time(carryover.get("at")) if isinstance(carryover, dict) else None
+        )
+        reviewed = [_iso_time(review.get("at")) for review in reviews]
+        if carried_at is None or not any(at and at >= carried_at for at in reviewed):
+            return None, "review carryover has not been re-verified"
+
+    pre_digest = digest.get("pre_digest")
+    expected = pre_digest.get("sha256") if isinstance(pre_digest, dict) else None
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return None, "selected digest has no canonical pre-digest hash"
+    from anomalica_common.pre_digest import materialise, pre_digest_hash
+
+    if pre_digest_hash(materialise(body)) != expected:
+        return None, "selected digest is stale for the live record body"
+
+    title = frontmatter.get("title") or rec.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None, "live record has no safe title"
+    metadata = _safe_record_metadata(frontmatter)
+    return (
+        {
+            "title": title,
+            "record_hash": full[:PUBLIC_HASH_LENGTH],
+            "metadata": metadata,
+            "source": {
+                **metadata,
+                "capabilities": _source_capabilities(frontmatter),
+            },
+        },
+        "eligible",
+    )
 
 
 def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dict:
@@ -3286,12 +3609,9 @@ def load_ingest_meta(ingests_root: Path | None, content_hash: str | None) -> dic
         return {}
     copyright_block = fm.get("copyright") or {}
     status = copyright_block.get("status")
-    source_type = fm.get("source_type")
     out = {
         "status": status,
         "effective_status": effective_copyright_status(copyright_block),
-        "type": source_type,
-        "display": source_display_mode(status, source_type),
     }
     for key in ("source_url", "publisher", "date_published", "duration"):
         if fm.get(key):
@@ -3307,15 +3627,12 @@ def render_record_page(
     ai_usage: list | None = None,
     source: dict | None = None,
 ) -> str:
-    """The public /records/ inspection page: the model's article (title,
-    description, references, body) + source metadata + a record_hash the site
-    turns into a "view the facts breakdown in the workbench" link
-    ({workbenchUrl}/{record_hash}). The facts/entities QA breakdown is NOT emitted
-    - it is consolidated in the workbench, not the public site."""
+    """A reader-facing article for one eligible, fully reviewed live record."""
     frontmatter = {
-        "title": article_fm.get("title", ""),  # a source document's title, verbatim
+        "schema": "anomalica/public-record/1",
+        "content_kind": "record",
+        "title": article_fm.get("title", ""),
         "description": article_fm.get("description", ""),
-        "noindex": True,
         "metadata": metadata,
     }
     if record_hash:
@@ -3334,6 +3651,56 @@ def render_record_page(
     body, renumbered = renumber_citations(body, frontmatter.get("references") or [])
     if renumbered:
         frontmatter["references"] = renumbered
+    return (
+        "---\n"
+        + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+        + "\n---\n\n"
+        + body.strip()
+        + "\n"
+    )
+
+
+def reproject_record_page(article: str, projection: dict) -> str | None:
+    """Upgrade generated prose to public-record/1 without another model call."""
+    parsed = _split_article(article)
+    if parsed is None:
+        return None
+    old, body = parsed
+    description = old.get("description")
+    built_by = old.get("built_by")
+    if (
+        not isinstance(description, str)
+        or not description.strip()
+        or not isinstance(built_by, dict)
+    ):
+        return None
+    references = []
+    for reference in old.get("references") or []:
+        if isinstance(reference, dict):
+            references.append(
+                {
+                    key: value
+                    for key, value in reference.items()
+                    if key not in ("workbench_url", "copyright_status")
+                }
+            )
+        else:
+            references.append(reference)
+    frontmatter = {
+        "schema": "anomalica/public-record/1",
+        "content_kind": "record",
+        "title": projection["title"],
+        "description": description,
+        "record_hash": projection["record_hash"],
+        "metadata": projection["metadata"],
+        "source": projection["source"],
+        "references": references,
+    }
+    if "directives" in old:
+        frontmatter = _insert_after(
+            frontmatter, "title", "directives", old["directives"]
+        )
+    frontmatter["built_by"] = built_by
     return (
         "---\n"
         + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
@@ -3630,8 +3997,8 @@ def main() -> int:
     target.add_argument(
         "--record",
         help=(
-            "Assemble a per-record narrative + facts/entities page from the "
-            "per-record digest. Accepts a digest friendly_name (filename stem), "
+            "Assemble a reviewed public record narrative from the per-record "
+            "digest and live ingest review state. Accepts a digest friendly_name, "
             "a path to a digest .yaml, or a record id / title"
         ),
     )
@@ -3790,6 +4157,14 @@ def main() -> int:
         claims = claims_for_node(conn, node["id"])
         related = related_nodes(conn, node["id"])
 
+    if digest is None and node.get("type") == "document":
+        print(
+            "document nodes do not emit public articles; reviewed source works "
+            "are published through --record",
+            file=sys.stderr,
+        )
+        return 2
+
     print(
         f"node: {node.get('name')} ({node.get('type')}, "
         f"{(node.get('id') or '?')[:8]})\n"
@@ -3800,9 +4175,33 @@ def main() -> int:
     # Resolve the output path now (not just at write time) so collected
     # directives from the existing article + the _directives.yaml hierarchy can
     # be injected into the prompt, and so the same path is reused for the write.
-    section = args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
+    section = (
+        "records"
+        if digest is not None
+        else args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
+    )
     slug = node_slug(node)
     out = output_path(Path(args.content_root), section, slug)
+    public_record = None
+    if digest is not None:
+        public_record, reason = public_record_projection(
+            digest, Path(args.ingests_root) if args.ingests_root else None
+        )
+        if public_record is None:
+            if not args.dry_run and not args.print_only:
+                if out.is_file():
+                    out.unlink()
+                    print(
+                        f"  removed ineligible record page: {out} ({reason})",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"  skipped ineligible record: {reason}", file=sys.stderr)
+                return 0
+            print(
+                f"record is not eligible for public output: {reason}", file=sys.stderr
+            )
+            return 2
     from anomalica_common.llm import ledger
 
     ledger.set_context(type="assemble", ref=slug)
@@ -3979,27 +4378,16 @@ def main() -> int:
     # so it lives in built_by.tokens.
     if digest is not None:
         content_root = Path(args.content_root)
-        # Give the record page's references the same per-claim provenance
-        # (quote, claim_id, record_hash, workbench_url) as entity-article
-        # references, for review-link parity. inspection_url is naturally
-        # skipped here - digest claims carry no record_friendly_name, and the
-        # references are already on this record's inspection page.
-        fm = _augment_references(fm, claims, content_root)
-        rec = digest.get("record") or {}
-        record_hash = _public_hash(rec.get("content_hash"))
-        source_meta = load_ingest_meta(
-            Path(args.ingests_root) if args.ingests_root else None,
-            (digest.get("record") or {}).get("content_hash"),
-        )
+        # Keep public claim provenance, but never reviewer links. An entity
+        # article may link to the Workbench; a reader-facing record page may not.
+        fm = _augment_references(fm, claims, content_root, public_record=True)
+        fm["title"] = public_record["title"]
         article = render_record_page(
             fm,
             body,
-            metadata=record_metadata(digest),
-            record_hash=record_hash,
-            ai_usage=None
-            if record_hash
-            else accumulate(digest.get("ai_usage") or [], assemble_entry),
-            source=source_meta,
+            metadata=public_record["metadata"],
+            record_hash=public_record["record_hash"],
+            source=public_record["source"],
         )
     elif brief is not None:
         article = render_article(
@@ -4038,7 +4426,8 @@ def main() -> int:
     # and after any preserved human field is folded back in.
     # Before built_by, which hashes the final bytes.
     article = stamp_tags(article, node.get("type"), existing_tags(out))
-    article = carry_metadata(article, existing_metadata(out))
+    if digest is None:
+        article = carry_metadata(article, existing_metadata(out))
     article = stamp_aliases(
         article, slug_aliases(node, section, args.db, Path(args.content_root))
     )
