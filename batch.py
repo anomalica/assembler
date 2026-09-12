@@ -920,6 +920,7 @@ def reconcile_public_records(
     digests = Path(digests_root).expanduser()
     ingests = Path(ingests_root).expanduser()
     changed: list[tuple[Path, str, str | None]] = []
+    published_slugs: set[str] = set()
     records = content / "pages" / "records"
     for page in sorted(records.glob("*.*.md")) if records.is_dir() else []:
         slug = page.name.rsplit(".", 2)[0]
@@ -938,6 +939,7 @@ def reconcile_public_records(
         if projection is None:
             changed.append((page, "remove", reason))
             continue
+        published_slugs.add(slug)
         try:
             current = page.read_text(encoding="utf-8")
         except OSError:
@@ -961,6 +963,48 @@ def reconcile_public_records(
         if parsed and ("built_by" in parsed[0] or "built_from" in parsed[0]):
             changed.append((page, "remove", "document-node publication is retired"))
 
+    # inspection_url is derived from publication state. Keep the citation and
+    # workbench link, but do not leave entity pages pointing at a Record that the
+    # gate has removed (or is about to remove in this same dry run).
+    link_changes: list[tuple[Path, str, int]] = []
+    unpublished_link_targets: set[str] = set()
+    pages = content / "pages"
+    for page in sorted(pages.glob("*/*.*.md")) if pages.is_dir() else []:
+        if page.parent.name in {"documents", "records"}:
+            continue
+        try:
+            text = page.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed = asm._split_article(text)
+        if parsed is None:
+            continue
+        fm, _ = parsed
+        if "built_by" not in fm and "built_from" not in fm:
+            continue
+        references = fm.get("references")
+        if not isinstance(references, list):
+            continue
+        removed = 0
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            slug = _inspection_slug(reference.get("inspection_url"))
+            if slug and slug not in published_slugs:
+                reference.pop("inspection_url")
+                removed += 1
+                unpublished_link_targets.add(slug)
+        if removed:
+            match = re.match(r"^(---\n)(.*?)(\n---\n)(.*)$", text, re.S)
+            if match:
+                rewritten = (
+                    "---\n"
+                    + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+                    + "\n---\n"
+                    + match.group(4)
+                )
+                link_changes.append((page, rewritten, removed))
+
     for page, action, payload in changed:
         print(
             f"  {action}: {page} ({payload if action == 'remove' else 'public-record/1'})"
@@ -973,7 +1017,19 @@ def reconcile_public_records(
             page.write_text(payload, encoding="utf-8")
         if written is not None:
             written.append(page)
-    print(f"  {len(changed)} public page change(s){'' if apply else ' (dry run)'}")
+    for page, rewritten, removed in link_changes:
+        print(f"  unlink: {page} ({removed} unpublished Record reference(s))")
+        if apply:
+            page.write_text(rewritten, encoding="utf-8")
+            if written is not None:
+                written.append(page)
+    print(
+        f"  {len(changed)} public page change(s), "
+        f"{len(link_changes)} referring page change(s), "
+        f"{sum(item[2] for item in link_changes)} inspection_url removal(s) "
+        f"across {len(unpublished_link_targets)} unpublished target(s)"
+        f"{'' if apply else ' (dry run)'}"
+    )
     return 0
 
 

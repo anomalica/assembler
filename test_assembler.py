@@ -1279,6 +1279,66 @@ def test_record_reconciliation_retires_only_generated_document_pages(tmp_path):
     assert authored.exists(), "the assembler must not delete human-owned content"
 
 
+def test_record_reconciliation_removes_only_generated_links_to_unpublished_records(
+    monkeypatch, tmp_path
+):
+    import batch
+    import yaml
+
+    people = tmp_path / "content" / "pages" / "people"
+    records = tmp_path / "content" / "pages" / "records"
+    digests = tmp_path / "digests"
+    people.mkdir(parents=True)
+    records.mkdir(parents=True)
+    digests.mkdir()
+    published = records / "published.en.md"
+    published.write_text("---\ntitle: Published\nbuilt_by: {}\n---\n\nSummary\n")
+    (digests / "published.yaml").write_text(yaml.safe_dump({"record": {}}))
+    monkeypatch.setattr(
+        batch.asm, "public_record_projection", lambda *args: ({}, "eligible")
+    )
+    monkeypatch.setattr(
+        batch.asm, "reproject_record_page", lambda current, projection: current
+    )
+    generated = people / "generated.en.md"
+    authored = people / "authored.en.md"
+    article = (
+        "---\ntitle: Person\nreferences:\n- text: Published citation\n"
+        "  inspection_url: /records/published#claim-c0\n"
+        "- text: Unpublished citation\n"
+        "  inspection_url: /records/unpublished#claim-c1\n"
+        "  workbench_url: https://workbench.invalid/hash#claim-c1\n"
+        "{ownership}---\n\nBody\n"
+    )
+    generated.write_text(article.format(ownership="built_from: {}\n"))
+    authored.write_text(article.format(ownership=""))
+
+    written = []
+    batch.reconcile_public_records(
+        str(tmp_path / "content"),
+        str(digests),
+        str(tmp_path / "ingests"),
+        False,
+        written,
+    )
+    assert "inspection_url" in generated.read_text(), "dry run writes nothing"
+    assert written == []
+
+    batch.reconcile_public_records(
+        str(tmp_path / "content"),
+        str(digests),
+        str(tmp_path / "ingests"),
+        True,
+        written,
+    )
+    fm, body = a._split_article(generated.read_text())
+    assert fm["references"][0]["inspection_url"].startswith("/records/published")
+    assert "inspection_url" not in fm["references"][1]
+    assert fm["references"][1]["workbench_url"].endswith("#claim-c1")
+    assert body == "Body" and written == [generated]
+    assert "inspection_url" in authored.read_text(), "human-owned page is preserved"
+
+
 def test_retarget_links_never_restores_a_record_page_reviewer_link(tmp_path):
     import batch
 
