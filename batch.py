@@ -160,7 +160,7 @@ def _confirm_tail(model: str) -> str:
     a banner that said "metered - OpenRouter", which is the one thing the gate
     must never say about a run that costs money.
     """
-    if asm._use_api() or asm.is_openrouter_model(model):
+    if asm._uses_metered_route(model):
         return "once the dollar amount above is cleared - this run is METERED"
     return "to generate on the subscription"
 
@@ -391,10 +391,11 @@ def _load(args, kind: str, item: str):
         if not loaded:
             return None
         brief, _slug = loaded
+        related = asm.refresh_related_slugs(asm.related_from_brief(brief), args.db)
         return (
             asm.brief_node(brief),
             asm.claims_from_brief(brief),
-            asm.related_from_brief(brief),
+            related,
         )
     loaded = asm.load_digest(Path(args.digests_root), item)
     if not loaded:
@@ -419,7 +420,31 @@ def _prompt_chars(args, kind: str, item: str) -> int | None:
     if loaded is None:
         return None
     node, claims, related = loaded
-    return len(asm.build_prompt(node, claims, related))
+    out = _target_path(args, kind, item)
+    directives = asm.collect_directives(out, Path(args.content_root)) if out else []
+    return len(asm.build_prompt(node, claims, related, directives))
+
+
+def _subscription_oversized(args, kind: str, items: list[str]) -> dict[str, str]:
+    """Candidate items that cannot fit OpenAI OAuth, before any child starts."""
+    if not asm.is_openai_subscription_model(args.model):
+        return {}
+    oversized: dict[str, str] = {}
+    for item in items:
+        loaded = _load(args, kind, item)
+        if loaded is None:
+            continue
+        node, claims, related = loaded
+        out = _target_path(args, kind, item)
+        directives = asm.collect_directives(out, Path(args.content_root)) if out else []
+        prompt = asm.build_prompt(node, claims, related, directives)
+        try:
+            asm.check_openai_subscription_input(
+                f"{asm._SYSTEM_PROMPT}\n\n{prompt}", args.model
+            )
+        except asm.OpenAISubscriptionInputTooLarge as exc:
+            oversized[item] = str(exc)
+    return oversized
 
 
 def openrouter_budget_remaining() -> tuple[float, float] | None:
@@ -476,6 +501,7 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     # reported it as "no metered spend", which is the one thing this gate must
     # never say about a run that costs money.
     via_openrouter = asm.is_openrouter_model(args.model)
+    via_openai_subscription = asm.is_openai_subscription_model(args.model)
     if via_openrouter:
         from anomalica_common.llm.cost import price_for
 
@@ -492,8 +518,18 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
         # be kept current; it can only be wrong later.
         from anomalica_common.llm.cost import price_for
 
-        in_price, out_price = price_for(args.model)
-        chars_per_token, fixed_in = CHARS_PER_TOKEN, FIXED_INPUT_TOKENS
+        priced_model = (
+            asm.openai_subscription_model_id(args.model)
+            if via_openai_subscription
+            else args.model
+        )
+        in_price, out_price = price_for(priced_model)
+        chars_per_token = CHARS_PER_TOKEN
+        fixed_in = (
+            asm.openai_subscription_input_capacity(args.model)[1]
+            if via_openai_subscription
+            else FIXED_INPUT_TOKENS
+        )
 
     resolved: list[str] = []
     unresolved: list[str] = []
@@ -511,12 +547,18 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
     in_cost = total_in_tokens * in_price / 1_000_000
     out_cost = out_tokens * out_price / 1_000_000
     total = in_cost + out_cost
-    on_api = asm._use_api() or via_openrouter
+    on_api = asm._uses_metered_route(args.model)
 
     print("=" * 60, file=sys.stderr)
     if on_api:
         provider = "OpenRouter" if via_openrouter else "Anthropic API"
         print(f"BATCH SPEND ESTIMATE (metered - {provider})", file=sys.stderr)
+    elif via_openai_subscription:
+        print(
+            "BATCH PRE-FLIGHT (OpenAI subscription - no metered spend, "
+            "but spends plan allowance)",
+            file=sys.stderr,
+        )
     else:
         print(
             "BATCH PRE-FLIGHT (Claude subscription - no metered spend, "
@@ -539,12 +581,12 @@ def estimate(args, kind: str, items: list[str]) -> tuple[list[str], list[str]]:
             file=sys.stderr,
         )
     else:
+        plan = "OpenAI Pro" if via_openai_subscription else "Max"
         print(
-            f"  Draws on the Max plan's finite weekly allowance - DISCOUNTED, "
+            f"  Draws on the {plan} plan's finite allowance - DISCOUNTED, "
             f"NOT FREE. Equivalent metered value ~${total:,.2f}. The allowance is "
             f"shared across every project and heavier models burn it fastest, so "
-            f"this still needs clearing before it runs. (ASSEMBLER_USE_API=1 to "
-            f"bill the metered API instead.)",
+            f"this still needs clearing before it runs.",
             file=sys.stderr,
         )
     if via_openrouter:
@@ -661,9 +703,7 @@ def generate(args, kind: str, items: list[str]) -> int:
     # which is not metered and never consults it.
     # Any metered route, not just the Anthropic toggle: an OpenRouter model is
     # metered too, and its child gate would refuse every item without this.
-    if (asm._use_api() or asm.is_openrouter_model(args.model)) and getattr(
-        args, "confirm", False
-    ):
+    if asm._uses_metered_route(args.model) and getattr(args, "confirm", False):
         common.append("--confirm-spend")
     # The briefs root goes to every mode, not just --brief: it is also the
     # proposal set the body-link resolver indexes, and a record page links to
@@ -2694,7 +2734,12 @@ def main() -> int:
         return 2
     kind, items = chosen[0]
 
-    resolved, _ = estimate(args, kind, items)
+    try:
+        resolved, _ = estimate(args, kind, items)
+    except asm.OpenAISubscriptionCapacityUnverified as exc:
+        print(f"SUBSCRIPTION ROUTE REFUSED: {exc}", file=sys.stderr)
+        print("  No fallback was attempted.", file=sys.stderr)
+        return 2
 
     suspect = _check_suspect_names(args, kind, resolved)
     if suspect:
@@ -2724,6 +2769,31 @@ def main() -> int:
             "\nRefusing to run. ADR 0047 bars watermarking models from stages a "
             "reader reads - the mark travels into every quotation of the page. "
             "There is no override: the dispatch refuses the same model again.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if asm.is_openai_subscription_model(args.model):
+        try:
+            asm.assert_openai_subscription_operationally_ready()
+        except asm.OpenAISubscriptionOperationallyUnavailable as exc:
+            print(f"SUBSCRIPTION ROUTE BLOCKED: {exc}", file=sys.stderr)
+            print("  No fallback was attempted.", file=sys.stderr)
+            return 2
+
+    oversized = _subscription_oversized(args, kind, resolved)
+    if oversized:
+        maximum, _ = asm.openai_subscription_input_capacity(args.model)
+        print(
+            f"\nSUBSCRIPTION INPUT REFUSED: {len(oversized)} item(s) exceed the "
+            f"OpenAI subscription's {maximum:,}-token input limit.",
+            file=sys.stderr,
+        )
+        for item, why in oversized.items():
+            print(f"  {item}\n      {why}", file=sys.stderr)
+        print(
+            "\nNo fallback was attempted. Run those items separately with an "
+            "explicitly selected metered model after authorising its quoted spend.",
             file=sys.stderr,
         )
         return 2

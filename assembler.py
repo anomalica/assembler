@@ -43,12 +43,25 @@ from anomalica_common.titles import (
     place_display_name,
 )
 from anomalica_common.llm import (
+    OpenAISubscriptionAuthRefused,
+    OpenAISubscriptionCapacityUnverified,
+    OpenAISubscriptionInputTooLarge,
+    OpenAISubscriptionOperationallyUnavailable,
+    OpencodeRateLimited,
     PlanRateLimited,
     accumulate,
+    check_openai_subscription_input,
+    assert_openai_subscription_operationally_ready,
+    get_usage_trace,
+    is_openai_subscription_model,
     is_openrouter_model,
+    note_run_failure,
+    openai_subscription_input_capacity,
+    openai_subscription_capacity_snapshot,
+    openai_subscription_model_id,
     usage_entry,
 )
-from anomalica_common.llm.transport import _raise_if_plan_limited
+from anomalica_common.llm.transport import _call_opencode, _raise_if_plan_limited
 from anomalica_common.slug import SECTION_BY_TYPE as _COMMON_SECTION_BY_TYPE
 from anomalica_common.slug import node_slug as _node_slug
 from anomalica_common.slug import slugify
@@ -1673,6 +1686,13 @@ def _use_api() -> bool:
     return os.environ.get("ASSEMBLER_USE_API", "").lower() in ("1", "true", "yes")
 
 
+def _uses_metered_route(model: str) -> bool:
+    """Whether this model selection reaches a per-token billed transport."""
+    return is_openrouter_model(model) or (
+        _use_api() and not is_openai_subscription_model(model)
+    )
+
+
 # Token-usage accounting for the public AI-usage provenance (ADR 0037). The
 # assembler has its own (generation-shaped) transport, so it accumulates usage
 # locally in the field shape anomalica_common.llm.usage_entry consumes, rather
@@ -1688,19 +1708,25 @@ _USAGE_FIELDS = (
     "cache_creation_input_tokens",
 )
 _usage: dict = {}
+_execution_identity: dict = {}
 
 
 def _reset_usage() -> None:
-    global _usage
+    global _usage, _execution_identity
     _usage = {f: 0 for f in _USAGE_FIELDS}
+    _execution_identity = {}
 
 
-def _record_usage(usage: dict | None) -> None:
+def _record_usage(usage: dict | None, route: str | None = None) -> None:
     if not _usage:
         _reset_usage()
     if usage:
         for f in _USAGE_FIELDS:
             _usage[f] += int(usage.get(f) or 0)
+    _usage["calls"] = int(_usage.get("calls") or 0) + 1
+    if route:
+        seen = _usage.get("route")
+        _usage["route"] = route if seen in (None, route) else "mixed"
 
 
 def _get_usage() -> dict:
@@ -1709,7 +1735,42 @@ def _get_usage() -> dict:
     return dict(_usage)
 
 
-def enforce_model_policy(model: str | None, stage: str = "assemble") -> str:
+def _executable_version(command: str) -> str:
+    proc = subprocess.run(
+        [command, "--version"], capture_output=True, text=True, timeout=10
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(f"cannot determine {command} executable version")
+    return proc.stdout.strip().split()[0]
+
+
+def _record_execution_identity(
+    *,
+    logical_user_prompt: str,
+    submitted_payload: str,
+    system_prompt_role: str,
+    implementation: str,
+    version: str | None,
+    config: Path | None,
+    scaffold: str,
+) -> None:
+    global _execution_identity
+    _execution_identity = {
+        "prompt_sha256": _sha256(logical_user_prompt),
+        "submitted_payload_sha256": _sha256(submitted_payload),
+        "system_prompt_role": system_prompt_role,
+        "transport_implementation": implementation,
+        "transport_version": version,
+        "transport_config_sha256": (
+            hashlib.sha256(config.read_bytes()).hexdigest() if config else None
+        ),
+        "execution_scaffold": scaffold,
+    }
+
+
+def enforce_model_policy(
+    model: str | None, stage: str = "assemble", policy_snapshot=None
+) -> str:
     """Refuse, before any call, a model the policy bars from this stage.
 
     Fails CLOSED. An unreadable policy is a refusal, not a pass: the one thing
@@ -1728,7 +1789,11 @@ def enforce_model_policy(model: str | None, stage: str = "assemble") -> str:
             "writes prose a reader sees - refusing rather than guessing",
         )
     try:
-        policy = mp.load()
+        policy = (
+            policy_snapshot.policy
+            if policy_snapshot is not None
+            else mp.load_snapshot().policy
+        )
     except Exception as exc:
         raise mp.PolicyRefusal(
             stage, model, f"model policy unreadable ({exc}); refusing to run unchecked"
@@ -1741,10 +1806,19 @@ def enforce_model_policy(model: str | None, stage: str = "assemble") -> str:
     return model
 
 
-def call_claude(prompt: str, model: str = DEFAULT_MODEL) -> str:
-    enforce_model_policy(model)
+def call_claude(prompt: str, model: str = DEFAULT_MODEL, policy_snapshot=None) -> str:
+    if is_openai_subscription_model(model) and policy_snapshot is None:
+        from anomalica_common import model_policy as mp
+
+        policy_snapshot = mp.load_snapshot()
+    if policy_snapshot is None:
+        enforce_model_policy(model)
+    else:
+        enforce_model_policy(model, policy_snapshot=policy_snapshot)
     """Generate the article. Defaults to the Claude subscription via the CLI;
     set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
+    if is_openai_subscription_model(model):
+        return _call_openai_subscription(prompt, model, policy_snapshot=policy_snapshot)
     if is_openrouter_model(model):
         return _call_openrouter(prompt, model)
     return _call_api(prompt, model) if _use_api() else _call_cli(prompt, model)
@@ -1758,6 +1832,15 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     Strips the CLAUDECODE / CLAUDE_CODE_* markers so the subprocess is not treated
     as nested Claude Code. The full prompt is the user turn via stdin.
     """
+    _record_execution_identity(
+        logical_user_prompt=prompt,
+        submitted_payload=prompt,
+        system_prompt_role="system",
+        implementation="claude",
+        version=_executable_version("claude"),
+        config=None,
+        scaffold="opaque",
+    )
     env = {
         k: v
         for k, v in os.environ.items()
@@ -1818,11 +1901,42 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     try:
         wrapper = json.loads(proc.stdout)
     except json.JSONDecodeError:
+        _record_usage(None, "cli")
         return proc.stdout
     # Capture token usage for the public AI-usage provenance. The wrapper's
     # total_cost_usd is deliberately ignored: no dollar figure is stored.
-    _record_usage(wrapper.get("usage"))
+    _record_usage(wrapper.get("usage"), "cli")
     return wrapper.get("result", proc.stdout)
+
+
+def _call_openai_subscription(prompt: str, model: str, policy_snapshot=None) -> str:
+    """Generate through OpenCode's authenticated OpenAI subscription route."""
+    from anomalica_common.llm import ledger
+
+    assert_openai_subscription_operationally_ready()
+    payload = f"{_SYSTEM_PROMPT}\n\n{prompt}"
+    from anomalica_common.llm.transport import _OPENCODE_CONFIG, _opencode_version
+
+    _record_execution_identity(
+        logical_user_prompt=prompt,
+        submitted_payload=payload,
+        system_prompt_role="user-prefix",
+        implementation="opencode",
+        version=_opencode_version(),
+        config=_OPENCODE_CONFIG,
+        scaffold="opaque",
+    )
+    ledger.set_context(type="assemble", body_chars=len(payload), source="direct")
+    before = len(get_usage_trace())
+    result = (
+        _call_opencode(payload, "", model, _policy_snapshot=policy_snapshot)
+        if policy_snapshot is not None
+        else _call_opencode(payload, "", model)
+    )
+    trace = get_usage_trace()
+    usage = trace[-1] if len(trace) > before else None
+    _record_usage(usage, "openai-subscription")
+    return result
 
 
 # Per-article token estimates, single-sourced here because both the single-run
@@ -1862,13 +1976,24 @@ def _estimate_article_cost(
     """
     from anomalica_common.llm.cost import price_for
 
-    in_price, out_price = price_for(API_MODEL_MAP.get(model, model))
+    priced_model = (
+        openai_subscription_model_id(model)
+        if is_openai_subscription_model(model)
+        else API_MODEL_MAP.get(model, model)
+    )
+    in_price, out_price = price_for(priced_model)
     if prompt_chars is None:
         in_tok, out_tok = FIXED_INPUT_TOKENS, EST_OUTPUT_TOKENS
     else:
         via_openrouter = is_openrouter_model(model)
         chars_per_token = CHARS_PER_TOKEN  # 3.5 was inherited, unfitted, errs unsafe
-        fixed = 0 if via_openrouter else FIXED_INPUT_TOKENS
+        fixed = (
+            0
+            if via_openrouter
+            else openai_subscription_input_capacity(model)[1]
+            if is_openai_subscription_model(model)
+            else FIXED_INPUT_TOKENS
+        )
         in_tok = fixed + round(prompt_chars / chars_per_token)
         # A record page is capped at 300-400 words by its own prompt and cannot
         # produce the reference-heavy output an entity page can; measured median
@@ -1902,6 +2027,16 @@ def _call_openrouter(prompt: str, model: str) -> str:
     """
     import urllib.error
     import urllib.request
+
+    _record_execution_identity(
+        logical_user_prompt=prompt,
+        submitted_payload=prompt,
+        system_prompt_role="system",
+        implementation="openrouter-http",
+        version=None,
+        config=None,
+        scaffold="none",
+    )
 
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
@@ -1951,7 +2086,8 @@ def _call_openrouter(prompt: str, model: str) -> str:
         {
             "input_tokens": usage.get("prompt_tokens") or 0,
             "output_tokens": usage.get("completion_tokens") or 0,
-        }
+        },
+        "openrouter",
     )
     return (choices[0].get("message") or {}).get("content") or ""
 
@@ -1962,6 +2098,16 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
     a large claims prompt doesn't trip the SDK's non-streaming time guard."""
     import anthropic
     from anomalica_common.llm.transport import _require_metered
+
+    _record_execution_identity(
+        logical_user_prompt=prompt,
+        submitted_payload=prompt,
+        system_prompt_role="system",
+        implementation="anthropic-sdk",
+        version=anthropic.__version__,
+        config=None,
+        scaffold="none",
+    )
 
     # Backstop, not the gate. The gate is in main(); this refuses if a future
     # call site ever reaches the metered client without passing it, the same
@@ -1995,7 +2141,8 @@ def _call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
                     u, "cache_creation_input_tokens", 0
                 )
                 or 0,
-            }
+            },
+            "api",
         )
     for block in message.content:
         if getattr(block, "type", None) == "text":
@@ -3217,23 +3364,25 @@ def built_by_block(assemble_entry: dict, prompt: str, directives: list[str]) -> 
     Hashed in components, never blended into one digest: a single hash cannot
     say WHICH component differed, and folding the transport in would give one
     authored prompt two identities depending on the billing path. Both
-    transports now send _SYSTEM_PROMPT verbatim, so system_prompt_sha256 is
-    constant across them by construction - it is emitted anyway, so a future
-    divergence is detectable rather than silent. (The digest layer keys model /
-    prompt / prep independently for the same reason.)
+    The authored system prompt is byte-identical across transports, but its
+    protocol role is not: OpenCode receives it as a prefix in the stdin user
+    message and adds an opaque scaffold. The execution fields make that mapping
+    visible without pretending the hidden scaffold is reconstructable.
     """
     block = {
         k: assemble_entry[k] for k in ("model", "model_version") if k in assemble_entry
     }
     block.update(
         {
-            "transport": "api" if _use_api() else "cli",
+            "transport": assemble_entry.get("route")
+            or ("api" if _use_api() else "cli"),
             "prompt_sha256": _sha256(prompt),
             "system_prompt_sha256": _sha256(_SYSTEM_PROMPT),
             "directives_sha256": _sha256(json.dumps(directives, ensure_ascii=False)),
             "tokens": assemble_entry.get("tokens") or {},
         }
     )
+    block.update(_execution_identity)
     return block
 
 
@@ -3570,8 +3719,13 @@ def main() -> int:
     # The dispatch check in call_claude is the backstop and still runs; without
     # this one it was reached only after the link index and prompt were built -
     # 220 seconds on Socorro - before the run was told no.
+    policy_snapshot = None
     try:
-        enforce_model_policy(args.model)
+        if is_openai_subscription_model(args.model):
+            from anomalica_common import model_policy as mp
+
+            policy_snapshot = mp.load_snapshot()
+        enforce_model_policy(args.model, policy_snapshot=policy_snapshot)
     except Exception as exc:  # PolicyRefusal; anything else is still a refusal
         print(f"MODEL NOT PERMITTED: {exc}", file=sys.stderr)
         return 2
@@ -3649,6 +3803,9 @@ def main() -> int:
     section = args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
     slug = node_slug(node)
     out = output_path(Path(args.content_root), section, slug)
+    from anomalica_common.llm import ledger
+
+    ledger.set_context(type="assemble", ref=slug)
     directives = collect_directives(out, Path(args.content_root))
     if directives:
         print(f"  directives: {len(directives)} applied", file=sys.stderr)
@@ -3660,12 +3817,47 @@ def main() -> int:
 
     print(f"  prompt: {len(prompt):,} chars", file=sys.stderr)
 
+    if is_openai_subscription_model(args.model):
+        try:
+            assert_openai_subscription_operationally_ready()
+            capacity_snapshot = openai_subscription_capacity_snapshot(
+                args.model, policy_snapshot
+            )
+            effective = check_openai_subscription_input(
+                f"{_SYSTEM_PROMPT}\n\n{prompt}",
+                args.model,
+                snapshot=capacity_snapshot,
+            )
+        except OpenAISubscriptionInputTooLarge as exc:
+            note_run_failure()
+            print(f"SUBSCRIPTION INPUT REFUSED: {exc}", file=sys.stderr)
+            print(
+                "  No fallback was attempted. Choose an explicitly authorised "
+                "metered model or reduce the input upstream.",
+                file=sys.stderr,
+            )
+            return 2
+        except OpenAISubscriptionCapacityUnverified as exc:
+            note_run_failure()
+            print(f"SUBSCRIPTION ROUTE REFUSED: {exc}", file=sys.stderr)
+            print("  No fallback was attempted.", file=sys.stderr)
+            return 2
+        except OpenAISubscriptionOperationallyUnavailable as exc:
+            print(f"SUBSCRIPTION ROUTE BLOCKED: {exc}", file=sys.stderr)
+            print("  No fallback was attempted.", file=sys.stderr)
+            return 2
+        maximum = capacity_snapshot["max_input"]
+        print(
+            f"  OpenAI subscription input bound: {effective:,}/{maximum:,} tokens",
+            file=sys.stderr,
+        )
+
     # The spend gate, AFTER the prompt exists so it can be sized on this article
     # rather than on a constant. Building the prompt calls no model, so paying
     # for a real figure costs nothing. Positioned after the --dry-run return, so
     # a dry run cannot reach it - a run that spends nothing is not gated, by
     # construction rather than by a special case.
-    if _use_api() or is_openrouter_model(args.model):
+    if _uses_metered_route(args.model):
         from anomalica_common.llm import spend_confirmed
 
         if not spend_confirmed(
@@ -3699,7 +3891,29 @@ def main() -> int:
         # hundred characters and turns a blind retry into a corrective one.
         attempt_prompt = prompt if attempt == 1 else prompt + _retry_note(fail_msg)
         try:
-            response = call_claude(attempt_prompt, model=args.model)
+            response = call_claude(
+                attempt_prompt,
+                model=args.model,
+                policy_snapshot=policy_snapshot,
+            )
+        except OpenAISubscriptionInputTooLarge as exc:
+            note_run_failure()
+            print(f"SUBSCRIPTION INPUT REFUSED: {exc}", file=sys.stderr)
+            print("  No fallback was attempted.", file=sys.stderr)
+            return 2
+        except (
+            OpenAISubscriptionAuthRefused,
+            OpenAISubscriptionCapacityUnverified,
+        ) as exc:
+            note_run_failure()
+            print(f"SUBSCRIPTION ROUTE REFUSED: {exc}", file=sys.stderr)
+            print("  No fallback was attempted.", file=sys.stderr)
+            return 2
+        except OpencodeRateLimited as exc:
+            note_run_failure()
+            print(f"{_PLAN_LIMIT_MARKER} reset_at=-", file=sys.stderr)
+            print(f"  OpenAI subscription throttled: {exc}", file=sys.stderr)
+            return _EXIT_PLAN_RATE_LIMITED
         except PlanRateLimited as exc:
             # Not a failed article: the plan window is full and the brief is
             # untouched. Exit on its own code with the reset time in a fixed
@@ -3739,6 +3953,7 @@ def main() -> int:
         break  # passed both gates
 
     if fm is None:
+        note_run_failure()
         print(
             f"GENERATION FAILED after {_MAX_GEN_ATTEMPTS} attempts ({fail_msg})",
             file=sys.stderr,

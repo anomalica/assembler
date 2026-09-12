@@ -631,6 +631,249 @@ def test_openrouter_is_selected_by_model_id_not_a_flag(monkeypatch):
     assert calls == {}, "a refused model must not reach any transport"
 
 
+def test_openai_subscription_candidate_has_its_own_dispatch(monkeypatch):
+    model = "openai-subscription/gpt-5.6-luna"
+    calls = {}
+    monkeypatch.setattr(a, "enforce_model_policy", lambda m, **kwargs: m)
+    monkeypatch.setattr(
+        a,
+        "_call_openai_subscription",
+        lambda p, m, **kwargs: calls.setdefault("sub", m),
+    )
+    monkeypatch.setattr(
+        a, "_call_openrouter", lambda p, m: calls.setdefault("metered", m)
+    )
+
+    assert not a.is_openrouter_model(model)
+    a.call_claude("x", model=model)
+    assert calls == {"sub": model}, "candidate must never fall through to OpenRouter"
+
+
+def test_candidate_uses_one_policy_snapshot_across_eligibility_and_transport(
+    monkeypatch, tmp_path
+):
+    import hashlib
+    import json
+    from anomalica_common import model_policy as mp
+    from anomalica_common.llm import transport
+
+    model = "openai-subscription/gpt-5.6-luna"
+    config_hash = hashlib.sha256(transport._OPENCODE_CONFIG.read_bytes()).hexdigest()
+    policy = mp.Policy(
+        {
+            "watermarking": {"openai": {"state": "clean"}},
+            "models": [
+                {
+                    "id": model,
+                    "provider": "openai",
+                    "max_input": 272000,
+                    "input_reserve": 12000,
+                    "input_reserve_qualification": {
+                        "transport_implementation": "opencode",
+                        "transport_version": "1.18.30",
+                        "transport_config_sha256": config_hash,
+                    },
+                }
+            ],
+            "stages": [{"id": "assemble", "priority": [], "candidates": [model]}],
+        }
+    )
+    original = mp.PolicySnapshot(tmp_path / "original.yaml", "a" * 64, policy)
+    changed = mp.PolicySnapshot(
+        tmp_path / "changed.yaml", "b" * 64, mp.Policy({"models": []})
+    )
+    loads = []
+
+    def changing_policy():
+        loads.append(True)
+        return original if len(loads) == 1 else changed
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {"type": "text", "part": {"type": "text", "text": "article"}}
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {"tokens": {"input": 1, "output": 1}, "cost": 0},
+                    }
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(mp, "load_snapshot", changing_policy)
+    monkeypatch.setattr(
+        a, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    monkeypatch.setattr(
+        transport, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    monkeypatch.setattr(transport, "_opencode_version", lambda: "1.18.30")
+    monkeypatch.setattr(
+        transport, "_assert_openai_subscription_oauth", lambda auth_path: None
+    )
+    monkeypatch.setattr(transport.subprocess, "run", lambda *args, **kwargs: Proc())
+    transport.reset_usage()
+    a._reset_usage()
+
+    assert a.call_claude("prompt", model=model) == "article"
+    assert len(loads) == 1, "transport must retain the eligibility snapshot"
+
+
+def test_default_metered_built_by_route_remains_explicit_openrouter():
+    a._reset_usage()
+    a._record_usage({"input_tokens": 1, "output_tokens": 1}, "openrouter")
+    entry = a.usage_entry("assemble", a.DEFAULT_MODEL, a._get_usage())
+
+    assert a.DEFAULT_MODEL == "openai/gpt-5.6-sol"
+    assert a.built_by_block(entry, "prompt", [])["transport"] == "openrouter"
+
+
+def test_openai_subscription_usage_reaches_article_provenance(monkeypatch):
+    import hashlib
+    from anomalica_common.llm import transport
+
+    model = "openai-subscription/gpt-5.6-terra"
+    traces = iter(
+        [
+            [],
+            [
+                {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 4,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(a, "get_usage_trace", lambda: next(traces))
+    monkeypatch.setattr(
+        a, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    monkeypatch.setattr(a, "_call_opencode", lambda *args: "article")
+    monkeypatch.setattr(transport, "_opencode_version", lambda: "1.18.30")
+    a._reset_usage()
+
+    assert a._call_openai_subscription("prompt", model) == "article"
+    entry = a.usage_entry("assemble", model, a._get_usage())
+    assert entry["model"] == model
+    assert entry["route"] == "openai-subscription"
+    assert entry["tokens"] == {
+        "input": 107,
+        "output": 20,
+        "real_input": 100,
+        "cache_read": 3,
+        "cache_write": 4,
+        "calls": 1,
+    }
+    built_by = a.built_by_block(entry, "prompt", [])
+    assert built_by["transport"] == "openai-subscription"
+    submitted = f"{a._SYSTEM_PROMPT}\n\nprompt".encode()
+    assert built_by["prompt_sha256"] == hashlib.sha256(b"prompt").hexdigest()
+    assert (
+        built_by["system_prompt_sha256"]
+        == hashlib.sha256(a._SYSTEM_PROMPT.encode()).hexdigest()
+    )
+    assert built_by["submitted_payload_sha256"] == hashlib.sha256(submitted).hexdigest()
+    assert built_by["system_prompt_role"] == "user-prefix"
+    assert built_by["transport_implementation"] == "opencode"
+    assert built_by["transport_version"] == "1.18.30"
+    assert (
+        built_by["transport_config_sha256"]
+        == hashlib.sha256(transport._OPENCODE_CONFIG.read_bytes()).hexdigest()
+    )
+    assert built_by["execution_scaffold"] == "opaque"
+
+
+def test_openai_subscription_throttle_stays_distinct(monkeypatch):
+    from anomalica_common.llm import OpencodeRateLimited
+    import pytest
+
+    def throttled(*_args):
+        raise OpencodeRateLimited("quota")
+
+    monkeypatch.setattr(
+        a, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    monkeypatch.setattr(a, "_call_opencode", throttled)
+    with pytest.raises(OpencodeRateLimited):
+        a._call_openai_subscription("prompt", "openai-subscription/gpt-5.6-luna")
+
+
+def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
+    monkeypatch, tmp_path, capsys
+):
+    import sys
+    from anomalica_common.llm import ledger
+
+    brief = {
+        "brief_hash": "brief-hash",
+        "page": {
+            "node_id": "node-1",
+            "node_type": "topic",
+            "title": "Test topic",
+            "slug": "test-topic",
+        },
+        "claims": [
+            {
+                "claim_id": "claim-1",
+                "claim_hash": "claim-hash",
+                "content": "A grounded claim.",
+                "claim_type": "observation",
+            }
+        ],
+    }
+    monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
+    monkeypatch.setattr(
+        a, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    ledger.clear_context()
+    failures = []
+    monkeypatch.setattr(a, "note_run_failure", lambda: failures.append(True))
+    monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "test-topic"))
+    monkeypatch.setattr(
+        a,
+        "call_claude",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            a.OpencodeRateLimited("allowance exhausted")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "assembler.py",
+            "--brief",
+            "test-topic",
+            "--model",
+            "openai-subscription/gpt-5.6-luna",
+            "--content-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert a.main() == a._EXIT_PLAN_RATE_LIMITED
+    assert a._PLAN_LIMIT_MARKER in capsys.readouterr().err
+    assert ledger._context["ref"] == "test-topic"
+    assert failures
+
+
+def test_direct_subscription_helper_blocks_before_observing_opencode(monkeypatch):
+    from anomalica_common.llm import transport
+    import pytest
+
+    observed = []
+    monkeypatch.setattr(transport, "_opencode_version", lambda: observed.append(True))
+    with pytest.raises(a.OpenAISubscriptionOperationallyUnavailable):
+        a._call_openai_subscription("prompt", "openai-subscription/gpt-5.6-luna")
+    assert not observed
+
+
 def test_openrouter_refuses_without_a_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     try:
@@ -774,6 +1017,16 @@ def test_the_estimate_is_sized_on_this_article_not_a_constant():
     assert large["usd"] > small["usd"]
 
 
+def test_subscription_candidate_uses_metered_twin_only_for_equivalent_cost():
+    candidate = "openai-subscription/gpt-5.6-luna"
+    metered = "openai/gpt-5.6-luna"
+    sub_est = a._estimate_article_cost(candidate, 10_000)
+    metered_est = a._estimate_article_cost(metered, 10_000)
+    reserve = a.openai_subscription_input_capacity(candidate)[1]
+    assert sub_est["est_input_tokens"] == (metered_est["est_input_tokens"] + reserve)
+    assert sub_est["usd"] > metered_est["usd"]
+
+
 def test_a_record_page_is_estimated_on_its_own_output_ceiling():
     """A record page is capped at 300-400 words; an entity page is not. One
     ceiling for both overstates a record page's output roughly fourfold."""
@@ -807,6 +1060,71 @@ def test_the_refusal_names_this_component_s_flag():
     )
     assert any("--confirm-spend" in line for line in out)
     assert not any("with --confirm " in line for line in out)
+
+
+def test_batch_refuses_oversized_subscription_items_before_children(monkeypatch):
+    import batch
+    import sys
+
+    model = "openai-subscription/gpt-5.6-luna"
+    monkeypatch.setattr(
+        a, "assert_openai_subscription_operationally_ready", lambda: None
+    )
+    monkeypatch.setattr(batch, "estimate", lambda *args: (["large"], []))
+    monkeypatch.setattr(batch, "_check_suspect_names", lambda *args: {})
+    monkeypatch.setattr(batch, "_check_model_policy", lambda *args: None)
+    monkeypatch.setattr(
+        batch,
+        "_subscription_oversized",
+        lambda *args: {"large": "about 300,000 tokens"},
+    )
+    monkeypatch.setattr(
+        batch,
+        "generate",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("oversized item reached a child process")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch.py", "--briefs", "large", "--model", model, "--confirm"],
+    )
+
+    assert batch.main() == 2
+
+
+def test_batch_brief_preflight_refreshes_related_slugs_like_the_child(monkeypatch):
+    import batch
+    from types import SimpleNamespace
+
+    brief = {"page": {}}
+    original = [{"name": "Related", "slug": "old"}]
+    refreshed = [{"name": "Related", "slug": "current"}]
+    monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "page"))
+    monkeypatch.setattr(a, "brief_node", lambda value: {"id": "node"})
+    monkeypatch.setattr(a, "claims_from_brief", lambda value: [])
+    monkeypatch.setattr(a, "related_from_brief", lambda value: original)
+    monkeypatch.setattr(
+        a,
+        "refresh_related_slugs",
+        lambda related, db: refreshed if db == "graph.db" else related,
+    )
+
+    loaded = batch._load(
+        SimpleNamespace(briefs_root="briefs", db="graph.db"), "briefs", "page"
+    )
+    assert loaded[2] == refreshed
+
+
+def test_batch_checks_model_policy_before_subscription_readiness():
+    import batch
+    import inspect
+
+    source = inspect.getsource(batch.main)
+    assert source.index("why = _check_model_policy(args.model)") < source.index(
+        "asm.assert_openai_subscription_operationally_ready()"
+    )
 
 
 def _orphan_fixture(tmp_path):
@@ -1614,6 +1932,16 @@ def test_model_policy_permits_the_stage_models():
     assert batch._check_model_policy("openai/gpt-5.6-sol") is None
 
 
+def test_subscription_models_are_explicit_candidates_not_defaults():
+    from anomalica_common import model_policy as mp
+
+    policy = mp.load(reload=True)
+    candidate = "openai-subscription/gpt-5.6-sol"
+    assert policy.refusal("assemble", candidate) is None
+    assert candidate not in policy.priority("assemble")
+    assert policy.choose("assemble") == "openai/gpt-5.6-sol"
+
+
 def test_default_model_comes_from_the_policy_not_a_constant():
     """ADR 0047: the priority list for assemble decides what writes a page. A
     constant "sonnet" sat here while the policy refused it."""
@@ -1654,7 +1982,7 @@ def test_dispatch_fails_closed_when_the_policy_cannot_be_read(monkeypatch):
     import pytest
 
     monkeypatch.setattr(
-        mp, "load", lambda *a, **k: (_ for _ in ()).throw(OSError("gone"))
+        mp, "load_snapshot", lambda *a, **k: (_ for _ in ()).throw(OSError("gone"))
     )
     monkeypatch.setattr(a, "_call_openrouter", lambda *a, **k: "must not run")
     with pytest.raises(mp.PolicyRefusal):
@@ -1758,6 +2086,12 @@ def test_confirm_tail_never_calls_a_metered_run_the_subscription(monkeypatch):
     assert "METERED" in batch._confirm_tail("openai/gpt-5.6-sol")
     assert "subscription" not in batch._confirm_tail("openai/gpt-5.6-sol")
     assert "subscription" in batch._confirm_tail("sonnet")
+
+    monkeypatch.setenv("ASSEMBLER_USE_API", "1")
+    candidate = "openai-subscription/gpt-5.6-sol"
+    assert not a._uses_metered_route(candidate)
+    assert "subscription" in batch._confirm_tail(candidate)
+    assert "METERED" not in batch._confirm_tail(candidate)
 
 
 def test_check_orphans_reports_a_page_no_brief_owns(tmp_path, capsys):
