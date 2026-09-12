@@ -1810,7 +1810,13 @@ def enforce_model_policy(
     return model
 
 
-def call_claude(prompt: str, model: str = DEFAULT_MODEL, policy_snapshot=None) -> str:
+def call_claude(
+    prompt: str,
+    model: str = DEFAULT_MODEL,
+    policy_snapshot=None,
+    *,
+    target: str | None = None,
+) -> str:
     if is_openai_subscription_model(model) and policy_snapshot is None:
         from anomalica_common import model_policy as mp
 
@@ -1822,7 +1828,9 @@ def call_claude(prompt: str, model: str = DEFAULT_MODEL, policy_snapshot=None) -
     """Generate the article. Defaults to the Claude subscription via the CLI;
     set ASSEMBLER_USE_API=1 to route through the metered Anthropic API instead."""
     if is_openai_subscription_model(model):
-        return _call_openai_subscription(prompt, model, policy_snapshot=policy_snapshot)
+        return _call_openai_subscription(
+            prompt, model, policy_snapshot=policy_snapshot, target=target
+        )
     if is_openrouter_model(model):
         return _call_openrouter(prompt, model)
     return _call_api(prompt, model) if _use_api() else _call_cli(prompt, model)
@@ -1913,29 +1921,48 @@ def _call_cli(prompt: str, model: str = DEFAULT_MODEL) -> str:
     return wrapper.get("result", proc.stdout)
 
 
-def _call_openai_subscription(prompt: str, model: str, policy_snapshot=None) -> str:
+def _call_openai_subscription(
+    prompt: str, model: str, policy_snapshot=None, *, target: str | None = None
+) -> str:
     """Generate through OpenCode's authenticated OpenAI subscription route."""
-    from anomalica_common.llm import ledger
+    from anomalica_common.llm import ai_ledger, ledger
 
     assert_openai_subscription_operationally_ready()
     payload = f"{_SYSTEM_PROMPT}\n\n{prompt}"
+    ledger.set_context(type="assemble", body_chars=len(payload), source="direct")
+    before = len(get_usage_trace())
+    attribution = ai_ledger.Attribution(
+        component="assembler", operation="assemble", target=target or ""
+    )
+    result = (
+        _call_opencode(
+            payload,
+            "",
+            model,
+            attribution=attribution,
+            _policy_snapshot=policy_snapshot,
+        )
+        if policy_snapshot is not None
+        else _call_opencode(payload, "", model, attribution=attribution)
+    )
+    # The canonical transport has now proved that the observed executable and
+    # config match this exact policy snapshot. Do not probe either before its
+    # write-ahead reservation: a qualification refusal is itself a ledger row.
     from anomalica_common.llm.transport import _OPENCODE_CONFIG, _opencode_version
 
+    version = (
+        policy_snapshot.policy.input_reserve_qualification(model)["transport_version"]
+        if policy_snapshot is not None
+        else _opencode_version()
+    )
     _record_execution_identity(
         logical_user_prompt=prompt,
         submitted_payload=payload,
         system_prompt_role="user-prefix",
         implementation="opencode",
-        version=_opencode_version(),
+        version=version,
         config=_OPENCODE_CONFIG,
         scaffold="opaque",
-    )
-    ledger.set_context(type="assemble", body_chars=len(payload), source="direct")
-    before = len(get_usage_trace())
-    result = (
-        _call_opencode(payload, "", model, _policy_snapshot=policy_snapshot)
-        if policy_snapshot is not None
-        else _call_opencode(payload, "", model)
     )
     trace = get_usage_trace()
     usage = trace[-1] if len(trace) > before else None
@@ -4294,6 +4321,7 @@ def main() -> int:
                 attempt_prompt,
                 model=args.model,
                 policy_snapshot=policy_snapshot,
+                target=slug,
             )
         except OpenAISubscriptionInputTooLarge as exc:
             note_run_failure()

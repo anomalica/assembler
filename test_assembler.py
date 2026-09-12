@@ -707,8 +707,10 @@ def test_candidate_uses_one_policy_snapshot_across_eligibility_and_transport(
 ):
     import hashlib
     import json
+    import sqlite3
+    import pytest
     from anomalica_common import model_policy as mp
-    from anomalica_common.llm import transport
+    from anomalica_common.llm import ai_ledger, transport
 
     model = "openai-subscription/gpt-5.6-luna"
     config_hash = hashlib.sha256(transport._OPENCODE_CONFIG.read_bytes()).hexdigest()
@@ -770,11 +772,82 @@ def test_candidate_uses_one_policy_snapshot_across_eligibility_and_transport(
         transport, "_assert_openai_subscription_oauth", lambda auth_path: None
     )
     monkeypatch.setattr(transport.subprocess, "run", lambda *args, **kwargs: Proc())
+    ledger_db = tmp_path / "ai-ledger.db"
+    monkeypatch.setenv("ANOMALICA_LEDGER_DB", str(ledger_db))
     transport.reset_usage()
     a._reset_usage()
 
-    assert a.call_claude("prompt", model=model) == "article"
+    assert a.call_claude("prompt", model=model, target="test-topic") == "article"
     assert len(loads) == 1, "transport must retain the eligibility snapshot"
+    with sqlite3.connect(ledger_db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute("SELECT * FROM attempts")]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["schema_version"] == ai_ledger.SCHEMA_VERSION
+    assert (row["component"], row["operation"], row["target"]) == (
+        "assembler",
+        "assemble",
+        "test-topic",
+    )
+    assert (row["transport"], row["transport_implementation"], row["model_id"]) == (
+        "openai-subscription",
+        "opencode",
+        model,
+    )
+    assert (row["qualification_status"], row["provider_started"], row["outcome"]) == (
+        "passed",
+        1,
+        "ok",
+    )
+    assert (row["tokens_in"], row["tokens_out"]) == (1, 1)
+    payload = f"{a._SYSTEM_PROMPT}\n\nprompt".encode()
+    assert row["submitted_payload_bytes"] == len(payload)
+    assert row["submitted_payload_sha256"] == hashlib.sha256(payload).hexdigest()
+
+    class FailedProc:
+        returncode = 1
+        stderr = "provider failed"
+        stdout = ""
+
+    monkeypatch.setattr(
+        transport.subprocess, "run", lambda *args, **kwargs: FailedProc()
+    )
+    with pytest.raises(RuntimeError, match="provider failed"):
+        a.call_claude(
+            "retry prompt",
+            model=model,
+            policy_snapshot=original,
+            target="test-topic",
+        )
+    with sqlite3.connect(ledger_db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM attempts ORDER BY timestamp_start")
+        ]
+    assert len(rows) == 2, "each provider invocation is a separate terminal attempt"
+    failed = rows[1]
+    assert (failed["component"], failed["operation"], failed["target"]) == (
+        "assembler",
+        "assemble",
+        "test-topic",
+    )
+    assert (
+        failed["transport"],
+        failed["transport_implementation"],
+        failed["model_id"],
+    ) == ("openai-subscription", "opencode", model)
+    assert (
+        failed["qualification_status"],
+        failed["provider_started"],
+        failed["outcome"],
+    ) == ("passed", 1, "error")
+    retry_payload = f"{a._SYSTEM_PROMPT}\n\nretry prompt".encode()
+    assert (
+        failed["submitted_payload_sha256"] == hashlib.sha256(retry_payload).hexdigest()
+    )
+    assert failed["submitted_payload_sha256"] != row["submitted_payload_sha256"]
 
 
 def test_default_metered_built_by_route_remains_explicit_openrouter():
@@ -808,11 +881,22 @@ def test_openai_subscription_usage_reaches_article_provenance(monkeypatch):
     monkeypatch.setattr(
         a, "assert_openai_subscription_operationally_ready", lambda: None
     )
-    monkeypatch.setattr(a, "_call_opencode", lambda *args: "article")
+    attributions = []
+
+    def opencode(*args, **kwargs):
+        attributions.append(kwargs["attribution"])
+        return "article"
+
+    monkeypatch.setattr(a, "_call_opencode", opencode)
     monkeypatch.setattr(transport, "_opencode_version", lambda: "1.18.30")
     a._reset_usage()
 
-    assert a._call_openai_subscription("prompt", model) == "article"
+    assert (
+        a._call_openai_subscription("prompt", model, target="test-topic") == "article"
+    )
+    assert attributions == [
+        transport.ai_ledger.Attribution("assembler", "assemble", "test-topic")
+    ]
     entry = a.usage_entry("assemble", model, a._get_usage())
     assert entry["model"] == model
     assert entry["route"] == "openai-subscription"
@@ -847,7 +931,7 @@ def test_openai_subscription_throttle_stays_distinct(monkeypatch):
     from anomalica_common.llm import OpencodeRateLimited
     import pytest
 
-    def throttled(*_args):
+    def throttled(*_args, **_kwargs):
         raise OpencodeRateLimited("quota")
 
     monkeypatch.setattr(
@@ -855,7 +939,9 @@ def test_openai_subscription_throttle_stays_distinct(monkeypatch):
     )
     monkeypatch.setattr(a, "_call_opencode", throttled)
     with pytest.raises(OpencodeRateLimited):
-        a._call_openai_subscription("prompt", "openai-subscription/gpt-5.6-luna")
+        a._call_openai_subscription(
+            "prompt", "openai-subscription/gpt-5.6-luna", target="test-topic"
+        )
 
 
 def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
@@ -887,14 +973,18 @@ def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
     )
     ledger.clear_context()
     failures = []
+    targets = []
     monkeypatch.setattr(a, "note_run_failure", lambda: failures.append(True))
     monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "test-topic"))
+
+    def throttled(*args, **kwargs):
+        targets.append(kwargs.get("target"))
+        raise a.OpencodeRateLimited("allowance exhausted")
+
     monkeypatch.setattr(
         a,
         "call_claude",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            a.OpencodeRateLimited("allowance exhausted")
-        ),
+        throttled,
     )
     monkeypatch.setattr(
         sys,
@@ -913,18 +1003,30 @@ def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
     assert a.main() == a._EXIT_PLAN_RATE_LIMITED
     assert a._PLAN_LIMIT_MARKER in capsys.readouterr().err
     assert ledger._context["ref"] == "test-topic"
+    assert targets == ["test-topic"]
     assert failures
 
 
-def test_direct_subscription_helper_blocks_before_observing_opencode(monkeypatch):
-    from anomalica_common.llm import transport
+def test_direct_subscription_helper_blocks_before_provider_when_ledger_unavailable(
+    monkeypatch, tmp_path
+):
+    from anomalica_common.llm import ai_ledger, transport
     import pytest
 
     observed = []
-    monkeypatch.setattr(transport, "_opencode_version", lambda: observed.append(True))
+    unavailable_parent = tmp_path / "not-a-directory"
+    unavailable_parent.write_text("file")
+    monkeypatch.setenv("ANOMALICA_LEDGER_DB", str(unavailable_parent / "ai-ledger.db"))
+    monkeypatch.setattr(
+        transport.subprocess, "run", lambda *args, **kwargs: observed.append(True)
+    )
     with pytest.raises(a.OpenAISubscriptionOperationallyUnavailable):
-        a._call_openai_subscription("prompt", "openai-subscription/gpt-5.6-luna")
+        a._call_openai_subscription(
+            "prompt", "openai-subscription/gpt-5.6-luna", target="test-topic"
+        )
     assert not observed
+    with pytest.raises(ai_ledger.LedgerError):
+        ai_ledger.assert_ready()
 
 
 def test_openrouter_refuses_without_a_key(monkeypatch):
