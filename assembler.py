@@ -1019,10 +1019,11 @@ def related_from_brief(brief: dict) -> list[dict]:
 
 
 def built_from_block(brief: dict) -> dict:
-    """The article-level audit field: the brief's brief_hash + the ORDERED list of
+    """The article-level audit field: both brief hashes + the ORDERED list of
     {id, hash} the brief contained. Copied verbatim - the assembler computes no
-    hash (single source: assimilator owns claim_hash, synthesiser owns brief_hash).
-    Lets staleness detection diff a page's built brief against a rebuilt one.
+    hash (single source: assimilator owns claim_hash; synthesiser owns brief_hash
+    and payload_hash). Lets staleness detection diff a page's built brief against
+    a rebuilt one, including writer context outside the stable claim identities.
 
     Records the node's FULL claim count alongside the brief's when the two differ.
     A brief is capped, so the largest entities are written from a fraction of what
@@ -1035,6 +1036,7 @@ def built_from_block(brief: dict) -> dict:
     page = brief.get("page") or {}
     block = {
         "brief_hash": brief.get("brief_hash"),
+        "payload_hash": brief.get("payload_hash"),
         "claims": [
             {"id": c.get("claim_id"), "hash": c.get("claim_hash")} for c in claims
         ],
@@ -4154,11 +4156,13 @@ def main() -> int:
             print(f"brief not found: {args.brief!r}", file=sys.stderr)
             return 2
         brief, _slug = loaded
-        if not brief.get("brief_hash") or any(
-            not c.get("claim_hash") for c in brief.get("claims") or []
+        if (
+            not brief.get("brief_hash")
+            or not brief.get("payload_hash")
+            or any(not c.get("claim_hash") for c in brief.get("claims") or [])
         ):
             print(
-                f"brief {args.brief!r} missing brief_hash or a claim_hash - "
+                f"brief {args.brief!r} missing brief_hash, payload_hash, or a claim_hash - "
                 "refusing to write a page with a broken built_from audit field",
                 file=sys.stderr,
             )

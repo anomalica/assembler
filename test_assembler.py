@@ -952,6 +952,7 @@ def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
 
     brief = {
         "brief_hash": "brief-hash",
+        "payload_hash": "payload-hash",
         "page": {
             "node_id": "node-1",
             "node_type": "topic",
@@ -2404,6 +2405,7 @@ def test_built_from_records_a_capped_brief():
     carries no trace of what it did not see."""
     brief = {
         "brief_hash": "h",
+        "payload_hash": "p",
         "page": {"claim_count": 2, "claim_count_total": 2457},
         "claims": [
             {"claim_id": "a", "claim_hash": "1"},
@@ -2411,6 +2413,8 @@ def test_built_from_records_a_capped_brief():
         ],
     }
     block = a.built_from_block(brief)
+    assert block["brief_hash"] == "h"
+    assert block["payload_hash"] == "p"
     assert block["claims_available"] == 2457
     assert block["claims_used"] == 2
 
@@ -2420,10 +2424,45 @@ def test_built_from_stays_quiet_when_nothing_was_dropped():
     equality on all of them would be noise in every page's front matter."""
     brief = {
         "brief_hash": "h",
+        "payload_hash": "p",
         "page": {"claim_count": 1, "claim_count_total": 1},
         "claims": [{"claim_id": "a", "claim_hash": "1"}],
     }
     assert "claims_available" not in a.built_from_block(brief)
+
+
+def test_brief_without_payload_hash_cannot_produce_an_unbound_article(
+    monkeypatch, tmp_path, capsys
+):
+    import sys
+
+    brief = {
+        "brief_hash": "selection-hash",
+        "claims": [{"claim_id": "a", "claim_hash": "1"}],
+    }
+    monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
+    monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "page"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "assembler.py",
+            "--brief",
+            "topics/page",
+            "--briefs-root",
+            str(tmp_path),
+            "--content-root",
+            str(tmp_path),
+            "--model",
+            "test-model",
+        ],
+    )
+
+    assert a.main() == 2
+    assert (
+        "missing brief_hash, payload_hash, or a claim_hash" in capsys.readouterr().err
+    )
 
 
 def test_model_policy_refuses_claude_for_reader_facing_prose():
