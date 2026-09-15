@@ -896,6 +896,68 @@ def brief_node(brief: dict) -> dict:
     }
 
 
+def brief_validation_error(brief: object, reference: str) -> str | None:
+    """Return why a brief cannot be the writer's complete immutable input."""
+    if not isinstance(brief, dict):
+        return "document is not a mapping"
+    if brief.get("schema") != "anomalica/brief/2":
+        return "schema is not anomalica/brief/2"
+    for field in ("brief_hash", "payload_hash"):
+        if not isinstance(brief.get(field), str) or not brief[field]:
+            return f"missing {field}"
+    page = brief.get("page")
+    if not isinstance(page, dict):
+        return "missing page"
+    for field in ("kind", "title", "slug", "node_type"):
+        if not isinstance(page.get(field), str) or not page[field]:
+            return f"missing page.{field}"
+    if page["kind"] != "entity":
+        return f"unsupported page.kind {page['kind']!r}"
+    nodes = page.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return "page.nodes must be a non-empty list"
+    for index, member in enumerate(nodes):
+        if not isinstance(member, dict):
+            return f"page.nodes[{index}] is not a mapping"
+        for field in ("node_id", "name", "node_type"):
+            if not isinstance(member.get(field), str) or not member[field]:
+                return f"missing page.nodes[{index}].{field}"
+    generated = brief.get("generated")
+    if (
+        not isinstance(generated, dict)
+        or not isinstance(generated.get("graph_version"), str)
+        or not generated["graph_version"]
+    ):
+        return "missing generated.graph_version"
+    claims = brief.get("claims")
+    if not isinstance(claims, list):
+        return "claims must be a list"
+    for index, claim in enumerate(claims):
+        if not isinstance(claim, dict):
+            return f"claims[{index}] is not a mapping"
+        for field in ("claim_id", "claim_hash", "content"):
+            if not isinstance(claim.get(field), str) or not claim[field]:
+                return f"missing claims[{index}].{field}"
+    related = brief.get("related_nodes", [])
+    if not isinstance(related, list):
+        return "related_nodes must be a list"
+    for index, node in enumerate(related):
+        if not isinstance(node, dict):
+            return f"related_nodes[{index}] is not a mapping"
+        for field in ("node_id", "title", "node_type", "slug"):
+            if not isinstance(node.get(field), str) or not node[field]:
+                return f"missing related_nodes[{index}].{field}"
+
+    parts = reference.split("/")
+    if parts[-1] != page["slug"]:
+        return f"brief reference slug {parts[-1]!r} does not match page.slug"
+    if len(parts) == 2:
+        expected = SECTION_BY_TYPE.get(page["node_type"], page["node_type"] + "s")
+        if parts[0] != expected:
+            return f"brief reference section {parts[0]!r} does not match page.node_type"
+    return None
+
+
 # yamlfmt's `retain_line_breaks` sentinel. The shared commit hook writes it INTO
 # string values, so a brief's excerpt arrives with the marker where a newline was;
 # a long value also loses everything after the break. Stripped on the way in, not
@@ -956,54 +1018,6 @@ def claims_from_brief(brief: dict) -> list[dict]:
     # real measurement (distinct provenance-chain roots across the corroboration
     # group, so ten outlets on one press release count as one); evidence.score is
     # the neutral placeholder, and the two must not be confused.
-    return out
-
-
-def refresh_related_slugs(related: list[dict], db_path: str | None) -> list[dict]:
-    """Re-resolve each linkable entity's slug from the LIVE graph, by node id.
-
-    A brief freezes slugs at synthesise time and the graph moves underneath it -
-    three times in one evening during the link-value run, each move silently
-    invalidating the cross-links of every page built before it. ADR 0036 makes the
-    brief the sole source for CLAIMS, which is about not inventing facts; what an
-    entity is currently CALLED is not a fact the brief owns, and resolving it
-    invents nothing.
-
-    Matched on node_id rather than name, so a rename is followed rather than
-    guessed. A node that no longer exists live - merged away or retired - is
-    dropped from the linkable set: it has no page to link to, and its slug would
-    resolve to nothing.
-    """
-    if not db_path or not related or not Path(db_path).is_file():
-        return related
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        live = {
-            row[0]: (row[1], row[2])
-            for row in conn.execute(
-                "SELECT id, name, node_type FROM nodes WHERE retired_at IS NULL"
-            )
-        }
-        conn.close()
-    except sqlite3.Error:
-        return related  # a graph we cannot read is not a reason to write nothing
-    out: list[dict] = []
-    dropped = 0
-    for r in related:
-        node_id = r.get("id")
-        if node_id and node_id in live:
-            name, node_type = live[node_id]
-            out.append({**r, "name": name, "type": node_type, "metadata": None})
-        elif node_id:
-            dropped += 1  # merged away or retired - no page exists
-        else:
-            out.append(r)
-    if dropped:
-        print(
-            f"  {dropped} linkable entit{'y' if dropped == 1 else 'ies'} dropped "
-            "(merged away since the brief was built)",
-            file=sys.stderr,
-        )
     return out
 
 
@@ -2905,6 +2919,30 @@ def build_link_index(
     return {"exact": exact, "by_slug": by_slug, "stems": stems, "by_text": by_text}
 
 
+def build_brief_link_index(related: list[dict]) -> dict:
+    """Link resolver containing only the frozen candidates in one brief."""
+    exact: set[str] = set()
+    by_slug: dict[str, set[str]] = {}
+    stems: dict[str, str] = {}
+    by_text: dict[str, str] = {}
+    for node in related:
+        title = node.get("name")
+        slug = node_slug(node)
+        node_type = node.get("type")
+        if not title or not slug or not node_type or is_described_speaker(title):
+            continue
+        section = SECTION_BY_TYPE.get(node_type, node_type + "s")
+        path = f"/{section}/{slug}"
+        exact.add(path)
+        by_slug.setdefault(slug, set()).add(section)
+        by_text.setdefault(slug.replace("-", " "), path)
+        by_text.setdefault(slugify(_display_name(title)).replace("-", " "), path)
+        match = _ACRONYM_TITLE_RE.match(title)
+        if match and match.group(1):
+            stems.setdefault(slugify(match.group(1)), path)
+    return {"exact": exact, "by_slug": by_slug, "stems": stems, "by_text": by_text}
+
+
 def cached_link_index(
     briefs_root: Path | None,
     content_root: Path | None,
@@ -4219,12 +4257,15 @@ def main() -> int:
     # global ANOMALICA_USE_API, and this component resolves ASSEMBLER_USE_API.
     # An OpenRouter model is metered too, so the gate must fire for it - the
     # toggle alone would let a provider-qualified model spend unchecked.
-    # Built once, before any render: body links are resolved against the proposal
-    # set rather than files on disk, so the same brief yields the same article
-    # whether it is assembled first or ninetieth in a batch.
-    set_ingests_root(Path(args.ingests_root) if args.ingests_root else None)
+    # Brief mode replaces these process-local readers after loading its exact
+    # payload. Transitional modes still use the corpus-wide indexes they own.
+    set_ingests_root(
+        None if args.brief or not args.ingests_root else Path(args.ingests_root)
+    )
     set_link_index(
-        cached_link_index(
+        None
+        if args.brief
+        else cached_link_index(
             Path(args.briefs_root) if args.briefs_root else None,
             Path(args.content_root),
             args.link_min_claims,
@@ -4240,20 +4281,17 @@ def main() -> int:
             print(f"brief not found: {args.brief!r}", file=sys.stderr)
             return 2
         brief, _slug = loaded
-        if (
-            not brief.get("brief_hash")
-            or not brief.get("payload_hash")
-            or any(not c.get("claim_hash") for c in brief.get("claims") or [])
-        ):
+        invalid = brief_validation_error(brief, _slug)
+        if invalid:
             print(
-                f"brief {args.brief!r} missing brief_hash, payload_hash, or a claim_hash - "
-                "refusing to write a page with a broken built_from audit field",
+                f"invalid brief {args.brief!r}: {invalid}; refusing to assemble",
                 file=sys.stderr,
             )
             return 2
         node = brief_node(brief)
         claims = claims_from_brief(brief)
-        related = refresh_related_slugs(related_from_brief(brief), args.db)
+        related = related_from_brief(brief)
+        set_link_index(build_brief_link_index(related))
     elif args.record:
         loaded = load_digest(Path(args.digests_root), args.record)
         if not loaded:
@@ -4521,7 +4559,7 @@ def main() -> int:
             fm,
             body,
             claims=claims,
-            content_root=Path(args.content_root),
+            content_root=None,
             built_from=built_from_block(brief),
             person=(brief.get("page") or {}).get("node_type") == "person",
             place=(brief.get("page") or {}).get("node_type") == "place",
@@ -4556,7 +4594,13 @@ def main() -> int:
     if digest is None:
         article = carry_metadata(article, existing_metadata(out))
     article = stamp_aliases(
-        article, slug_aliases(node, section, args.db, Path(args.content_root))
+        article,
+        slug_aliases(
+            node,
+            section,
+            None if brief is not None else args.db,
+            None if brief is not None else Path(args.content_root),
+        ),
     )
     article = stamp_built_by(
         article, built_by_block(assemble_entry, prompt, directives)

@@ -236,11 +236,10 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     inferred from a redaction step that turned out to be a regression, not read
     from the policy.
 
-    NOT CURRENT: a brief whose node has been retired, or which sits at a slug the
-    node has since moved off. The first publishes a page for something that no
-    longer exists; the second publishes a SECOND page for a live entity, which is
-    how one person ends up with two articles. Derived from the graph rather than
-    a list of filenames, so it stays true as nodes merge and rename.
+    NOT CURRENT: two published briefs covering the same node would publish two
+    pages for one entity. Retirement, veto and supersession are producer gates:
+    the writer consumes the published brief set and must not reinterpret it from
+    a newer graph state than the payload it is about to bind.
 
     Refused rather than warned: a CDN leak is not reversible, and a duplicate
     entity page is invisible until someone notices two of them.
@@ -248,50 +247,19 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
     if kind != "briefs":
         return {}, []
     root = Path(args.briefs_root).expanduser()
-    nodes, by_node, vetoed, superseded = {}, {}, {}, {}
+    by_node: dict[str, list[str]] = {}
     pages: dict[str, dict] = {}
     pubs: dict[str, dict] = {}
-    try:
-        conn = sqlite3.connect(f"file:{Path(args.db).expanduser()}?mode=ro", uri=True)
-        nodes = {
-            r[0]: r for r in conn.execute("SELECT id, name, retired_at FROM nodes")
-        }
-        try:
-            vetoed = {
-                r[0]: r[1]
-                for r in conn.execute(
-                    "SELECT node_id, veto_id FROM page_vetoes WHERE undone_at IS NULL"
-                )
-            }
-        except sqlite3.Error:
-            vetoed = {}
-        try:
-            # A composed page supersedes its members' pages, and the member
-            # briefs deliberately stand until the composed article is built - so
-            # for that window both name the same nodes. That is the transition
-            # working, not two pages for one entity, and the ledger tells them
-            # apart.
-            superseded = {
-                f"{r[0]}/{r[1]}": r[2]
-                for r in conn.execute(
-                    "SELECT section, slug, reason FROM superseded_pages"
-                )
-            }
-        except sqlite3.Error:
-            superseded = {}
-        # One walk, and keep what it read. The workbench's brief index went 0.4s
-        # to 4s when two passes each rebuilt it over 805 files; this loop already
-        # visits every brief, so re-reading an item's brief afterwards is pure
-        # waste that grows with the corpus.
-        for bf in asm.brief_files(root):
-            ref = asm.brief_ref(root, bf)
-            blocks = _brief_blocks(bf, ("page", "publication"))
-            pages[ref] = blocks["page"]
-            pubs[ref] = blocks["publication"]
-            for m in asm.covered_nodes(pages[ref]):
-                by_node.setdefault(m["node_id"], []).append(ref)
-    except sqlite3.Error:
-        nodes = {}  # no graph: fall back to the publication check alone
+    # One walk, and keep what it read. Published brief bytes are authoritative;
+    # opening the live graph here would make dispatch depend on a different input
+    # from the one the assembler records in built_from.
+    for bf in asm.brief_files(root):
+        ref = asm.brief_ref(root, bf)
+        blocks = _brief_blocks(bf, ("page", "publication"))
+        pages[ref] = blocks["page"]
+        pubs[ref] = blocks["publication"]
+        for member in asm.covered_nodes(pages[ref]):
+            by_node.setdefault(member["node_id"], []).append(ref)
 
     gone = _gone_urls(getattr(args, "site_root", None))
     refuse, stale = {}, []
@@ -327,50 +295,17 @@ def _check_publication(args, kind: str, items: list[str]) -> tuple[dict, list]:
         if status and status not in _PUBLISHED_STATUSES:
             stale.append(f"{item} (unrecognised publication.status: {status})")
         members = asm.covered_nodes(page)
-        # Every member gates the page: one retired or vetoed node is enough.
-        nid = next((m["node_id"] for m in members if m["node_id"] in vetoed), None)
-        if nid is None:
-            nid = next(
-                (
-                    m["node_id"]
-                    for m in members
-                    if nodes and nodes.get(m["node_id"]) and nodes[m["node_id"]][2]
-                ),
-                None,
-            )
-        if nid is None:
-            nid = next(
-                (m["node_id"] for m in members if nodes and m["node_id"] not in nodes),
-                None,
-            )
-        if nid is None:
-            nid = members[0]["node_id"] if members else None
-        row = nodes.get(nid) if nodes else None
-        if nid in vetoed:
-            # A veto is a reviewer's "this node should not have a page". Without
-            # this, retiring the page and then running a batch rebuilds it from
-            # the brief that is still on disk - silently undoing the decision,
-            # and spending metered money to do it.
-            refuse[item] = (
-                f"the workbench has vetoed a page for its node (veto {vetoed[nid]})"
-            )
-        elif nodes and nid and row is None:
-            refuse[item] = "its node is not in the graph"
-        elif row is not None and row[2]:
-            refuse[item] = f"its node was retired {row[2]}"
-        elif item in superseded:
-            refuse[item] = (
-                f"superseded - {superseded[item]}; build the page that replaced it"
-            )
-        elif nid and len(by_node.get(nid, [])) > 1:
-            # Members this brief supersedes do not count: during a composition
-            # the member briefs stand until the composed article exists, and
-            # both name the same nodes on purpose.
-            others = [o for o in by_node[nid] if o != item and o not in superseded]
-            if others:
-                refuse[item] = (
-                    f"stale slug - the same node is also briefed as {others[0]}"
-                )
+        duplicate = next(
+            (
+                other
+                for member in members
+                for other in by_node.get(member["node_id"], [])
+                if other != item
+            ),
+            None,
+        )
+        if duplicate:
+            refuse[item] = f"stale slug - the same node is also briefed as {duplicate}"
         elif not status:
             stale.append(item)
     return refuse, stale
@@ -397,11 +332,10 @@ def _load(args, kind: str, item: str):
         if not loaded:
             return None
         brief, _slug = loaded
-        related = asm.refresh_related_slugs(asm.related_from_brief(brief), args.db)
         return (
             asm.brief_node(brief),
             asm.claims_from_brief(brief),
-            related,
+            asm.related_from_brief(brief),
         )
     loaded = asm.load_digest(Path(args.digests_root), item)
     if not loaded:

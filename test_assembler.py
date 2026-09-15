@@ -480,22 +480,40 @@ def test_output_path_cannot_escape_pages(tmp_path):
         a.output_path(tmp_path, "events", "same")
 
 
+def _valid_assembly_brief(slug="subject"):
+    return {
+        "schema": "anomalica/brief/2",
+        "brief_hash": "brief-hash",
+        "payload_hash": "payload-hash",
+        "page": {
+            "kind": "entity",
+            "node_type": "topic",
+            "title": "Subject",
+            "slug": slug,
+            "nodes": [
+                {"node_id": "node-1", "name": "Earlier Subject", "node_type": "topic"}
+            ],
+        },
+        "generated": {"graph_version": "graph-version"},
+        "claims": [
+            {
+                "claim_id": "claim-1",
+                "claim_hash": "claim-hash",
+                "content": "A grounded claim.",
+            }
+        ],
+        "related_nodes": [],
+    }
+
+
 def test_brief_cli_passes_exact_multilingual_identity_to_prompt(
     monkeypatch, tmp_path, capsys
 ):
     import sys
 
-    brief = {
-        "brief_hash": "brief-hash",
-        "payload_hash": "payload-hash",
-        "page": {
-            "node_id": "node-1",
-            "node_type": "topic",
-            "title": "Subject",
-            "slug": "payload-slug-must-not-win",
-        },
-        "claims": [{"claim_id": "claim-1", "claim_hash": "claim-hash"}],
-    }
+    brief = _valid_assembly_brief("filename-slug")
+    brief["page"]["node_type"] = "event"
+    brief["page"]["nodes"][0]["node_type"] = "event"
     seen = {}
     monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
     monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
@@ -568,40 +586,140 @@ def test_non_english_prompt_uses_the_exact_language_tag():
     assert "British English throughout" not in prompt
 
 
-def test_related_slugs_follow_a_rename(tmp_path):
-    """A brief freezes slugs at synthesise time; the graph moved three times in one
-    evening. Matched on node id, so a rename is followed rather than guessed."""
-    import sqlite3
+def test_required_brief_writer_fields_fail_closed():
+    cases = (
+        ("schema", lambda brief: brief.pop("schema")),
+        ("page.title", lambda brief: brief["page"].pop("title")),
+        ("page.nodes", lambda brief: brief["page"].pop("nodes")),
+        (
+            "page.nodes[0].name",
+            lambda brief: brief["page"]["nodes"][0].pop("name"),
+        ),
+        ("generated.graph_version", lambda brief: brief.pop("generated")),
+        ("claims[0].content", lambda brief: brief["claims"][0].pop("content")),
+        (
+            "related_nodes[0].slug",
+            lambda brief: brief["related_nodes"][0].pop("slug"),
+        ),
+    )
+    for expected, mutate in cases:
+        brief = _valid_assembly_brief()
+        brief["related_nodes"] = [
+            {
+                "node_id": "related",
+                "title": "Related",
+                "node_type": "topic",
+                "slug": "related",
+            }
+        ]
+        mutate(brief)
+        assert expected in (a.brief_validation_error(brief, "subject") or "")
 
-    db = tmp_path / "g.db"
+    mismatch = _valid_assembly_brief()
+    assert "does not match page.slug" in a.brief_validation_error(mismatch, "other")
+
+
+def test_graph_mutation_cannot_change_bound_prompt_links_or_aliases(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+    import sys
+
+    brief = _valid_assembly_brief()
+    brief["related_nodes"] = [
+        {
+            "node_id": "related",
+            "node_type": "topic",
+            "title": "Frozen related title",
+            "slug": "frozen-related-slug",
+        }
+    ]
+    content = tmp_path / "content"
+    db = tmp_path / "graph.db"
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE nodes (id TEXT, name TEXT, node_type TEXT, retired_at TEXT)"
     )
-    conn.execute("INSERT INTO nodes VALUES ('n1','alien abduction','topic',NULL)")
-    conn.execute("INSERT INTO nodes VALUES ('n2','Gone','topic','2026-08-22')")
+    conn.execute("CREATE TABLE aliases (alias TEXT, node_id TEXT)")
+    conn.execute("INSERT INTO nodes VALUES ('node-1', 'Live subject', 'topic', NULL)")
+    conn.execute("INSERT INTO nodes VALUES ('related', 'Live related', 'topic', NULL)")
+    conn.execute("INSERT INTO aliases VALUES ('First live alias', 'node-1')")
     conn.commit()
     conn.close()
-    related = [
-        {
-            "id": "n1",
-            "name": "alien abduction phenomenon",
-            "type": "topic",
-            "metadata": {"explicit_slug": "alien-abduction-phenomenon"},
+    graph_connect = sqlite3.connect
+    monkeypatch.setattr(
+        a.sqlite3,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("brief assembly opened the live graph")
+        ),
+    )
+
+    prompts = []
+    monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "subject"))
+    monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(a, "_uses_metered_route", lambda *args: False)
+    monkeypatch.setattr(
+        a,
+        "call_claude",
+        lambda prompt, *args, **kwargs: prompts.append(prompt) or "raw",
+    )
+    monkeypatch.setattr(
+        a,
+        "validate_article",
+        lambda response: (
+            {"title": "Subject", "description": "Description", "references": []},
+            "Stable [related link](/topics/frozen-related-slug).",
+        ),
+    )
+    monkeypatch.setattr(
+        a,
+        "usage_entry",
+        lambda *args, **kwargs: {
+            "model": "test-model",
+            "model_version": "test-version",
+            "route": "subscription",
+            "tokens": {},
         },
-        {"id": "n2", "name": "Gone", "type": "topic", "metadata": None},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "assembler.py",
+            "--brief",
+            "subject",
+            "--content-root",
+            str(content),
+            "--db",
+            str(db),
+            "--model",
+            "test-model",
+        ],
+    )
+
+    assert a.main() == 0
+    page = a.output_path(content, "topics", "subject")
+    first = page.read_text()
+    first_fm, first_body = a._split_article(first)
+    assert first_fm["aliases"] == [
+        "/topics/earlier-subject/",
+        "/en/topics/earlier-subject/",
     ]
-    out = a.refresh_related_slugs(related, str(db))
-    assert len(out) == 1, "a node merged away has no page and must be dropped"
-    assert out[0]["name"] == "alien abduction"
-    assert out[0]["metadata"] is None, "the frozen explicit_slug must not survive"
+    assert "/topics/frozen-related-slug" in first_body
+    assert "Frozen related title" in prompts[0]
+    assert "Live related" not in prompts[0]
 
+    conn = graph_connect(db)
+    conn.execute("UPDATE nodes SET name = 'Mutated related' WHERE id = 'related'")
+    conn.execute("DELETE FROM aliases")
+    conn.execute("INSERT INTO aliases VALUES ('Second live alias', 'node-1')")
+    conn.commit()
+    conn.close()
 
-def test_related_slugs_survive_an_unreadable_graph():
-    """A graph we cannot read is not a reason to write nothing."""
-    related = [{"id": "x", "name": "N", "type": "topic"}]
-    assert a.refresh_related_slugs(related, "/nonexistent/g.db") == related
-    assert a.refresh_related_slugs(related, None) == related
+    assert a.main() == 0
+    assert page.read_text() == first
+    assert prompts == [prompts[0], prompts[0]]
 
 
 def test_aliases_cover_a_type_change_not_just_a_rename(tmp_path, monkeypatch):
@@ -1101,25 +1219,8 @@ def test_openai_subscription_throttle_exits_with_the_batch_park_signal(
     import sys
     from anomalica_common.llm import ledger
 
-    brief = {
-        "brief_hash": "brief-hash",
-        "payload_hash": "payload-hash",
-        "page": {
-            "node_id": "node-1",
-            "node_type": "topic",
-            "title": "Test topic",
-            "slug": "test-topic",
-        },
-        "claims": [
-            {
-                "claim_id": "claim-1",
-                "claim_hash": "claim-hash",
-                "content": "A grounded claim.",
-                "claim_type": "observation",
-            }
-        ],
-    }
-    monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
+    brief = _valid_assembly_brief("test-topic")
+    brief["page"]["title"] = "Test topic"
     monkeypatch.setattr(
         a, "assert_openai_subscription_operationally_ready", lambda: None
     )
@@ -1760,27 +1861,21 @@ def test_batch_refuses_oversized_subscription_items_before_children(monkeypatch)
     assert batch.main() == 2
 
 
-def test_batch_brief_preflight_refreshes_related_slugs_like_the_child(monkeypatch):
+def test_batch_brief_preflight_uses_frozen_related_nodes(monkeypatch):
     import batch
     from types import SimpleNamespace
 
     brief = {"page": {}}
     original = [{"name": "Related", "slug": "old"}]
-    refreshed = [{"name": "Related", "slug": "current"}]
     monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "page"))
     monkeypatch.setattr(a, "brief_node", lambda value: {"id": "node"})
     monkeypatch.setattr(a, "claims_from_brief", lambda value: [])
     monkeypatch.setattr(a, "related_from_brief", lambda value: original)
-    monkeypatch.setattr(
-        a,
-        "refresh_related_slugs",
-        lambda related, db: refreshed if db == "graph.db" else related,
-    )
 
     loaded = batch._load(
         SimpleNamespace(briefs_root="briefs", db="graph.db"), "briefs", "page"
     )
-    assert loaded[2] == refreshed
+    assert loaded[2] == original
 
 
 def test_batch_checks_model_policy_before_subscription_readiness():
@@ -2502,15 +2597,22 @@ def test_preflight_surfaces_an_unrecognised_status(tmp_path):
     assert stale and "some-new-mode" in stale[0]
 
 
-def test_preflight_refuses_a_brief_whose_node_was_retired(tmp_path):
-    """Building one publishes an article about something the graph says is gone.
-    Seven such briefs were sitting in the published set after a merge round."""
+def test_preflight_never_reinterprets_a_published_brief_from_the_live_graph(
+    monkeypatch, tmp_path
+):
     import batch
 
-    _pub_brief(tmp_path, "dead", "redacted", node_id="gone")
+    _pub_brief(tmp_path, "published", "redacted", node_id="gone")
     args = _pub_args(tmp_path, live=(), retired=("gone",))
-    refuse, _ = batch._check_publication(args, "briefs", ["dead"])
-    assert "retired" in refuse["dead"]
+    monkeypatch.setattr(
+        batch.sqlite3,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("brief preflight opened the live graph")
+        ),
+    )
+
+    assert batch._check_publication(args, "briefs", ["published"]) == ({}, [])
 
 
 def test_preflight_refuses_a_brief_at_a_stale_slug(tmp_path):
@@ -2526,16 +2628,13 @@ def test_preflight_refuses_a_brief_at_a_stale_slug(tmp_path):
     assert "new-slug" in refuse["old-slug"], "name the brief to build instead"
 
 
-def test_preflight_survives_an_unreadable_graph(tmp_path):
-    """No graph is not a reason to refuse everything - the redaction check still
-    stands on the file alone."""
+def test_preflight_does_not_require_a_graph_path(tmp_path):
     import batch
 
     _pub_brief(tmp_path, "good", "redacted")
 
     class A:
         briefs_root = str(tmp_path)
-        db = "/nonexistent/g.db"
 
     assert batch._check_publication(A(), "briefs", ["good"]) == ({}, [])
 
@@ -2587,10 +2686,8 @@ def test_brief_without_payload_hash_cannot_produce_an_unbound_article(
 ):
     import sys
 
-    brief = {
-        "brief_hash": "selection-hash",
-        "claims": [{"claim_id": "a", "claim_hash": "1"}],
-    }
+    brief = _valid_assembly_brief("page")
+    brief.pop("payload_hash")
     monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
     monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
     monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "page"))
@@ -2611,9 +2708,7 @@ def test_brief_without_payload_hash_cannot_produce_an_unbound_article(
     )
 
     assert a.main() == 2
-    assert (
-        "missing brief_hash, payload_hash, or a claim_hash" in capsys.readouterr().err
-    )
+    assert "missing payload_hash" in capsys.readouterr().err
 
 
 def test_model_policy_refuses_claude_for_reader_facing_prose():
@@ -3252,10 +3347,7 @@ def test_retire_vetoed_still_emits_gone_when_there_is_no_candidate(tmp_path, cap
     assert "- from: /en/topics/bad-topic/" in out and "gone: true" in out
 
 
-def test_preflight_refuses_a_brief_whose_node_is_vetoed(tmp_path):
-    """Retiring a vetoed node's page leaves its brief on disk; without this a
-    later batch rebuilds the page, undoing a reviewer's decision and spending
-    metered money to do it."""
+def test_preflight_does_not_read_live_veto_state(monkeypatch, tmp_path):
     import sqlite3
 
     import batch
@@ -3269,25 +3361,15 @@ def test_preflight_refuses_a_brief_whose_node_is_vetoed(tmp_path):
     conn.execute("INSERT INTO page_vetoes VALUES ('n1','v9',NULL)")
     conn.commit()
     conn.close()
-    refuse, _ = batch._check_publication(args, "briefs", ["banned"])
-    assert "vetoed" in refuse["banned"] and "v9" in refuse["banned"]
-
-
-def test_preflight_allows_a_brief_whose_veto_was_undone(tmp_path):
-    import sqlite3
-
-    import batch
-
-    _pub_brief(tmp_path, "ok-again", "published", node_id="n1")
-    args = _pub_args(tmp_path, live=("n1",))
-    conn = sqlite3.connect(args.db)
-    conn.execute(
-        "CREATE TABLE page_vetoes (node_id TEXT, veto_id TEXT, undone_at TEXT)"
+    monkeypatch.setattr(
+        batch.sqlite3,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("brief preflight opened the live graph")
+        ),
     )
-    conn.execute("INSERT INTO page_vetoes VALUES ('n1','v9','2026-09-03')")
-    conn.commit()
-    conn.close()
-    assert batch._check_publication(args, "briefs", ["ok-again"]) == ({}, [])
+
+    assert batch._check_publication(args, "briefs", ["banned"]) == ({}, [])
 
 
 def test_covered_nodes_reads_both_brief_schemas():
