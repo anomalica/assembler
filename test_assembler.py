@@ -417,6 +417,157 @@ def test_an_alias_equal_to_the_current_slug_is_dropped():
     assert a.slug_aliases(node, "people", None, None) == []
 
 
+def test_load_brief_returns_its_full_reference_and_rejects_traversal(tmp_path):
+    root = tmp_path / "briefs"
+    section = root / "events"
+    section.mkdir(parents=True)
+    brief = section / "same.yaml"
+    brief.write_text("page: {}\n")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("page: {}\n")
+    (root / "linked.yaml").symlink_to(outside)
+
+    loaded = a.load_brief(root, "events/same")
+
+    assert loaded is not None
+    assert loaded[1] == "events/same"
+    assert a.load_brief(root, "../outside") is None
+    assert a.load_brief(root, str(outside)) is None
+    assert a.load_brief(root, "linked.yaml") is None
+
+
+def test_brief_article_identity_uses_full_ref_and_supports_legacy_flat_refs():
+    assert a.brief_article_identity("events/same", "topic", "ja") == (
+        "events",
+        "same",
+        "ja",
+    )
+    assert a.brief_article_identity("same", "event") == ("events", "same", "en")
+    assert a.brief_article_identity("same", "topic", section_override="projects") == (
+        "projects",
+        "same",
+        "en",
+    )
+
+
+def test_brief_article_identity_rejects_ambiguous_or_conflicting_paths():
+    import pytest
+
+    with pytest.raises(ValueError, match="invalid brief reference"):
+        a.brief_article_identity("nested/events/same", "event")
+    with pytest.raises(ValueError, match="invalid article section"):
+        a.brief_article_identity("../same", "event")
+    with pytest.raises(ValueError, match="conflicts with brief section"):
+        a.brief_article_identity("events/same", "event", section_override="projects")
+
+
+def test_output_path_cannot_escape_pages(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="invalid article section"):
+        a.output_path(tmp_path, "../outside", "same")
+    with pytest.raises(ValueError, match="invalid article slug"):
+        a.output_path(tmp_path, "events", "../same")
+    with pytest.raises(ValueError, match="invalid article language"):
+        a.output_path(tmp_path, "events", "same", "../ja")
+
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (pages / "events").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes content/pages"):
+        a.output_path(tmp_path, "events", "same")
+
+
+def test_brief_cli_passes_exact_multilingual_identity_to_prompt(
+    monkeypatch, tmp_path, capsys
+):
+    import sys
+
+    brief = {
+        "brief_hash": "brief-hash",
+        "payload_hash": "payload-hash",
+        "page": {
+            "node_id": "node-1",
+            "node_type": "topic",
+            "title": "Subject",
+            "slug": "payload-slug-must-not-win",
+        },
+        "claims": [{"claim_id": "claim-1", "claim_hash": "claim-hash"}],
+    }
+    seen = {}
+    monkeypatch.setattr(a, "enforce_model_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(a, "cached_link_index", lambda *args: {})
+    monkeypatch.setattr(a, "load_brief", lambda *args: (brief, "events/filename-slug"))
+    monkeypatch.setattr(
+        a,
+        "collect_directives",
+        lambda path, root: seen.update(path=path) or [],
+    )
+    monkeypatch.setattr(
+        a,
+        "build_prompt",
+        lambda node, claims, related, directives, language: seen.update(
+            language=language
+        )
+        or "PROMPT",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "assembler.py",
+            "--brief",
+            "events/filename-slug",
+            "--language",
+            "ja",
+            "--content-root",
+            str(tmp_path),
+            "--dry-run",
+            "--model",
+            "test-model",
+        ],
+    )
+
+    assert a.main() == 0
+    assert seen == {
+        "path": tmp_path / "pages/events/filename-slug.ja.md",
+        "language": "ja",
+    }
+    assert capsys.readouterr().out == "PROMPT\n"
+
+
+def test_cli_rejects_an_invalid_language_before_model_policy(monkeypatch):
+    import pytest
+    import sys
+
+    called = False
+
+    def policy(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(a, "enforce_model_policy", policy)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["assembler.py", "--brief", "events/same", "--language", "../ja"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        a.main()
+    assert exc.value.code == 2
+    assert called is False
+
+
+def test_non_english_prompt_uses_the_exact_language_tag():
+    prompt = a.build_prompt({"name": "Subject", "type": "topic"}, [], [], language="ja")
+
+    assert "BCP 47 tag 'ja'" in prompt
+    assert "British English throughout" not in prompt
+
+
 def test_related_slugs_follow_a_rename(tmp_path):
     """A brief freezes slugs at synthesise time; the graph moved three times in one
     evening. Matched on node id, so a rename is followed rather than guessed."""

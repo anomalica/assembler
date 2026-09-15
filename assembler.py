@@ -827,14 +827,20 @@ def brief_ref(briefs_root, path) -> str:
 
 
 def load_brief(briefs_root: Path, ref: str) -> tuple[dict, str] | None:
-    """Locate and parse a synthesiser brief. `ref` is a page slug (the filename
-    stem) or a path to a brief .yaml. Returns (brief, slug) or None."""
-    p = Path(ref)
-    if p.suffix in {".yaml", ".yml"} and p.is_file():
-        return yaml.safe_load(p.read_text()), p.stem
-    direct = briefs_root / f"{ref}.yaml"
-    if direct.is_file():
-        return yaml.safe_load(direct.read_text()), ref
+    """Locate a brief below its root and return its canonical filename reference."""
+    root = briefs_root.resolve()
+    supplied = Path(ref)
+    if supplied.suffix in {".yaml", ".yml"}:
+        candidate = supplied if supplied.is_file() else root / supplied
+    else:
+        candidate = root / f"{ref}.yaml"
+    try:
+        path = candidate.resolve()
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if path.is_file() and path.suffix in {".yaml", ".yml"}:
+        return yaml.safe_load(path.read_text()), brief_ref(root, path)
     return None
 
 
@@ -1145,12 +1151,59 @@ def node_slug(node: dict) -> str:
     return _node_slug(node.get("name", ""), node.get("metadata"))
 
 
+_LANGUAGE_TAG_RE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*")
+
+
+def _identity_component(value: str, label: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"invalid article {label}: {value!r}")
+    return value
+
+
+def brief_article_identity(
+    reference: str,
+    node_type: str,
+    language: str = "en",
+    section_override: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve an article identity from a canonical brief filename reference."""
+    parts = reference.split("/")
+    if len(parts) == 1:
+        section = section_override or SECTION_BY_TYPE.get(node_type, node_type + "s")
+        slug = parts[0]
+    elif len(parts) == 2:
+        section, slug = parts
+        if section_override and section_override != section:
+            raise ValueError(
+                f"--section {section_override!r} conflicts with brief section {section!r}"
+            )
+    else:
+        raise ValueError(f"invalid brief reference: {reference!r}")
+    if not _LANGUAGE_TAG_RE.fullmatch(language):
+        raise ValueError(f"invalid article language: {language!r}")
+    return (
+        _identity_component(section, "section"),
+        _identity_component(slug, "slug"),
+        language,
+    )
+
+
 def output_path(content_root: Path, section: str, slug: str, lang: str = "en") -> Path:
     # Hugo mounts content/pages/ to content/. So generated articles
     # for the public site live under pages/<section>/<slug>.<lang>.md - URLs
     # then come out as /<section>/<slug>/ to match the site's existing
     # /people/david-fravor pattern.
-    return content_root / "pages" / section / f"{slug}.{lang}.md"
+    section = _identity_component(section, "section")
+    slug = _identity_component(slug, "slug")
+    if not _LANGUAGE_TAG_RE.fullmatch(lang):
+        raise ValueError(f"invalid article language: {lang!r}")
+    root = (content_root / "pages").resolve()
+    candidate = content_root / "pages" / section / f"{slug}.{lang}.md"
+    try:
+        candidate.resolve().relative_to(root)
+    except ValueError as exc:
+        raise ValueError("article output escapes content/pages") from exc
+    return candidate
 
 
 # ----------------------------------------------------------------------------
@@ -1166,9 +1219,7 @@ THE NODE THIS ARTICLE IS ABOUT:
 
 INSTRUCTIONS:
 
-Write a single article in British English about this {node_type}. The article goes on a public reference website (Anomalica) about unidentified anomalous phenomena (UAP) research. Tone: neutral, encyclopaedic, like a Wikipedia article. Do not editorialise. Do not advocate.
-
-SPELLING - British English throughout, with ONE exception: proper nouns keep their official/original spelling. Never Briticise the words inside an official American name. US government bodies retain American spelling - "Department of Defense" (never "Defence"), "Defense Intelligence Agency" (never "Defence Intelligence Agency"), "Secretary of Defense", "Office of the Secretary of Defense"; and official US programme names keep "Program" - "Advanced Aerospace Threat Identification Program" (never "Programme"). The British forms (defence, programme, organisation, ...) are correct only as ordinary words, not when they sit inside a proper noun that is spelled the American way officially.
+{language_instructions}
 {directives_block}
 Your ENTIRE response must be a single YAML+markdown document in this exact shape:
 
@@ -1615,11 +1666,37 @@ def build_prompt(
     claims: list[dict],
     related: list[dict],
     directives: list[str] | None = None,
+    language: str = "en",
 ) -> str:
     claims_block = "\n\n".join(format_claim(c, i + 1) for i, c in enumerate(claims))
+    language_instructions = (
+        "Write a single article in British English about this {node_type}. The article "
+        "goes on a public reference website (Anomalica) about unidentified anomalous "
+        "phenomena (UAP) research. Tone: neutral, encyclopaedic, like a Wikipedia "
+        "article. Do not editorialise. Do not advocate.\n\n"
+        "SPELLING - British English throughout, with ONE exception: proper nouns keep "
+        "their official/original spelling. Never Briticise the words inside an official "
+        'American name. US government bodies retain American spelling - "Department '
+        'of Defense" (never "Defence"), "Defense Intelligence Agency" (never '
+        '"Defence Intelligence Agency"), "Secretary of Defense", "Office of the '
+        'Secretary of Defense"; and official US programme names keep "Program" - '
+        '"Advanced Aerospace Threat Identification Program" (never "Programme"). '
+        "The British forms (defence, programme, organisation, ...) are correct only as "
+        "ordinary words, not when they sit inside a proper noun that is spelled the "
+        "American way officially."
+        if language == "en"
+        else f"Write a single article in the language identified by BCP 47 tag "
+        f"{language!r} about this {{node_type}}. Use natural, idiomatic prose in that "
+        "language. The article goes on a public reference website (Anomalica) about "
+        "unidentified anomalous phenomena (UAP) research. Tone: neutral and "
+        "encyclopaedic. Do not editorialise. Do not advocate. Preserve proper nouns in "
+        "their official or original spelling unless that language conventionally uses "
+        "an established local form."
+    )
     return ASSEMBLY_PROMPT.format(
         node_name=node["name"],
         node_type=node["type"],
+        language_instructions=language_instructions.format(node_type=node["type"]),
         related_block=format_related_block(related),
         tags_block=format_tags_block(node.get("type")),
         length_block=format_length_block(node.get("type")),
@@ -4065,6 +4142,11 @@ def main() -> int:
         help="Hugo content section (defaults to derived from node type)",
     )
     ap.add_argument(
+        "--language",
+        default="en",
+        help="BCP 47 language tag for the generated article (default: en)",
+    )
+    ap.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help="Model to write with. Default: the model policy's first permitted "
@@ -4110,6 +4192,8 @@ def main() -> int:
         "batch.py passes it through from its own --confirm.",
     )
     args = ap.parse_args()
+    if not _LANGUAGE_TAG_RE.fullmatch(args.language):
+        ap.error("--language must be a BCP 47 language tag")
 
     # Model policy, checked at parse time so the direct path refuses in seconds.
     # The dispatch check in call_claude is the backstop and still runs; without
@@ -4206,13 +4290,24 @@ def main() -> int:
     # Resolve the output path now (not just at write time) so collected
     # directives from the existing article + the _directives.yaml hierarchy can
     # be injected into the prompt, and so the same path is reused for the write.
-    section = (
-        "records"
-        if digest is not None
-        else args.section or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
-    )
-    slug = node_slug(node)
-    out = output_path(Path(args.content_root), section, slug)
+    try:
+        if brief is not None:
+            section, slug, language = brief_article_identity(
+                _slug, node["type"], args.language, args.section
+            )
+        else:
+            section = (
+                "records"
+                if digest is not None
+                else args.section
+                or SECTION_BY_TYPE.get(node["type"], node["type"] + "s")
+            )
+            slug = node_slug(node)
+            language = args.language
+        out = output_path(Path(args.content_root), section, slug, language)
+    except ValueError as exc:
+        print(f"invalid article identity: {exc}", file=sys.stderr)
+        return 2
     public_record = None
     if digest is not None:
         public_record, reason = public_record_projection(
@@ -4240,7 +4335,7 @@ def main() -> int:
     if directives:
         print(f"  directives: {len(directives)} applied", file=sys.stderr)
 
-    prompt = build_prompt(node, claims, related, directives)
+    prompt = build_prompt(node, claims, related, directives, language)
     if args.dry_run:
         print(prompt)
         return 0
